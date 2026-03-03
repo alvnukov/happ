@@ -17,6 +17,7 @@ unsafe-libyaml = "0.2"
 base64 = "0.22"
 tempfile = "3"
 include_dir = "0.7"
+zq = { git = "https://github.com/alvnukov/zq", tag = "v0.1.0" }
 
 [dev-dependencies]
 pretty_assertions = "1"

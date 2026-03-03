@@ -1340,7 +1340,15 @@ fn convert_payload(
         "json-to-yaml" => {
             let j: serde_json::Value =
                 serde_json::from_str(input).map_err(|e| format!("JSON parse error: {e}"))?;
-            serde_yaml::to_string(&j).map_err(|e| format!("JSON->YAML conversion error: {e}"))
+            // zq enables serde_json/arbitrary_precision in the dependency graph.
+            // Serializing serde_json::Value directly to YAML then represents
+            // numbers via an internal wrapper map. Roundtrip through JSON text
+            // and serde_yaml::Value keeps plain scalar numbers stable.
+            let normalized_json =
+                serde_json::to_string(&j).map_err(|e| format!("JSON normalize error: {e}"))?;
+            let y: serde_yaml::Value = serde_yaml::from_str(&normalized_json)
+                .map_err(|e| format!("JSON->YAML conversion error: {e}"))?;
+            serde_yaml::to_string(&y).map_err(|e| format!("JSON->YAML conversion error: {e}"))
         }
         _ => Err("unsupported mode".to_string()),
     }
