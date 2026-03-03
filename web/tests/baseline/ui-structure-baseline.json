@@ -5,7 +5,6 @@
       "Main Import",
       "Converters",
       "jq Playground",
-      "yq Playground",
       "dyff Compare"
     ],
     "minWidths": {

@@ -229,44 +229,6 @@ fn handle_connection(
         )
         .map_err(|e| e.to_string());
     }
-    if route_path == "/api/yq" && method == "POST" {
-        let payload: serde_json::Value =
-            serde_json::from_str(body).map_err(|e| format!("invalid JSON request: {e}"))?;
-        let query = payload.get("query").and_then(|v| v.as_str()).unwrap_or(".");
-        let input = payload
-            .get("input")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let doc_mode = payload
-            .get("docMode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("first");
-        let doc_index = payload
-            .get("docIndex")
-            .and_then(|v| v.as_u64())
-            .map(|x| x as usize);
-        let compact = payload
-            .get("compact")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let raw_output = payload
-            .get("rawOutput")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let (ok, output) = match yq_payload(query, input, doc_mode, doc_index, compact, raw_output)
-        {
-            Ok(v) => (true, v),
-            Err(e) => (false, e),
-        };
-        let resp = serde_json::json!({ "ok": ok, "output": output }).to_string();
-        return write_response(
-            stream,
-            200,
-            "application/json; charset=utf-8",
-            resp.as_bytes(),
-        )
-        .map_err(|e| e.to_string());
-    }
     if route_path == "/api/dyff" && method == "POST" {
         let payload: serde_json::Value =
             serde_json::from_str(body).map_err(|e| format!("invalid JSON request: {e}"))?;
@@ -1385,37 +1347,6 @@ fn jq_payload(
     Ok(lines.join("\n"))
 }
 
-fn yq_payload(
-    query: &str,
-    input: &str,
-    doc_mode: &str,
-    doc_index: Option<usize>,
-    compact: bool,
-    raw_output: bool,
-) -> Result<String, String> {
-    let docs = crate::query::parse_input_docs_prefer_yaml(input)
-        .map_err(|e| format!("yq parse error: {e}"))?;
-    let selected = select_docs_for_web(docs, doc_mode, doc_index, "yq")?;
-    let out = crate::query::run_query_stream(query, selected)
-        .map_err(|e| format!("yq query error: {e}"))?;
-    let mut lines = Vec::with_capacity(out.len());
-    for v in out {
-        if raw_output {
-            if let Some(s) = v.as_str() {
-                lines.push(s.to_string());
-                continue;
-            }
-        }
-        let line = if compact {
-            serde_json::to_string(&v).map_err(|e| format!("yq output encode error: {e}"))?
-        } else {
-            serde_json::to_string_pretty(&v).map_err(|e| format!("yq output encode error: {e}"))?
-        };
-        lines.push(line);
-    }
-    Ok(lines.join("\n"))
-}
-
 fn dyff_payload(
     from: &str,
     to: &str,
@@ -1819,11 +1750,6 @@ pub fn render_page_html(source_yaml: &str, generated_values_yaml: &str) -> Strin
                 "description": "Run jq queries on JSON or YAML input."
             },
             {
-                "id": "yq-playground",
-                "title": "yq Playground",
-                "description": "Run yq queries on YAML or JSON input."
-            },
-            {
                 "id": "dyff-compare",
                 "title": "dyff Compare",
                 "description": "Compare two YAML payloads with dyff-like output."
@@ -1862,11 +1788,6 @@ pub fn render_compose_page_html(
                 "description": "Run jq queries on JSON or YAML input."
             },
             {
-                "id": "yq-playground",
-                "title": "yq Playground",
-                "description": "Run yq queries on YAML or JSON input."
-            },
-            {
                 "id": "dyff-compare",
                 "title": "dyff Compare",
                 "description": "Compare two YAML payloads with dyff-like output."
@@ -1895,11 +1816,6 @@ pub fn render_tools_page_html(stdin_text: Option<&str>) -> String {
                 "id": "jq-playground",
                 "title": "jq Playground",
                 "description": "Run jq queries on JSON or YAML input."
-            },
-            {
-                "id": "yq-playground",
-                "title": "yq Playground",
-                "description": "Run yq queries on YAML or JSON input."
             },
             {
                 "id": "dyff-compare",
@@ -2853,7 +2769,7 @@ window.addEventListener('error', function(e) {{
   <div class='top'>
     <div class='brand'>
       <h2 class='title'>{{{{ model.title }}}}</h2>
-      <div class='subtitle'>Fast local toolset for YAML/JSON, jq/yq and dyff.</div>
+      <div class='subtitle'>Fast local toolset for YAML/JSON, jq and dyff.</div>
     </div>
     <div class='top-actions'>
       <button @click='exitUi'>Exit</button>
@@ -3381,66 +3297,6 @@ window.addEventListener('error', function(e) {{
       <span>compact: {{{{ jqCompact ? "on" : "off" }}}}, raw: {{{{ jqRawOutput ? "on" : "off" }}}}</span>
     </div>
     <div class='err' v-if='jqError' style='margin-top:8px;'>{{{{ jqError }}}}</div>
-  </div>
-
-  <div v-else-if='activeUtilityKey === "yq-playground"' class='card'>
-    <div class='cardhead'>
-      <h3>yq Playground</h3>
-      <div class='cardbtns'>
-        <button class='secondary' @click='runYq'>Run</button>
-        <button class='secondary' @click='clearYq'>Clear</button>
-        <button class='secondary' @click='loadSampleYq'>Sample</button>
-      </div>
-    </div>
-    <div class='converter-controls'>
-      <select v-model='yqDocMode'>
-        <option value='first'>Input docs: first</option>
-        <option value='all'>Input docs: all</option>
-        <option value='index'>Input docs: index</option>
-      </select>
-      <input v-if='yqDocMode === "index"'
-             v-model.number='yqDocIndex'
-             type='number'
-             min='0'
-             step='1'
-             style='width:140px;'
-             placeholder='doc index' />
-      <label class='chk'><input type='checkbox' v-model='yqCompact'/> compact</label>
-      <label class='chk'><input type='checkbox' v-model='yqRawOutput'/> raw output</label>
-      <button class='secondary' @click='copyYqOutput'>Copy output</button>
-      <div class='muted'>Live query execution is enabled</div>
-    </div>
-    <div style='margin-bottom:10px;'>
-      <div class='muted' style='margin-bottom:6px;'>yq query</div>
-      <div class='chip-row'>
-        <button class='chip' v-for='p in yqPresets' :key='p.label' @click='applyYqPreset(p.query)'>{{{{ p.label }}}}</button>
-      </div>
-      <div class='editor-shell'>
-        <div v-if='cmAvailable' class='editor-host' ref='yqQueryCmHost' style='min-height:120px;height:22vh;'></div>
-        <textarea v-else v-model='yqQuery' spellcheck='false' style='min-height:72px;'></textarea>
-      </div>
-    </div>
-    <div class='conv-grid'>
-      <div>
-        <div class='panel-label'>Input (YAML or JSON)</div>
-        <div class='editor-shell'>
-          <div v-if='cmAvailable' class='editor-host' ref='yqInputCmHost' style='min-height:240px;height:38vh;'></div>
-          <textarea v-else v-model='yqInput' spellcheck='false' @select='onYqTextareaSelect' @keyup='onYqTextareaSelect' @mouseup='onYqTextareaSelect'></textarea>
-        </div>
-      </div>
-      <div>
-        <div class='panel-label'>Output</div>
-        <div class='editor-shell'>
-          <div v-if='cmAvailable' class='editor-host' ref='yqOutputCmHost' style='min-height:240px;height:38vh;'></div>
-          <pre v-else class='code-output' v-html='yqOutputHighlighted'></pre>
-        </div>
-      </div>
-    </div>
-    <div class='result-meta'>
-      <span>results: {{{{ yqResultCount }}}}, chars: {{{{ (yqOutput || '').length }}}}</span>
-      <span>compact: {{{{ yqCompact ? "on" : "off" }}}}, raw: {{{{ yqRawOutput ? "on" : "off" }}}}</span>
-    </div>
-    <div class='err' v-if='yqError' style='margin-top:8px;'>{{{{ yqError }}}}</div>
   </div>
 
   <div v-else-if='activeUtilityKey === "dyff-compare"' class='card'>
@@ -4045,7 +3901,6 @@ const app = Vue.createApp({{
     }}
     this.scheduleConvert();
     this.scheduleJqRun();
-    this.scheduleYqRun();
     this.scheduleDyffRun();
     this.refreshCodeMirrorAvailability();
     this.$nextTick(() => {{
@@ -6765,8 +6620,7 @@ mod tests {
         assert!(html.contains("Converters"));
         assert!(html.contains("jq Playground"));
         assert!(html.contains("/api/jq"));
-        assert!(html.contains("yq Playground"));
-        assert!(html.contains("/api/yq"));
+        assert!(!html.contains("yq Playground"));
         assert!(html.contains("dyff Compare"));
         assert!(html.contains("/api/dyff"));
         assert!(html.contains("jq-suggest"));
@@ -6957,20 +6811,6 @@ text: |-
     fn jq_payload_rejects_out_of_range_doc_index() {
         let err = jq_payload(".", "a: 1\n", "index", Some(5), false, false).expect_err("error");
         assert!(err.contains("out of range"));
-    }
-
-    #[test]
-    fn yq_payload_runs_query_for_yaml_input() {
-        let out = yq_payload(
-            ".apps[] | .name",
-            "apps:\n  - name: a\n  - name: b\n",
-            "first",
-            None,
-            false,
-            true,
-        )
-        .expect("yq");
-        assert_eq!(out, "a\nb");
     }
 
     #[test]
