@@ -1,6 +1,29 @@
-# happ-rs
+# happ
 
-Rust implementation of `happ` focused on import/inspect/diff/query workflows.
+[![CI](https://github.com/alvnukov/happ/actions/workflows/ci.yml/badge.svg)](https://github.com/alvnukov/happ/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/alvnukov/happ?label=release)](https://github.com/alvnukov/happ/releases)
+[![Homebrew](https://img.shields.io/badge/homebrew-alvnukov%2Ftap%2Fhapp-fbb040?logo=homebrew)](https://github.com/alvnukov/homebrew-tap)
+[![Coverage](https://codecov.io/gh/alvnukov/happ/graph/badge.svg?branch=main)](https://codecov.io/gh/alvnukov/happ)
+
+`happ` is a Rust CLI focused on import/inspect/diff/query workflows.
+
+## Installation
+
+### Homebrew (recommended)
+
+```bash
+brew tap alvnukov/tap
+brew install alvnukov/tap/happ
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/alvnukov/happ.git
+cd happ
+cargo build --release --locked
+./target/release/happ --help
+```
 
 ## Query commands
 
@@ -92,3 +115,15 @@ During build, `happ` fetches `helm-apps` chart from GitHub and embeds it into bi
 - override repo: `HELM_APPS_GITHUB_REPO`
 - override ref: `HELM_APPS_GITHUB_REF`
 - force local chart path: `HELM_APPS_CHART_PATH=/abs/path/to/charts/helm-apps`
+
+## Test coverage
+
+Coverage is calculated in CI in the `coverage` job (`cargo llvm-cov`) and uploaded to Codecov.
+
+You can reproduce locally:
+
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+cargo llvm-cov --workspace --all-features --summary-only
+```
