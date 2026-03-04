@@ -78,6 +78,16 @@ happ completion --shell zsh
 happ completion --shell bash --output /tmp/happ.bash
 ```
 
+Quick one-liner for current shell session (similar to `kubectl`):
+
+```bash
+# zsh
+source <(happ completion --shell zsh)
+
+# bash
+source <(happ completion --shell bash)
+```
+
 ### Configure completion in your shell
 
 #### zsh
