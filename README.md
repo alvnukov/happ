@@ -78,6 +78,79 @@ happ completion --shell zsh
 happ completion --shell bash --output /tmp/happ.bash
 ```
 
+### Configure completion in your shell
+
+#### zsh
+
+```bash
+mkdir -p "${HOME}/.zsh/completions"
+happ completion --shell zsh --output "${HOME}/.zsh/completions/_happ"
+```
+
+Add to `~/.zshrc`:
+
+```bash
+fpath=("${HOME}/.zsh/completions" $fpath)
+autoload -Uz compinit && compinit
+```
+
+Reload shell:
+
+```bash
+exec zsh
+```
+
+#### bash
+
+```bash
+mkdir -p "${HOME}/.local/share/bash-completion/completions"
+happ completion --shell bash --output "${HOME}/.local/share/bash-completion/completions/happ"
+```
+
+Reload shell:
+
+```bash
+exec bash
+```
+
+#### fish
+
+```bash
+mkdir -p "${HOME}/.config/fish/completions"
+happ completion --shell fish --output "${HOME}/.config/fish/completions/happ.fish"
+```
+
+Reload shell:
+
+```bash
+exec fish
+```
+
+#### PowerShell
+
+```powershell
+$dir = Split-Path -Parent $PROFILE
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+happ completion --shell powershell | Out-String | Add-Content -Path $PROFILE
+```
+
+Restart PowerShell session.
+
+#### elvish
+
+```bash
+mkdir -p "${HOME}/.config/elvish/lib"
+happ completion --shell elvish --output "${HOME}/.config/elvish/lib/happ.elv"
+```
+
+Add to `~/.config/elvish/rc.elv`:
+
+```elvish
+use happ
+```
+
+## Web mode
+
 ```bash
 # web mode for tests/CI without opening browser
 happ --web --web-open-browser=false
