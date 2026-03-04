@@ -95,13 +95,17 @@ jobs:
             coverage-summary.txt
 
       - name: Upload to Codecov
+        if: ${{ secrets.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v5
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
-          use_oidc: true
           fail_ci_if_error: true
           verbose: true
+
+      - name: Codecov not configured
+        if: ${{ secrets.CODECOV_TOKEN == '' }}
+        run: echo "::warning::CODECOV_TOKEN is not set, skipping Codecov upload."
 
   platform-build:
     runs-on: ${{ matrix.runner }}
