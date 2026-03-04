@@ -196,7 +196,10 @@ jobs:
           cargo generate-rpm --output dist
           rpm_file="$(find dist -maxdepth 1 -type f -name '*.rpm' | head -n 1)"
           test -n "${rpm_file}"
-          mv "${rpm_file}" "dist/happ-${VERSION}-1.${{ matrix.rpm_arch }}.rpm"
+          rpm_target="dist/happ-${VERSION}-1.${{ matrix.rpm_arch }}.rpm"
+          if [ "${rpm_file}" != "${rpm_target}" ]; then
+            mv "${rpm_file}" "${rpm_target}"
+          fi
           ls -la dist
 
       - name: Upload package artifacts
