@@ -1,7 +1,10 @@
 [package]
 name = "happ"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
+description = "Rust CLI for import/inspect/diff/query workflows around helm-apps"
+homepage = "https://github.com/alvnukov/happ"
+repository = "https://github.com/alvnukov/happ"
 license = "Apache-2.0"
 
 [dependencies]
@@ -26,3 +29,38 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "query_bench"
 harness = false
+
+[package.metadata.deb]
+maintainer = "alvnukov <noreply@github.com>"
+copyright = "2026, alvnukov"
+license-file = ["LICENSE", "0"]
+section = "utils"
+priority = "optional"
+depends = "$auto"
+extended-description = "happ imports Helm chart render output or raw manifests into helm-apps-based workflows."
+assets = [
+  ["target/release/happ", "usr/bin/happ", "755"],
+  ["README.md", "usr/share/doc/happ/README.md", "644"],
+  ["LICENSE", "usr/share/doc/happ/LICENSE", "644"],
+]
+
+[package.metadata.generate-rpm]
+license = "Apache-2.0"
+auto-req = "disabled"
+
+[[package.metadata.generate-rpm.assets]]
+source = "target/release/happ"
+dest = "/usr/bin/happ"
+mode = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "README.md"
+dest = "/usr/share/doc/happ/README.md"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "LICENSE"
+dest = "/usr/share/doc/happ/LICENSE"
+mode = "644"
+doc = true

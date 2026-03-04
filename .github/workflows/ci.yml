@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
 jobs:
   test:
@@ -146,3 +148,107 @@ jobs:
           mkdir -p dist
           cp "${{ matrix.binary_path }}" "dist/${{ matrix.asset_name }}"
           test -s "dist/${{ matrix.asset_name }}"
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+  linux-packages:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            deb_arch: arm64
+            rpm_arch: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install packaging tools
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-deb cargo-generate-rpm
+
+      - name: Build happ binary (release)
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+
+      - name: Build .deb and .rpm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -E '^version = ' Cargo.toml | head -1 | cut -d '"' -f2)"
+          mkdir -p dist
+          cargo deb --no-build --no-strip --output "dist/happ_${VERSION}_${{ matrix.deb_arch }}.deb"
+          cargo generate-rpm --output dist
+          rpm_file="$(find dist -maxdepth 1 -type f -name '*.rpm' | head -n 1)"
+          test -n "${rpm_file}"
+          mv "${rpm_file}" "dist/happ-${VERSION}-1.${{ matrix.rpm_arch }}.rpm"
+          ls -la dist
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.deb_arch }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - test
+      - coverage
+      - platform-build
+      - linux-packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release assets
+        run: |
+          set -euo pipefail
+          ls -la dist
+          test -s dist/happ_linux_amd64
+          test -s dist/happ_linux_arm64
+          test -s dist/happ_darwin_amd64
+          test -s dist/happ_darwin_arm64
+          test -s dist/happ_windows_amd64.exe
+          compgen -G "dist/happ_*_amd64.deb" > /dev/null
+          compgen -G "dist/happ_*_arm64.deb" > /dev/null
+          compgen -G "dist/happ-*-1.x86_64.rpm" > /dev/null
+          compgen -G "dist/happ-*-1.aarch64.rpm" > /dev/null
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/happ_linux_amd64
+            dist/happ_linux_arm64
+            dist/happ_darwin_amd64
+            dist/happ_darwin_arm64
+            dist/happ_windows_amd64.exe
+            dist/happ_*_amd64.deb
+            dist/happ_*_arm64.deb
+            dist/happ-*-1.x86_64.rpm
+            dist/happ-*-1.aarch64.rpm

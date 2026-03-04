@@ -16,6 +16,13 @@ brew tap alvnukov/tap
 brew install alvnukov/tap/happ
 ```
 
+### Linux packages from Releases
+
+Download artifacts from the latest [GitHub Releases](https://github.com/alvnukov/happ/releases):
+
+- `.deb` packages: `happ_<version>_amd64.deb`, `happ_<version>_arm64.deb`
+- `.rpm` packages: `happ-<version>-1.x86_64.rpm`, `happ-<version>-1.aarch64.rpm`
+
 ### Build from source
 
 ```bash
