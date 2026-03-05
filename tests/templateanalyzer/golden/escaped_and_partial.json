@@ -1,0 +1,20 @@
+{
+  "include_names": [
+    "safe.a"
+  ],
+  "values_paths": [],
+  "define_blocks": {},
+  "include_graph": {},
+  "unresolved_local_includes": [
+    "safe.a"
+  ],
+  "diagnostics": [
+    {
+      "code": "unterminated_character_constant",
+      "message": "unterminated character constant",
+      "line": 4,
+      "column": 43
+    }
+  ],
+  "include_cycles": []
+}

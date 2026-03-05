@@ -1,0 +1,1381 @@
+use super::GoTemplateScanError;
+
+const LEFT_DELIM: &str = "{{";
+const RIGHT_DELIM: &str = "}}";
+const GO_BUILTIN_FUNCTIONS: &[&str] = &[
+    "and", "call", "html", "index", "slice", "js", "len", "not", "or", "print", "printf",
+    "println", "urlquery", "eq", "ne", "lt", "le", "gt", "ge",
+];
+
+#[derive(Debug, Clone, Copy)]
+pub struct ParseCompatOptions<'a> {
+    pub skip_func_check: bool,
+    pub known_functions: &'a [&'a str],
+    pub check_variables: bool,
+    pub visible_variables: &'a [&'a str],
+}
+
+impl<'a> Default for ParseCompatOptions<'a> {
+    fn default() -> Self {
+        Self {
+            skip_func_check: true,
+            known_functions: &[],
+            check_variables: true,
+            visible_variables: &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VariableRef {
+    pub name: String,
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActionParseReport {
+    pub control: ControlAction,
+    pub define_name: Option<String>,
+    pub declared_vars: Vec<VariableRef>,
+    pub assigned_vars: Vec<VariableRef>,
+    pub referenced_vars: Vec<VariableRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokKind {
+    Space,
+    Pipe,
+    LeftParen,
+    RightParen,
+    Bool,
+    CharConst,
+    Number,
+    Assign,
+    Declare,
+    Field,
+    Identifier,
+    Comma,
+    String,
+    RawString,
+    Variable,
+    Dot,
+    Nil,
+    KwBlock,
+    KwBreak,
+    KwContinue,
+    KwDefine,
+    KwElse,
+    KwEnd,
+    KwIf,
+    KwRange,
+    KwTemplate,
+    KwWith,
+    Char,
+    Eof,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Tok {
+    kind: TokKind,
+    start: usize,
+    end: usize,
+}
+
+impl Tok {
+    fn text<'a>(&self, src: &'a str) -> &'a str {
+        &src[self.start..self.end]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TermKind {
+    Identifier,
+    Dot,
+    Nil,
+    Variable,
+    Field,
+    Bool,
+    Number,
+    String,
+    OtherExec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlKind {
+    If,
+    Range,
+    With,
+    Define,
+    Block,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlAction {
+    None,
+    Open(ControlKind),
+    Else(Option<ControlKind>),
+    Break,
+    Continue,
+    End,
+}
+
+pub(crate) fn parse_action_compat(
+    action: &str,
+    action_start: usize,
+) -> Result<ControlAction, GoTemplateScanError> {
+    parse_action_compat_with_options(action, action_start, ParseCompatOptions::default())
+}
+
+pub(crate) fn parse_action_compat_with_options(
+    action: &str,
+    action_start: usize,
+    options: ParseCompatOptions<'_>,
+) -> Result<ControlAction, GoTemplateScanError> {
+    parse_action_report_with_options(action, action_start, options).map(|r| r.control)
+}
+
+pub(crate) fn parse_action_report_with_options(
+    action: &str,
+    action_start: usize,
+    options: ParseCompatOptions<'_>,
+) -> Result<ActionParseReport, GoTemplateScanError> {
+    let Some((inner, inner_rel_start)) = action_inner_with_offset(action) else {
+        return Ok(ActionParseReport {
+            control: ControlAction::None,
+            define_name: None,
+            declared_vars: Vec::new(),
+            assigned_vars: Vec::new(),
+            referenced_vars: Vec::new(),
+        });
+    };
+    if inner.starts_with("/*") {
+        return Ok(ActionParseReport {
+            control: ControlAction::None,
+            define_name: None,
+            declared_vars: Vec::new(),
+            assigned_vars: Vec::new(),
+            referenced_vars: Vec::new(),
+        });
+    }
+    if inner.is_empty() {
+        return Err(GoTemplateScanError {
+            code: "missing_value_for_context",
+            message: "missing value for command",
+            offset: action_start + inner_rel_start,
+        });
+    }
+    let abs_base = action_start + inner_rel_start;
+    let tokens = lex_action_inner(inner, abs_base)?;
+
+    let mut p = Parser::new(inner, tokens, abs_base, options);
+    let control = p.parse_action()?;
+    Ok(ActionParseReport {
+        control,
+        define_name: p.opened_define_name,
+        declared_vars: p.declared_vars,
+        assigned_vars: p.assigned_vars,
+        referenced_vars: p.referenced_vars,
+    })
+}
+
+fn action_inner_with_offset(action: &str) -> Option<(&str, usize)> {
+    if !(action.starts_with(LEFT_DELIM) && action.ends_with(RIGHT_DELIM)) || action.len() < 4 {
+        return None;
+    }
+    let inner = &action[LEFT_DELIM.len()..action.len() - RIGHT_DELIM.len()];
+    let bytes = inner.as_bytes();
+
+    let mut start = 0usize;
+    let mut end = inner.len();
+
+    if bytes.len() >= 2 && bytes[0] == b'-' && is_space(bytes[1]) {
+        start = 1;
+    }
+
+    while start < end && is_space(bytes[start]) {
+        start += 1;
+    }
+    while start < end && is_space(bytes[end - 1]) {
+        end -= 1;
+    }
+    if end > start && bytes[end - 1] == b'-' {
+        end -= 1;
+        while start < end && is_space(bytes[end - 1]) {
+            end -= 1;
+        }
+    }
+
+    Some((&inner[start..end], LEFT_DELIM.len() + start))
+}
+
+struct Parser<'a> {
+    src: &'a str,
+    tokens: Vec<Tok>,
+    base: usize,
+    idx: usize,
+    options: ParseCompatOptions<'a>,
+    opened_define_name: Option<String>,
+    declared_vars: Vec<VariableRef>,
+    assigned_vars: Vec<VariableRef>,
+    referenced_vars: Vec<VariableRef>,
+}
+
+impl<'a> Parser<'a> {
+    fn new(src: &'a str, tokens: Vec<Tok>, base: usize, options: ParseCompatOptions<'a>) -> Self {
+        Self {
+            src,
+            tokens,
+            base,
+            idx: 0,
+            options,
+            opened_define_name: None,
+            declared_vars: Vec::new(),
+            assigned_vars: Vec::new(),
+            referenced_vars: Vec::new(),
+        }
+    }
+
+    fn parse_action(&mut self) -> Result<ControlAction, GoTemplateScanError> {
+        let tok = self.peek_non_space();
+        match tok.kind {
+            TokKind::KwEnd => {
+                let _ = self.next_non_space();
+                let tail = self.next_non_space();
+                if tail.kind != TokKind::Eof {
+                    return Err(self.unexpected_token(&tail, "command"));
+                }
+                Ok(ControlAction::End)
+            }
+            TokKind::KwBreak | TokKind::KwContinue => {
+                if self.keyword_token_is_function(tok) {
+                    self.parse_pipeline("command", TokKind::Eof, false)?;
+                    return Ok(ControlAction::None);
+                }
+                let kw = self.next_non_space().kind;
+                let tail = self.next_non_space();
+                if tail.kind != TokKind::Eof {
+                    return Err(self.unexpected_token(&tail, "command"));
+                }
+                Ok(match kw {
+                    TokKind::KwBreak => ControlAction::Break,
+                    TokKind::KwContinue => ControlAction::Continue,
+                    _ => unreachable!(),
+                })
+            }
+            TokKind::KwElse => Ok(ControlAction::Else(self.parse_else_clause()?)),
+            TokKind::KwDefine => {
+                let name = self.parse_define_clause()?;
+                self.opened_define_name = Some(name);
+                Ok(ControlAction::Open(ControlKind::Define))
+            }
+            TokKind::KwTemplate => {
+                self.parse_template_clause()?;
+                Ok(ControlAction::None)
+            }
+            TokKind::KwBlock => {
+                self.parse_block_clause()?;
+                Ok(ControlAction::Open(ControlKind::Block))
+            }
+            TokKind::KwIf | TokKind::KwWith => {
+                let _ = self.next_non_space();
+                self.parse_pipeline("control", TokKind::Eof, false)?;
+                let kind = match tok.kind {
+                    TokKind::KwIf => ControlKind::If,
+                    TokKind::KwWith => ControlKind::With,
+                    _ => unreachable!(),
+                };
+                Ok(ControlAction::Open(kind))
+            }
+            TokKind::KwRange => {
+                let _ = self.next_non_space();
+                self.parse_pipeline("range", TokKind::Eof, true)?;
+                Ok(ControlAction::Open(ControlKind::Range))
+            }
+            _ => {
+                self.parse_pipeline("command", TokKind::Eof, false)?;
+                Ok(ControlAction::None)
+            }
+        }
+    }
+
+    fn parse_else_clause(&mut self) -> Result<Option<ControlKind>, GoTemplateScanError> {
+        let _ = self.next_non_space();
+        match self.peek_non_space().kind {
+            TokKind::Eof => Ok(None),
+            TokKind::KwIf | TokKind::KwWith => {
+                let kw = self.next_non_space().kind;
+                self.parse_pipeline("control", TokKind::Eof, false)?;
+                Ok(Some(match kw {
+                    TokKind::KwIf => ControlKind::If,
+                    TokKind::KwWith => ControlKind::With,
+                    _ => unreachable!(),
+                }))
+            }
+            _ => Err(self.unexpected_token(&self.peek_non_space(), "else")),
+        }
+    }
+
+    fn parse_define_clause(&mut self) -> Result<String, GoTemplateScanError> {
+        let _ = self.next_non_space();
+        let name = self.next_non_space();
+        match name.kind {
+            TokKind::String | TokKind::RawString => {
+                let tail = self.next_non_space();
+                if tail.kind == TokKind::Eof {
+                    Ok(unquote_string_like(name.text(self.src)))
+                } else {
+                    Err(self.unexpected_token(&tail, "define clause"))
+                }
+            }
+            _ => Err(self.unexpected_token(&name, "define clause")),
+        }
+    }
+
+    fn parse_template_clause(&mut self) -> Result<(), GoTemplateScanError> {
+        let _ = self.next_non_space();
+        let name = self.next_non_space();
+        match name.kind {
+            TokKind::String | TokKind::RawString => {
+                if self.peek_non_space().kind == TokKind::Eof {
+                    return Ok(());
+                }
+                self.parse_pipeline("template clause", TokKind::Eof, false)
+            }
+            _ => Err(self.unexpected_token(&name, "template clause")),
+        }
+    }
+
+    fn parse_block_clause(&mut self) -> Result<(), GoTemplateScanError> {
+        let _ = self.next_non_space();
+        let name = self.next_non_space();
+        match name.kind {
+            TokKind::String | TokKind::RawString => {
+                if self.peek_non_space().kind == TokKind::Eof {
+                    return Err(GoTemplateScanError {
+                        code: "missing_value_for_context",
+                        message: "missing value for block clause",
+                        offset: self.abs(name.end),
+                    });
+                }
+                self.parse_pipeline("block clause", TokKind::Eof, false)
+            }
+            _ => Err(self.unexpected_token(&name, "block clause")),
+        }
+    }
+
+    fn parse_pipeline(
+        &mut self,
+        context: &'static str,
+        end_kind: TokKind,
+        allow_multi_decl: bool,
+    ) -> Result<(), GoTemplateScanError> {
+        self.parse_declarations(context, allow_multi_decl)?;
+        let mut stage = 0usize;
+        let mut saw_command = false;
+        loop {
+            let tok = self.next_non_space();
+            if tok.kind == end_kind {
+                break;
+            }
+            if tok.kind == TokKind::Eof {
+                if end_kind == TokKind::Eof {
+                    break;
+                }
+                return Err(self.unexpected_token(&tok, context));
+            }
+            if self.is_term_start(tok.kind) {
+                self.backup();
+                let first = self.parse_command()?;
+                saw_command = true;
+                stage += 1;
+                if let Some(func) = first.first_identifier {
+                    self.check_function_is_defined(func.name, func.start)?;
+                }
+                if stage > 1
+                    && matches!(
+                        first.first_term,
+                        TermKind::Bool
+                            | TermKind::Dot
+                            | TermKind::Nil
+                            | TermKind::Number
+                            | TermKind::String
+                    )
+                {
+                    return Err(GoTemplateScanError {
+                        code: "non_executable_command_in_pipeline",
+                        message: "non executable command in pipeline stage",
+                        offset: self.current_offset_for_stage(stage),
+                    });
+                }
+                continue;
+            }
+            return Err(self.unexpected_token(&tok, context));
+        }
+
+        if !saw_command {
+            return Err(GoTemplateScanError {
+                code: "missing_value_for_context",
+                message: context_message(context),
+                offset: self.current_offset(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn parse_declarations(
+        &mut self,
+        context: &'static str,
+        allow_multi_decl: bool,
+    ) -> Result<(), GoTemplateScanError> {
+        let checkpoint = self.idx;
+        let v = self.peek_non_space();
+        if v.kind != TokKind::Variable {
+            return Ok(());
+        }
+        let _ = self.next_non_space();
+        let next = self.peek_non_space();
+        match next.kind {
+            TokKind::Assign | TokKind::Declare => {
+                let op = self.next_non_space();
+                if op.kind == TokKind::Declare {
+                    self.record_declared(v.text(self.src), v.start);
+                } else {
+                    self.record_assigned(v.text(self.src), v.start);
+                }
+                Ok(())
+            }
+            TokKind::Comma => {
+                if !allow_multi_decl {
+                    return Err(GoTemplateScanError {
+                        code: "too_many_declarations",
+                        message: "too many declarations",
+                        offset: self.abs(v.start),
+                    });
+                }
+                let _ = self.next_non_space();
+                let second = self.next_non_space();
+                if second.kind != TokKind::Variable {
+                    if second.kind == TokKind::Eof {
+                        return Err(GoTemplateScanError {
+                            code: "missing_value_for_context",
+                            message: context_message(context),
+                            offset: self.current_offset(),
+                        });
+                    }
+                    return Err(self.unexpected_token(&second, context));
+                }
+                if self.peek_non_space().kind == TokKind::Comma {
+                    return Err(GoTemplateScanError {
+                        code: "too_many_declarations",
+                        message: "too many declarations",
+                        offset: self.abs(second.start),
+                    });
+                }
+                let assign = self.next_non_space();
+                if assign.kind != TokKind::Assign && assign.kind != TokKind::Declare {
+                    if assign.kind == TokKind::Eof {
+                        return Err(GoTemplateScanError {
+                            code: "missing_value_for_context",
+                            message: context_message(context),
+                            offset: self.current_offset(),
+                        });
+                    }
+                    return Err(self.unexpected_token(&assign, context));
+                }
+                if assign.kind == TokKind::Declare {
+                    self.record_declared(v.text(self.src), v.start);
+                    self.record_declared(second.text(self.src), second.start);
+                } else {
+                    self.record_assigned(v.text(self.src), v.start);
+                    self.record_assigned(second.text(self.src), second.start);
+                }
+                Ok(())
+            }
+            _ => {
+                self.idx = checkpoint;
+                Ok(())
+            }
+        }
+    }
+
+    fn parse_command(&mut self) -> Result<CommandInfo<'a>, GoTemplateScanError> {
+        let mut first_term = None;
+        let mut first_identifier = None;
+        let mut first_variable = None;
+        let mut args = 0usize;
+        loop {
+            let first_tok = self.peek_non_space();
+            let operand = self.parse_operand()?;
+            if let Some(term) = operand {
+                if first_term.is_none() {
+                    first_term = Some(term);
+                    if term == TermKind::Identifier && first_tok.kind == TokKind::Identifier {
+                        first_identifier = Some(IdentifierRef {
+                            name: first_tok.text(self.src),
+                            start: first_tok.start,
+                        });
+                    } else if term == TermKind::Variable && first_tok.kind == TokKind::Variable {
+                        first_variable = Some(IdentifierRef {
+                            name: first_tok.text(self.src),
+                            start: first_tok.start,
+                        });
+                    }
+                }
+                args += 1;
+            }
+
+            let tok = self.next();
+            match tok.kind {
+                TokKind::Space => continue,
+                TokKind::Eof | TokKind::RightParen => {
+                    self.backup();
+                    break;
+                }
+                TokKind::Pipe => break,
+                TokKind::Declare | TokKind::Assign => {
+                    if let Some(v) = first_variable {
+                        if self.options.check_variables && !self.variable_is_visible(v.name) {
+                            return Err(GoTemplateScanError {
+                                code: "undefined_variable",
+                                message: "undefined variable",
+                                offset: self.abs(v.start),
+                            });
+                        }
+                    }
+                    return Err(self.unexpected_in_operand(&tok));
+                }
+                _ => return Err(self.unexpected_in_operand(&tok)),
+            }
+        }
+
+        if args == 0 {
+            return Err(GoTemplateScanError {
+                code: "empty_command",
+                message: "empty command",
+                offset: self.current_offset(),
+            });
+        }
+
+        Ok(CommandInfo {
+            first_term: first_term.unwrap_or(TermKind::OtherExec),
+            first_identifier,
+        })
+    }
+
+    fn parse_operand(&mut self) -> Result<Option<TermKind>, GoTemplateScanError> {
+        let Some(term) = self.parse_term()? else {
+            return Ok(None);
+        };
+
+        if self.peek().kind == TokKind::Field {
+            while self.peek().kind == TokKind::Field {
+                let _ = self.next();
+            }
+            if matches!(
+                term,
+                TermKind::Bool
+                    | TermKind::String
+                    | TermKind::Number
+                    | TermKind::Nil
+                    | TermKind::Dot
+            ) {
+                return Err(GoTemplateScanError {
+                    code: "unexpected_dot_after_term",
+                    message: "unexpected <.> after term",
+                    offset: self.abs(self.peek().start),
+                });
+            }
+        }
+
+        Ok(Some(term))
+    }
+
+    fn parse_term(&mut self) -> Result<Option<TermKind>, GoTemplateScanError> {
+        let tok = self.next_non_space();
+        match tok.kind {
+            TokKind::Identifier => Ok(Some(TermKind::Identifier)),
+            TokKind::KwBreak | TokKind::KwContinue if self.keyword_token_is_function(tok) => {
+                Ok(Some(TermKind::Identifier))
+            }
+            TokKind::Dot => Ok(Some(TermKind::Dot)),
+            TokKind::Nil => Ok(Some(TermKind::Nil)),
+            TokKind::Variable => {
+                self.record_reference(tok.text(self.src), tok.start);
+                Ok(Some(TermKind::Variable))
+            }
+            TokKind::Field => Ok(Some(TermKind::Field)),
+            TokKind::Bool => Ok(Some(TermKind::Bool)),
+            TokKind::CharConst | TokKind::Number => Ok(Some(TermKind::Number)),
+            TokKind::String | TokKind::RawString => Ok(Some(TermKind::String)),
+            TokKind::LeftParen => {
+                self.parse_pipeline("parenthesized pipeline", TokKind::RightParen, false)?;
+                Ok(Some(TermKind::OtherExec))
+            }
+            _ => {
+                self.backup();
+                Ok(None)
+            }
+        }
+    }
+
+    fn unexpected_in_operand(&self, tok: &Tok) -> GoTemplateScanError {
+        match tok.kind {
+            TokKind::Char if tok.text(self.src) == "{" => GoTemplateScanError {
+                code: "unexpected_left_delim_in_operand",
+                message: "unexpected \"{\" in operand",
+                offset: self.abs(tok.start),
+            },
+            TokKind::Dot => GoTemplateScanError {
+                code: "unexpected_dot_in_operand",
+                message: "unexpected <.> in operand",
+                offset: self.abs(tok.start),
+            },
+            _ => self.unexpected_token(tok, "operand"),
+        }
+    }
+
+    fn unexpected_token(&self, tok: &Tok, context: &'static str) -> GoTemplateScanError {
+        if tok.kind == TokKind::Eof {
+            return GoTemplateScanError {
+                code: "unexpected_eof",
+                message: "unexpected EOF",
+                offset: self.abs(tok.start),
+            };
+        }
+        GoTemplateScanError {
+            code: "unexpected_token",
+            message: context_message(context),
+            offset: self.abs(tok.start),
+        }
+    }
+
+    fn current_offset(&self) -> usize {
+        self.tokens
+            .get(self.idx)
+            .or_else(|| self.tokens.last())
+            .map_or(self.base, |t| self.abs(t.start))
+    }
+
+    fn current_offset_for_stage(&self, _stage: usize) -> usize {
+        self.current_offset()
+    }
+
+    fn keyword_token_is_function(&self, tok: Tok) -> bool {
+        let Some(name) = keyword_function_candidate(tok.kind) else {
+            return false;
+        };
+        self.function_is_defined(name)
+    }
+
+    fn check_function_is_defined(
+        &self,
+        name: &'a str,
+        start: usize,
+    ) -> Result<(), GoTemplateScanError> {
+        if self.options.skip_func_check || self.function_is_defined(name) {
+            return Ok(());
+        }
+        Err(GoTemplateScanError {
+            code: "undefined_function",
+            message: "function is not defined",
+            offset: self.abs(start),
+        })
+    }
+
+    fn function_is_defined(&self, name: &str) -> bool {
+        GO_BUILTIN_FUNCTIONS.iter().any(|builtin| builtin == &name)
+            || self
+                .options
+                .known_functions
+                .iter()
+                .any(|known| known == &name)
+    }
+
+    fn is_term_start(&self, kind: TokKind) -> bool {
+        is_term_start(kind)
+            || keyword_function_candidate(kind).is_some_and(|name| self.function_is_defined(name))
+    }
+
+    fn variable_is_visible(&self, name: &str) -> bool {
+        if name == "$" {
+            return true;
+        }
+        self.options.visible_variables.iter().any(|v| v == &name)
+    }
+
+    fn record_declared(&mut self, name: &str, start: usize) {
+        self.declared_vars.push(VariableRef {
+            name: name.to_string(),
+            offset: self.abs(start),
+        });
+    }
+
+    fn record_assigned(&mut self, name: &str, start: usize) {
+        self.assigned_vars.push(VariableRef {
+            name: name.to_string(),
+            offset: self.abs(start),
+        });
+    }
+
+    fn record_reference(&mut self, name: &str, start: usize) {
+        self.referenced_vars.push(VariableRef {
+            name: name.to_string(),
+            offset: self.abs(start),
+        });
+    }
+
+    fn abs(&self, local: usize) -> usize {
+        self.base + local
+    }
+
+    fn peek(&self) -> Tok {
+        self.tokens.get(self.idx).copied().unwrap_or(Tok {
+            kind: TokKind::Eof,
+            start: self.src.len(),
+            end: self.src.len(),
+        })
+    }
+
+    fn next(&mut self) -> Tok {
+        let tok = self.peek();
+        if self.idx < self.tokens.len() {
+            self.idx += 1;
+        }
+        tok
+    }
+
+    fn backup(&mut self) {
+        if self.idx > 0 {
+            self.idx -= 1;
+        }
+    }
+
+    fn peek_non_space(&self) -> Tok {
+        let mut i = self.idx;
+        while let Some(tok) = self.tokens.get(i).copied() {
+            if tok.kind != TokKind::Space {
+                return tok;
+            }
+            i += 1;
+        }
+        Tok {
+            kind: TokKind::Eof,
+            start: self.src.len(),
+            end: self.src.len(),
+        }
+    }
+
+    fn next_non_space(&mut self) -> Tok {
+        loop {
+            let tok = self.next();
+            if tok.kind != TokKind::Space {
+                return tok;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommandInfo<'a> {
+    first_term: TermKind,
+    first_identifier: Option<IdentifierRef<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IdentifierRef<'a> {
+    name: &'a str,
+    start: usize,
+}
+
+fn keyword_function_candidate(kind: TokKind) -> Option<&'static str> {
+    match kind {
+        TokKind::KwBreak => Some("break"),
+        TokKind::KwContinue => Some("continue"),
+        _ => None,
+    }
+}
+
+fn unquote_string_like(raw: &str) -> String {
+    if raw.len() >= 2 {
+        let first = raw.as_bytes()[0];
+        let last = raw.as_bytes()[raw.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'`' && last == b'`') {
+            return raw[1..raw.len() - 1].to_string();
+        }
+    }
+    raw.to_string()
+}
+
+fn context_message(context: &'static str) -> &'static str {
+    match context {
+        "command" => "unexpected token in command",
+        "operand" => "unexpected token in operand",
+        "define clause" => "unexpected token in define clause",
+        "template clause" => "unexpected token in template clause",
+        "block clause" => "unexpected token in block clause",
+        "else" => "unexpected token in else clause",
+        "control" => "unexpected token in control",
+        "range" => "missing value for range",
+        "parenthesized pipeline" => "unexpected token in parenthesized pipeline",
+        _ => "unexpected token",
+    }
+}
+
+fn is_term_start(kind: TokKind) -> bool {
+    matches!(
+        kind,
+        TokKind::Bool
+            | TokKind::CharConst
+            | TokKind::Dot
+            | TokKind::Field
+            | TokKind::Identifier
+            | TokKind::Number
+            | TokKind::Nil
+            | TokKind::RawString
+            | TokKind::String
+            | TokKind::Variable
+            | TokKind::LeftParen
+    )
+}
+
+fn lex_action_inner(src: &str, abs_base: usize) -> Result<Vec<Tok>, GoTemplateScanError> {
+    let bytes = src.as_bytes();
+    let mut out = Vec::with_capacity(src.len() / 2 + 2);
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if is_space(b) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_space(bytes[i]) {
+                i += 1;
+            }
+            out.push(Tok {
+                kind: TokKind::Space,
+                start,
+                end: i,
+            });
+            continue;
+        }
+
+        match b {
+            b'=' => {
+                out.push(tok(TokKind::Assign, i, i + 1));
+                i += 1;
+            }
+            b':' => {
+                if i + 1 >= bytes.len() || bytes[i + 1] != b'=' {
+                    return Err(GoTemplateScanError {
+                        code: "expected_declare_assign",
+                        message: "expected :=",
+                        offset: abs_base + i,
+                    });
+                }
+                out.push(tok(TokKind::Declare, i, i + 2));
+                i += 2;
+            }
+            b'|' => {
+                out.push(tok(TokKind::Pipe, i, i + 1));
+                i += 1;
+            }
+            b'(' => {
+                out.push(tok(TokKind::LeftParen, i, i + 1));
+                i += 1;
+            }
+            b')' => {
+                out.push(tok(TokKind::RightParen, i, i + 1));
+                i += 1;
+            }
+            b',' => {
+                out.push(tok(TokKind::Comma, i, i + 1));
+                i += 1;
+            }
+            b'"' => {
+                let start = i;
+                i += 1;
+                loop {
+                    if i >= bytes.len() {
+                        return Err(GoTemplateScanError {
+                            code: "unterminated_quoted_string",
+                            message: "unterminated quoted string",
+                            offset: abs_base + start,
+                        });
+                    }
+                    match bytes[i] {
+                        b'\\' => {
+                            i += 1;
+                            if i < bytes.len() {
+                                i += 1;
+                            }
+                        }
+                        b'\n' => {
+                            return Err(GoTemplateScanError {
+                                code: "unterminated_quoted_string",
+                                message: "unterminated quoted string",
+                                offset: abs_base + start,
+                            });
+                        }
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                out.push(tok(TokKind::String, start, i));
+            }
+            b'`' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'`' {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return Err(GoTemplateScanError {
+                        code: "unterminated_raw_quoted_string",
+                        message: "unterminated raw quoted string",
+                        offset: abs_base + start,
+                    });
+                }
+                i += 1;
+                out.push(tok(TokKind::RawString, start, i));
+            }
+            b'$' => {
+                let (kind, end) = lex_field_or_variable(bytes, i, true, abs_base)?;
+                out.push(tok(kind, i, end));
+                i = end;
+            }
+            b'\'' => {
+                let start = i;
+                i += 1;
+                loop {
+                    if i >= bytes.len() {
+                        return Err(GoTemplateScanError {
+                            code: "unterminated_character_constant",
+                            message: "unterminated character constant",
+                            offset: abs_base + start,
+                        });
+                    }
+                    match bytes[i] {
+                        b'\\' => {
+                            i += 1;
+                            if i < bytes.len() {
+                                i += 1;
+                            }
+                        }
+                        b'\n' => {
+                            return Err(GoTemplateScanError {
+                                code: "unterminated_character_constant",
+                                message: "unterminated character constant",
+                                offset: abs_base + start,
+                            });
+                        }
+                        b'\'' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                out.push(tok(TokKind::CharConst, start, i));
+            }
+            b'.' => {
+                if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+                    let end = lex_number(bytes, i, abs_base)?;
+                    out.push(tok(TokKind::Number, i, end));
+                    i = end;
+                } else {
+                    let (kind, end) = lex_field_or_variable(bytes, i, false, abs_base)?;
+                    out.push(tok(kind, i, end));
+                    i = end;
+                }
+            }
+            b'+' | b'-' | b'0'..=b'9' => {
+                let end = lex_number(bytes, i, abs_base)?;
+                out.push(tok(TokKind::Number, i, end));
+                i = end;
+            }
+            _ if is_alpha_numeric(b) => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && is_alpha_numeric(bytes[i]) {
+                    i += 1;
+                }
+                if !at_terminator(bytes, i) {
+                    return Err(GoTemplateScanError {
+                        code: "bad_character",
+                        message: "bad character in action",
+                        offset: abs_base + i,
+                    });
+                }
+                let word = &src[start..i];
+                let kind = classify_word(word);
+                out.push(tok(kind, start, i));
+            }
+            _ if b.is_ascii_graphic() || b == b' ' => {
+                out.push(tok(TokKind::Char, i, i + 1));
+                i += 1;
+            }
+            _ => {
+                return Err(GoTemplateScanError {
+                    code: "unrecognized_character_in_action",
+                    message: "unrecognized character in action",
+                    offset: abs_base + i,
+                });
+            }
+        }
+    }
+
+    out.push(Tok {
+        kind: TokKind::Eof,
+        start: src.len(),
+        end: src.len(),
+    });
+    Ok(out)
+}
+
+fn tok(kind: TokKind, start: usize, end: usize) -> Tok {
+    Tok { kind, start, end }
+}
+
+fn classify_word(word: &str) -> TokKind {
+    match word {
+        "true" | "false" => TokKind::Bool,
+        "nil" => TokKind::Nil,
+        "block" => TokKind::KwBlock,
+        "break" => TokKind::KwBreak,
+        "continue" => TokKind::KwContinue,
+        "define" => TokKind::KwDefine,
+        "else" => TokKind::KwElse,
+        "end" => TokKind::KwEnd,
+        "if" => TokKind::KwIf,
+        "range" => TokKind::KwRange,
+        "template" => TokKind::KwTemplate,
+        "with" => TokKind::KwWith,
+        _ => TokKind::Identifier,
+    }
+}
+
+fn lex_field_or_variable(
+    bytes: &[u8],
+    start: usize,
+    variable: bool,
+    abs_base: usize,
+) -> Result<(TokKind, usize), GoTemplateScanError> {
+    let mut i = start + 1;
+    if at_terminator(bytes, i) {
+        if variable {
+            return Ok((TokKind::Variable, i));
+        }
+        return Ok((TokKind::Dot, i));
+    }
+    while i < bytes.len() && is_alpha_numeric(bytes[i]) {
+        i += 1;
+    }
+    if !at_terminator(bytes, i) {
+        return Err(GoTemplateScanError {
+            code: "bad_character",
+            message: "bad character in action",
+            offset: abs_base + i,
+        });
+    }
+    if variable {
+        Ok((TokKind::Variable, i))
+    } else {
+        Ok((TokKind::Field, i))
+    }
+}
+
+fn lex_number(bytes: &[u8], start: usize, abs_base: usize) -> Result<usize, GoTemplateScanError> {
+    let mut i = start;
+    let end1 = scan_number(bytes, &mut i, abs_base, start)?;
+    if end1 == start {
+        return Err(GoTemplateScanError {
+            code: "bad_number_syntax",
+            message: "bad number syntax",
+            offset: abs_base + start,
+        });
+    }
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        let mut k = i;
+        let end2 = scan_number(bytes, &mut k, abs_base, start)?;
+        if end2 == i || bytes.get(k.wrapping_sub(1)).copied() != Some(b'i') {
+            return Err(GoTemplateScanError {
+                code: "bad_number_syntax",
+                message: "bad number syntax",
+                offset: abs_base + start,
+            });
+        }
+        i = k;
+    }
+    if !at_terminator(bytes, i) {
+        return Err(GoTemplateScanError {
+            code: "bad_number_syntax",
+            message: "bad number syntax",
+            offset: abs_base + start,
+        });
+    }
+    Ok(i)
+}
+
+fn scan_number(
+    bytes: &[u8],
+    i: &mut usize,
+    abs_base: usize,
+    start: usize,
+) -> Result<usize, GoTemplateScanError> {
+    let len = bytes.len();
+    if *i < len && (bytes[*i] == b'+' || bytes[*i] == b'-') {
+        *i += 1;
+    }
+
+    let mut base = 10u8;
+    let mut require_digit_after_prefix = false;
+    let mut leading_decimal_zero = false;
+    if *i < len && bytes[*i] == b'0' {
+        *i += 1;
+        leading_decimal_zero = true;
+        if *i < len && (bytes[*i] == b'x' || bytes[*i] == b'X') {
+            *i += 1;
+            base = 16;
+            leading_decimal_zero = false;
+            require_digit_after_prefix = true;
+        } else if *i < len && (bytes[*i] == b'o' || bytes[*i] == b'O') {
+            *i += 1;
+            base = 8;
+            leading_decimal_zero = false;
+            require_digit_after_prefix = true;
+        } else if *i < len && (bytes[*i] == b'b' || bytes[*i] == b'B') {
+            *i += 1;
+            base = 2;
+            leading_decimal_zero = false;
+            require_digit_after_prefix = true;
+        }
+    }
+
+    let mut saw_digit = leading_decimal_zero;
+    saw_digit |= consume_number_digits(bytes, i, base);
+
+    if *i < len && bytes[*i] == b'.' {
+        *i += 1;
+        let saw_fraction_digit = consume_number_digits(bytes, i, base);
+        saw_digit |= saw_fraction_digit;
+        if !saw_fraction_digit {
+            return Err(GoTemplateScanError {
+                code: "bad_number_syntax",
+                message: "bad number syntax",
+                offset: abs_base + start,
+            });
+        }
+    }
+
+    if base == 10 && *i < len && (bytes[*i] == b'e' || bytes[*i] == b'E') {
+        *i += 1;
+        if *i < len && (bytes[*i] == b'+' || bytes[*i] == b'-') {
+            *i += 1;
+        }
+        let mut exp_digits = false;
+        while *i < len && (bytes[*i].is_ascii_digit() || bytes[*i] == b'_') {
+            if bytes[*i].is_ascii_digit() {
+                exp_digits = true;
+            }
+            *i += 1;
+        }
+        if !exp_digits {
+            return Err(GoTemplateScanError {
+                code: "bad_number_syntax",
+                message: "bad number syntax",
+                offset: abs_base + start,
+            });
+        }
+    }
+
+    if base == 16 && *i < len && (bytes[*i] == b'p' || bytes[*i] == b'P') {
+        *i += 1;
+        if *i < len && (bytes[*i] == b'+' || bytes[*i] == b'-') {
+            *i += 1;
+        }
+        let mut exp_digits = false;
+        while *i < len && (bytes[*i].is_ascii_digit() || bytes[*i] == b'_') {
+            if bytes[*i].is_ascii_digit() {
+                exp_digits = true;
+            }
+            *i += 1;
+        }
+        if !exp_digits {
+            return Err(GoTemplateScanError {
+                code: "bad_number_syntax",
+                message: "bad number syntax",
+                offset: abs_base + start,
+            });
+        }
+    }
+
+    if require_digit_after_prefix && !saw_digit {
+        return Err(GoTemplateScanError {
+            code: "bad_number_syntax",
+            message: "bad number syntax",
+            offset: abs_base + start,
+        });
+    }
+    if !require_digit_after_prefix && !saw_digit {
+        return Err(GoTemplateScanError {
+            code: "bad_number_syntax",
+            message: "bad number syntax",
+            offset: abs_base + start,
+        });
+    }
+
+    if *i < len && bytes[*i] == b'i' {
+        *i += 1;
+    }
+
+    Ok(*i)
+}
+
+fn consume_number_digits(bytes: &[u8], i: &mut usize, base: u8) -> bool {
+    let len = bytes.len();
+    let mut saw_digit = false;
+    while *i < len && is_number_digit(bytes[*i], base) {
+        if bytes[*i] != b'_' {
+            saw_digit = true;
+        }
+        *i += 1;
+    }
+    saw_digit
+}
+
+fn at_terminator(bytes: &[u8], i: usize) -> bool {
+    if i >= bytes.len() {
+        return true;
+    }
+    let b = bytes[i];
+    is_space(b)
+        || matches!(
+            b,
+            b'.' | b',' | b'|' | b':' | b')' | b'(' | b'"' | b'\'' | b'`'
+        )
+}
+
+fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn is_alpha_numeric(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}
+
+fn is_number_digit(b: u8, base: u8) -> bool {
+    if b == b'_' {
+        return true;
+    }
+    match base {
+        2 => matches!(b, b'0' | b'1'),
+        8 => (b'0'..=b'7').contains(&b),
+        10 => b.is_ascii_digit(),
+        16 => b.is_ascii_hexdigit(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_accepts_basic_include_action() {
+        let action = parse_action_compat("{{ include \"x\" . }}", 0).expect("must parse");
+        assert_eq!(action, ControlAction::None);
+    }
+
+    #[test]
+    fn parser_reports_nested_left_delim_in_operand() {
+        let err =
+            parse_action_compat("{{ include \"a\" {{ .Values.x }} }}", 0).expect_err("must fail");
+        assert_eq!(err.code, "unexpected_left_delim_in_operand");
+    }
+
+    #[test]
+    fn parser_reports_unexpected_dot_in_operand() {
+        let err = parse_action_compat("{{ .Values.bad..path }}", 0).expect_err("must fail");
+        assert_eq!(err.code, "unexpected_dot_in_operand");
+    }
+
+    #[test]
+    fn parser_accepts_control_define_end_actions() {
+        assert_eq!(
+            parse_action_compat("{{ define \"a\" }}", 0).expect("must parse"),
+            ControlAction::Open(ControlKind::Define)
+        );
+        assert_eq!(
+            parse_action_compat("{{ end }}", 0).expect("must parse"),
+            ControlAction::End
+        );
+    }
+
+    #[test]
+    fn parser_can_check_function_existence() {
+        let err = parse_action_compat_with_options(
+            "{{ totallyUnknown . }}",
+            0,
+            ParseCompatOptions {
+                skip_func_check: false,
+                known_functions: &[],
+                check_variables: false,
+                visible_variables: &[],
+            },
+        )
+        .expect_err("must fail");
+        assert_eq!(err.code, "undefined_function");
+    }
+
+    #[test]
+    fn parser_allows_declared_function_with_func_check_enabled() {
+        let action = parse_action_compat_with_options(
+            "{{ customFn . }}",
+            0,
+            ParseCompatOptions {
+                skip_func_check: false,
+                known_functions: &["customFn"],
+                check_variables: false,
+                visible_variables: &[],
+            },
+        )
+        .expect("must parse");
+        assert_eq!(action, ControlAction::None);
+    }
+
+    #[test]
+    fn parser_treats_break_as_function_when_declared() {
+        let action = parse_action_compat_with_options(
+            "{{ break 20 }}",
+            0,
+            ParseCompatOptions {
+                skip_func_check: false,
+                known_functions: &["break"],
+                check_variables: false,
+                visible_variables: &[],
+            },
+        )
+        .expect("must parse");
+        assert_eq!(action, ControlAction::None);
+    }
+
+    #[test]
+    fn parser_rejects_multi_decl_outside_range() {
+        let err = parse_action_compat_with_options(
+            "{{ with $v, $u := 3 }}",
+            0,
+            ParseCompatOptions {
+                skip_func_check: true,
+                known_functions: &[],
+                check_variables: false,
+                visible_variables: &[],
+            },
+        )
+        .expect_err("must fail");
+        assert_eq!(err.code, "too_many_declarations");
+    }
+}

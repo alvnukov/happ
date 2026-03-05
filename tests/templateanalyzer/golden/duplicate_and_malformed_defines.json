@@ -1,0 +1,20 @@
+{
+  "include_names": [],
+  "values_paths": [
+    [
+      "x_y-z",
+      "v1"
+    ]
+  ],
+  "define_blocks": {
+    "dup.a": "{{- define \"dup.a\" -}}first{{- end -}}",
+    "single.q": "{{- define 'single.q' -}}{{ $.Values.x_y-z.v1 }}{{- end -}}"
+  },
+  "include_graph": {
+    "dup.a": [],
+    "single.q": []
+  },
+  "unresolved_local_includes": [],
+  "diagnostics": [],
+  "include_cycles": []
+}

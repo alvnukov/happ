@@ -1,0 +1,29 @@
+{
+  "include_names": [
+    "foo.cluster-name",
+    "foo.name"
+  ],
+  "values_paths": [
+    [
+      "cluster",
+      "name"
+    ],
+    [
+      "serviceAccount",
+      "name"
+    ]
+  ],
+  "define_blocks": {
+    "foo.cluster-name": "{{- define \"foo.cluster-name\" -}}\n{{- default (include \"foo.name\" .) .Values.cluster.name -}}\n{{- end -}}",
+    "foo.name": "{{- define \"foo.name\" -}}\nfoo\n{{- end -}}"
+  },
+  "include_graph": {
+    "foo.cluster-name": [
+      "foo.name"
+    ],
+    "foo.name": []
+  },
+  "unresolved_local_includes": [],
+  "diagnostics": [],
+  "include_cycles": []
+}

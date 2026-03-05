@@ -1,0 +1,20 @@
+mod assets;
+mod cli;
+mod composeimport;
+mod composeinspect;
+mod convert;
+mod dyfflike;
+pub mod gotemplates;
+mod inspectweb;
+mod lsp;
+mod output;
+mod query;
+mod service;
+mod source;
+pub mod sprigset;
+pub mod templateanalyzer;
+pub mod templatepolicy;
+mod verify;
+mod yamlmerge;
+
+pub use service::run;

@@ -1,0 +1,99 @@
+- name: include_ok
+  src: '{{ include "a" . }}'
+  expected_code: null
+- name: unclosed_action
+  src: '{{ include "a" . '
+  expected_code: unterminated_action
+- name: unclosed_comment_before_delim
+  src: '{{/* comment */ x }}'
+  expected_code: comment_ends_before_closing_delimiter
+- name: nested_left_delim_operand
+  src: '{{ include "a" {{ .Values.x }} }}'
+  expected_code: unexpected_left_delim_in_operand
+- name: bad_dot_operand
+  src: '{{ .Values.bad..path }}'
+  expected_code: unexpected_dot_in_operand
+- name: unterminated_quoted_string
+  src: '{{ include "a }}'
+  expected_code: unterminated_quoted_string
+- name: if_end_ok
+  src: '{{ if .Values.x }}{{ end }}'
+  expected_code: null
+- name: if_missing_end
+  src: '{{ if .Values.x }}'
+  expected_code: unexpected_eof
+- name: stray_else
+  src: '{{ else }}'
+  expected_code: unexpected_else_action
+- name: stray_end
+  src: '{{ end }}'
+  expected_code: unexpected_end_action
+- name: define_end_ok
+  src: '{{ define "a" }}{{ end }}'
+  expected_code: null
+- name: define_missing_end
+  src: '{{ define "a" }}'
+  expected_code: unexpected_eof
+- name: block_ok
+  src: '{{ block "x" . }}{{ end }}'
+  expected_code: null
+- name: block_missing_ctx
+  src: '{{ block "x" }}'
+  expected_code: missing_value_for_context
+- name: template_no_arg_ok
+  src: '{{ template "x" }}'
+  expected_code: null
+- name: template_with_arg_ok
+  src: '{{ template "x" . }}'
+  expected_code: null
+- name: range_else_if_invalid
+  src: '{{ range .Items }}x{{ else if .Cond }}y{{ end }}'
+  expected_code: unexpected_token
+- name: range_else_with_invalid
+  src: '{{ range .Items }}x{{ else with .Ctx }}y{{ end }}'
+  expected_code: unexpected_token
+- name: with_else_if_invalid
+  src: '{{ with .Ctx }}x{{ else if .Cond }}y{{ end }}'
+  expected_code: unexpected_token
+- name: if_else_with_invalid
+  src: '{{ if .Cond }}x{{ else with .Ctx }}y{{ end }}'
+  expected_code: unexpected_token
+- name: double_else_invalid
+  src: '{{ if .Cond }}x{{ else }}y{{ else }}z{{ end }}'
+  expected_code: unexpected_else_action
+- name: break_outside_range
+  src: '{{ break }}'
+  expected_code: break_outside_range
+- name: continue_outside_range
+  src: '{{ continue }}'
+  expected_code: continue_outside_range
+- name: break_inside_range_ok
+  src: '{{ range .Items }}{{ break }}{{ end }}'
+  expected_code: null
+- name: break_in_range_else_invalid
+  src: '{{ range .Items }}x{{ else }}{{ break }}{{ end }}'
+  expected_code: break_outside_range
+- name: continue_in_range_else_invalid
+  src: '{{ range .Items }}x{{ else }}{{ continue }}{{ end }}'
+  expected_code: continue_outside_range
+- name: unclosed_left_paren
+  src: '{{ .X (1 2 3}}'
+  expected_code: unclosed_left_paren
+- name: unexpected_right_paren
+  src: '{{ .X 1 2 3 ) }}'
+  expected_code: unexpected_right_paren
+- name: unterminated_raw_quoted_string
+  src: '{{`a}}'
+  expected_code: unterminated_raw_quoted_string
+- name: bad_number_syntax
+  src: '{{0xi}}'
+  expected_code: bad_number_syntax
+- name: unexpected_dot_after_term
+  src: '{{true.any}}'
+  expected_code: unexpected_dot_after_term
+- name: non_exec_pipeline_stage
+  src: '{{12|false}}'
+  expected_code: non_executable_command_in_pipeline
+- name: missing_parenthesized_pipeline_value
+  src: '{{ ( ) }}'
+  expected_code: missing_value_for_context
