@@ -1329,6 +1329,19 @@ fn eval_pipeline_command(
         return Ok(result);
     }
 
+    if let Some(result) = try_eval_dynamic_external_function(
+        action,
+        &tokens,
+        root,
+        dot,
+        has_pipe_input,
+        pipe_input.clone(),
+        state,
+        resolver,
+    )? {
+        return Ok(result);
+    }
+
     if has_pipe_input {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
@@ -1495,6 +1508,59 @@ fn try_eval_external_function(
             Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
                 reason: format!("error calling {name}: {reason}"),
+            })
+        }
+    }
+}
+
+fn try_eval_dynamic_external_function(
+    action: &str,
+    tokens: &[String],
+    root: &Value,
+    dot: &Value,
+    has_pipe_input: bool,
+    pipe_input: Option<Value>,
+    state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
+) -> Result<Option<Option<Value>>, NativeRenderError> {
+    let Some(resolver) = resolver else {
+        return Ok(None);
+    };
+    if tokens.is_empty() || is_identifier_name(&tokens[0]) {
+        return Ok(None);
+    }
+
+    let Some(Value::String(fn_name)) =
+        eval_command_token_value(action, &tokens[0], root, dot, state, Some(resolver))?
+    else {
+        return Ok(None);
+    };
+    if !is_identifier_name(&fn_name) {
+        return Ok(None);
+    }
+
+    let mut args = Vec::with_capacity(tokens.len().saturating_sub(1) + usize::from(has_pipe_input));
+    for token in tokens.iter().skip(1) {
+        args.push(eval_command_token_value(
+            action,
+            token,
+            root,
+            dot,
+            state,
+            Some(resolver),
+        )?);
+    }
+    if has_pipe_input {
+        args.push(pipe_input);
+    }
+
+    match resolver.call(&fn_name, &args) {
+        Ok(v) => Ok(Some(v)),
+        Err(NativeFunctionResolverError::UnknownFunction) => Ok(None),
+        Err(NativeFunctionResolverError::Failed { reason }) => {
+            Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!("error calling {fn_name}: {reason}"),
             })
         }
     }
@@ -3681,6 +3747,14 @@ mod tests {
         )
         .expect("must render");
         assert_eq!(out, "called:y");
+        let out = render_template_native_with_resolver(
+            "{{.fn \"z\"}}",
+            &data,
+            NativeRenderOptions::default(),
+            Some(&resolver),
+        )
+        .expect("must render");
+        assert_eq!(out, "called:z");
     }
 
     #[test]
