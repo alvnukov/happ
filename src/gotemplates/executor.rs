@@ -2215,32 +2215,23 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
                     out.push_str(&format_printf_mismatch(verb, arg));
                 }
             }
-            'x' | 'X' => {
+            'x' | 'X' | 'o' | 'b' => {
                 if let Some(n) = value_to_i64(arg) {
-                    let rendered = if n < 0 {
-                        let abs = n.unsigned_abs();
-                        if verb == 'x' {
-                            format!("-{:x}", abs)
-                        } else {
-                            format!("-{:X}", abs)
-                        }
-                    } else {
-                        let abs = n.unsigned_abs();
-                        if verb == 'x' {
-                            format!("{:x}", abs)
-                        } else {
-                            format!("{:X}", abs)
-                        }
-                    };
+                    let rendered = format_signed_integer_radix(n, verb);
                     push_with_width(&mut out, &rendered, width, zero_pad);
                 } else {
                     out.push_str(&format_printf_mismatch(verb, arg));
                 }
             }
-            'f' => {
+            'f' | 'e' | 'E' => {
                 if let Some(n) = value_to_f64(arg) {
                     let prec = precision.unwrap_or(6);
-                    let rendered = format!("{:.*}", prec, n);
+                    let rendered = match verb {
+                        'f' => format!("{:.*}", prec, n),
+                        'e' => format_float_exp_go(n, prec, false),
+                        'E' => format_float_exp_go(n, prec, true),
+                        _ => String::new(),
+                    };
                     push_with_width(&mut out, &rendered, width, zero_pad);
                 } else {
                     out.push_str(&format_printf_mismatch(verb, arg));
@@ -2375,6 +2366,41 @@ fn wrong_number_of_args(
         action: action.to_string(),
         reason: format!("wrong number of args for {fn_name}: want {want} got {got}"),
     }
+}
+
+fn format_signed_integer_radix(n: i64, verb: char) -> String {
+    let abs = n.unsigned_abs();
+    let body = match verb {
+        'x' => format!("{:x}", abs),
+        'X' => format!("{:X}", abs),
+        'o' => format!("{:o}", abs),
+        'b' => format!("{:b}", abs),
+        _ => abs.to_string(),
+    };
+    if n < 0 { format!("-{body}") } else { body }
+}
+
+fn format_float_exp_go(n: f64, precision: usize, upper: bool) -> String {
+    let raw = if upper {
+        format!("{:.*E}", precision, n)
+    } else {
+        format!("{:.*e}", precision, n)
+    };
+    normalize_scientific_exponent(&raw, upper)
+}
+
+fn normalize_scientific_exponent(raw: &str, upper: bool) -> String {
+    let sep = if upper { 'E' } else { 'e' };
+    let Some((mantissa, exp_raw)) = raw.split_once(sep) else {
+        return raw.to_string();
+    };
+    let exp = exp_raw.parse::<i32>().ok();
+    let Some(exp) = exp else {
+        return raw.to_string();
+    };
+    let sign = if exp >= 0 { '+' } else { '-' };
+    let abs = exp.unsigned_abs();
+    format!("{mantissa}{sep}{sign}{abs:02}")
 }
 
 fn format_value_for_printf(v: &Option<Value>, verb: char) -> String {
@@ -3546,6 +3572,14 @@ mod tests {
         assert_eq!(out, "1.200000");
         let out = render_template_native("{{printf \"%.2f\" 1.2}}", &data).expect("must render");
         assert_eq!(out, "1.20");
+        let out = render_template_native("{{printf \"%e\" 1.2}}", &data).expect("must render");
+        assert_eq!(out, "1.200000e+00");
+        let out = render_template_native("{{printf \"%E\" 1.2}}", &data).expect("must render");
+        assert_eq!(out, "1.200000E+00");
+        let out = render_template_native("{{printf \"%o\" 9}}", &data).expect("must render");
+        assert_eq!(out, "11");
+        let out = render_template_native("{{printf \"%b\" 9}}", &data).expect("must render");
+        assert_eq!(out, "1001");
         let out = render_template_native("{{printf \"%04x\" -1}}", &data).expect("must render");
         assert_eq!(out, "-001");
         let out = render_template_native("{{3 | printf \"%d\"}}", &data).expect("must render");
