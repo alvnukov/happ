@@ -106,6 +106,8 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{print 12_}}",
         "{{print 0x1._p2}}",
         "{{print 0x1.p_2}}",
+        "{{print '\\400'}}",
+        "{{print '\\777'}}",
         "{{and}}",
         "{{or}}",
         "{{not}}",

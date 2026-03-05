@@ -1522,6 +1522,12 @@ fn eval_command_token_value(
     if let Some(inner) = strip_outer_parens(token) {
         return eval_pipeline_expr(action, inner, root, dot, state, resolver);
     }
+    if looks_like_char_literal(token) && parse_char_constant(token).is_none() {
+        return Err(NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: format!("invalid syntax: {token}"),
+        });
+    }
     if looks_like_numeric_literal(token) && parse_number_value(token).is_none() {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
@@ -1540,6 +1546,10 @@ fn looks_like_numeric_literal(expr: &str) -> bool {
     body.as_bytes()
         .first()
         .is_some_and(|ch| ch.is_ascii_digit())
+}
+
+fn looks_like_char_literal(expr: &str) -> bool {
+    expr.len() >= 2 && expr.starts_with('\'') && expr.ends_with('\'')
 }
 
 fn ensure_variable_is_defined(expr: &str, state: &EvalState) -> Result<(), NativeRenderError> {
@@ -3222,7 +3232,11 @@ fn parse_go_char_escape(rest: &str) -> Option<u32> {
     }
 
     if rest.chars().all(|c| matches!(c, '0'..='7')) && rest.len() <= 3 {
-        return u32::from_str_radix(rest, 8).ok();
+        let v = u32::from_str_radix(rest, 8).ok()?;
+        if v > 0xFF {
+            return None;
+        }
+        return Some(v);
     }
 
     None
@@ -3725,6 +3739,7 @@ mod tests {
         assert_eq!(out, "9786");
         let out = render_template_native("{{print '\\U0001F600'}}", &data).expect("must render");
         assert_eq!(out, "128512");
+        assert!(render_template_native("{{print '\\400'}}", &data).is_err());
     }
 
     #[test]
