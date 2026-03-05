@@ -1,3 +1,4 @@
+pub mod compat;
 mod executor;
 mod functions;
 mod parser;
