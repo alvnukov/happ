@@ -1,4 +1,7 @@
 use serde_json::{Number, Value};
+use super::typedvalue::decode_go_bytes_value;
+
+const GO_PRINTF_NUM_LIMIT: usize = 1_000_000;
 
 pub fn looks_like_numeric_literal(expr: &str) -> bool {
     let body = expr
@@ -127,6 +130,7 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
     let mut out = String::with_capacity(fmt.len() + 8);
     let mut i = 0usize;
     let mut argi = 0usize;
+    let mut reordered = false;
     let bytes = fmt.as_bytes();
     while i < bytes.len() {
         if bytes[i] != b'%' {
@@ -145,35 +149,173 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
         while i < bytes.len()
             && matches!(
                 bytes[i] as char,
-                '+' | '-' | '#' | ' ' | '0' | '.' | '1'..='9'
+                '+' | '-' | '#' | ' ' | '0' | '.' | '*' | '[' | ']' | '1'..='9'
             )
         {
             i += 1;
         }
         if i >= bytes.len() {
-            return Err("printf has incomplete format specifier".to_string());
+            let tail_spec = &fmt[spec_start + 1..i];
+            let parsed_tail = parse_printf_spec_flags(tail_spec);
+            if parsed_tail.arg_index.is_some()
+                || parsed_tail.width_arg_index.is_some()
+                || parsed_tail.precision_arg_index.is_some()
+                || parsed_tail.bad_index
+            {
+                reordered = true;
+            }
+            if parsed_tail.width_from_arg && parsed_tail.width_arg_index.is_none() && argi < args.len()
+            {
+                argi += 1;
+            }
+            if parsed_tail.precision_from_arg
+                && parsed_tail.precision_arg_index.is_none()
+                && argi < args.len()
+            {
+                argi += 1;
+            }
+            if matches!(bytes.last(), Some(b']')) && parsed_tail.bad_index {
+                out.push_str(&format_bad_index(']'));
+                continue;
+            }
+            out.push_str("%!(NOVERB)");
+            break;
         }
         let spec_flags = &fmt[spec_start + 1..i];
         let verb = bytes[i] as char;
         i += 1;
-        let (width, zero_pad, precision) = parse_width_zero_precision(spec_flags);
-        let left_align = spec_flags.contains('-');
-        let plus_flag = spec_flags.contains('+');
-        let space_flag = !plus_flag && spec_flags.contains(' ');
-        let alt_flag = spec_flags.contains('#');
+        let spec = parse_printf_spec_flags(spec_flags);
+        if spec.no_verb {
+            out.push_str("%!(NOVERB)");
+            continue;
+        }
+        if spec.bad_index {
+            if spec_flags.contains('[') {
+                reordered = true;
+            }
+            out.push_str(&format_bad_index(verb));
+            continue;
+        }
+        let mut good_arg_num = true;
+        if let Some(idx) = spec.arg_index {
+            reordered = true;
+            if idx < args.len() {
+                argi = idx;
+            } else {
+                good_arg_num = false;
+            }
+        }
+        let mut width = spec.width;
+        let mut precision = spec.precision;
+        let mut left_align = spec.minus;
+        let mut zero_pad = spec.zero;
+        let plus_flag = spec.plus;
+        let space_flag = !plus_flag && spec.space;
+        let alt_flag = spec.sharp;
+
+        if spec.width_from_arg {
+            let width_idx = if let Some(idx) = spec.width_arg_index {
+                reordered = true;
+                if idx >= args.len() {
+                    good_arg_num = false;
+                }
+                idx
+            } else {
+                argi
+            };
+            if good_arg_num {
+                match args.get(width_idx) {
+                    Some(v) => match value_to_int_for_width_prec(v) {
+                        Some(n) => {
+                            let abs = n.unsigned_abs();
+                            let abs_usize = usize::try_from(abs).ok();
+                            if abs_usize.map_or(true, |v| v > GO_PRINTF_NUM_LIMIT) {
+                                out.push_str("%!(BADWIDTH)");
+                            } else if n < 0 {
+                                left_align = true;
+                                zero_pad = false;
+                                width = abs_usize;
+                            } else {
+                                width = abs_usize;
+                            }
+                        }
+                        None => out.push_str("%!(BADWIDTH)"),
+                    },
+                    None => out.push_str("%!(BADWIDTH)"),
+                }
+            }
+            if spec.width_arg_index.is_some() {
+                argi = width_idx.saturating_add(1);
+            } else if argi < args.len() {
+                argi += 1;
+            }
+        }
+
+        if spec.precision_from_arg {
+            let prec_idx = if let Some(idx) = spec.precision_arg_index {
+                reordered = true;
+                if idx >= args.len() {
+                    good_arg_num = false;
+                }
+                idx
+            } else {
+                argi
+            };
+            if good_arg_num {
+                match args.get(prec_idx) {
+                    Some(v) => match value_to_int_for_width_prec(v) {
+                        Some(n) if n >= 0 => {
+                            let p = usize::try_from(n).ok();
+                            if p.map_or(true, |v| v > GO_PRINTF_NUM_LIMIT) {
+                                out.push_str("%!(BADPREC)");
+                            } else {
+                                precision = p;
+                            }
+                        }
+                        Some(_) => precision = None,
+                        None => out.push_str("%!(BADPREC)"),
+                    },
+                    None => out.push_str("%!(BADPREC)"),
+                }
+            }
+            if spec.precision_arg_index.is_some() {
+                argi = prec_idx.saturating_add(1);
+            } else if argi < args.len() {
+                argi += 1;
+            }
+        }
+
+        if verb == '%' {
+            out.push('%');
+            continue;
+        }
+        if !good_arg_num {
+            out.push_str(&format_bad_index(verb));
+            continue;
+        }
 
         let Some(arg) = args.get(argi) else {
-            return Err("printf argument count mismatch".to_string());
+            out.push_str(&format_missing_arg(verb));
+            continue;
         };
         argi += 1;
 
         match verb {
-            'v' | 's' => {
-                let mut rendered = format_value_for_printf(arg, verb);
-                if verb == 's' {
-                    if let Some(prec) = precision {
-                        rendered = truncate_runes(&rendered, prec);
-                    }
+            'v' => {
+                let rendered = format_value_for_printf(arg, verb, alt_flag);
+                push_with_width(&mut out, &rendered, width, zero_pad, left_align);
+            }
+            's' => {
+                let mut rendered = if let Some(Value::String(s)) = arg.as_ref() {
+                    s.clone()
+                } else if let Some(bytes) = value_to_byte_slice(arg) {
+                    String::from_utf8_lossy(&bytes).into_owned()
+                } else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                    continue;
+                };
+                if let Some(prec) = precision {
+                    rendered = truncate_runes(&rendered, prec);
                 }
                 push_with_width(&mut out, &rendered, width, zero_pad, left_align);
             }
@@ -182,33 +324,11 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
                 push_with_width(&mut out, &rendered, width, zero_pad, left_align);
             }
             'q' => {
-                let rendered = if alt_flag {
-                    if let Some(Value::String(s)) = arg.as_ref() {
-                        if can_backquote_string(s) {
-                            let mut raw = String::with_capacity(s.len() + 2);
-                            raw.push('`');
-                            raw.push_str(s);
-                            raw.push('`');
-                            raw
-                        } else {
-                            format!("{s:?}")
-                        }
-                    } else {
-                        let text = format_value_for_printf(arg, 's');
-                        format!("{text:?}")
-                    }
-                } else if plus_flag {
-                    if let Some(Value::String(s)) = arg.as_ref() {
-                        quote_string_ascii_go(s)
-                    } else {
-                        let text = format_value_for_printf(arg, 's');
-                        quote_string_ascii_go(&text)
-                    }
-                } else {
-                    let text = format_value_for_printf(arg, 's');
-                    format!("{text:?}")
+                let Some(rendered) = format_q_verb_go(arg, plus_flag, alt_flag) else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                    continue;
                 };
-                if alt_flag {
+                if alt_flag && matches!(arg, Some(Value::String(_))) {
                     push_with_width(&mut out, &rendered, width, zero_pad, left_align);
                     continue;
                 }
@@ -216,8 +336,13 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
             }
             'd' => {
                 if let Some(n) = value_to_i64(arg) {
-                    let rendered =
-                        apply_printf_sign_flags(n.to_string(), n >= 0, plus_flag, space_flag);
+                    let rendered = format_integer_go(
+                        n, verb, plus_flag, space_flag, alt_flag, zero_pad, left_align, width,
+                        precision,
+                    );
+                    push_with_width(&mut out, &rendered, width, false, left_align);
+                } else if let Some(bytes) = value_to_byte_slice(arg) {
+                    let rendered = format_byte_slice_list_go(&bytes, 'd', alt_flag, precision);
                     push_with_width(&mut out, &rendered, width, zero_pad, left_align);
                 } else {
                     out.push_str(&format_printf_mismatch(verb, arg));
@@ -225,12 +350,24 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
             }
             'x' | 'X' | 'o' | 'b' => {
                 if let Some(n) = value_to_i64(arg) {
-                    let rendered = apply_printf_sign_flags(
-                        format_signed_integer_radix(n, verb),
-                        n >= 0,
-                        plus_flag,
-                        space_flag,
+                    let rendered = format_integer_go(
+                        n, verb, plus_flag, space_flag, alt_flag, zero_pad, left_align, width,
+                        precision,
                     );
+                    push_with_width(&mut out, &rendered, width, false, left_align);
+                } else if matches!(arg, Some(Value::String(_))) && matches!(verb, 'x' | 'X') {
+                    let Some(Value::String(s)) = arg.as_ref() else {
+                        unreachable!();
+                    };
+                    let rendered =
+                        format_bytes_hex_go(s.as_bytes(), verb == 'X', alt_flag, space_flag, precision);
+                    push_with_width(&mut out, &rendered, width, zero_pad, left_align);
+                } else if let Some(bytes) = value_to_byte_slice(arg) {
+                    let rendered = if matches!(verb, 'x' | 'X') {
+                        format_bytes_hex_go(&bytes, verb == 'X', alt_flag, space_flag, precision)
+                    } else {
+                        format_byte_slice_list_go(&bytes, verb, alt_flag, precision)
+                    };
                     push_with_width(&mut out, &rendered, width, zero_pad, left_align);
                 } else {
                     out.push_str(&format_printf_mismatch(verb, arg));
@@ -277,12 +414,34 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
                     out.push_str(&format_printf_mismatch(verb, arg));
                 }
             }
-            _ => return Err(format!("printf verb %{verb} is not supported")),
+            'c' => {
+                if let Some(r) = value_to_rune_go(arg) {
+                    let rendered = r.to_string();
+                    push_with_width(&mut out, &rendered, width, zero_pad, left_align);
+                } else if let Some(bytes) = value_to_byte_slice(arg) {
+                    let rendered = format_byte_slice_list_go(&bytes, 'c', alt_flag, precision);
+                    push_with_width(&mut out, &rendered, width, zero_pad, left_align);
+                } else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                }
+            }
+            'U' => {
+                if let Some(u) = value_to_u64_for_unicode(arg) {
+                    let rendered = format_unicode_verb_go(u, alt_flag, precision);
+                    push_with_width(&mut out, &rendered, width, false, left_align);
+                } else if let Some(bytes) = value_to_byte_slice(arg) {
+                    let rendered = format_byte_slice_list_go(&bytes, 'U', alt_flag, precision);
+                    push_with_width(&mut out, &rendered, width, zero_pad, left_align);
+                } else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                }
+            }
+            _ => out.push_str(&format_printf_mismatch(verb, arg)),
         }
     }
 
-    if argi != args.len() {
-        return Err("printf argument count mismatch".to_string());
+    if !reordered && argi < args.len() {
+        out.push_str(&format_extra_args(&args[argi..]));
     }
     Ok(out)
 }
@@ -466,10 +625,7 @@ fn shortest_decimal_components(v: f64) -> (String, i32) {
         return (digits, -(first as i32) - 1);
     }
 
-    let mut digits = raw;
-    while digits.ends_with('0') && digits.len() > 1 {
-        digits.pop();
-    }
+    let digits = raw;
     let exp10 = digits.len() as i32 - 1;
     (digits, exp10)
 }
@@ -479,10 +635,11 @@ fn to_scientific_from_digits(digits: &str, exp10: i32, upper: bool) -> String {
     let mut chars = digits.chars();
     if let Some(first) = chars.next() {
         out.push(first);
-        let rest: String = chars.collect();
+        let rest_raw: String = chars.collect();
+        let rest = rest_raw.trim_end_matches('0');
         if !rest.is_empty() {
             out.push('.');
-            out.push_str(&rest);
+            out.push_str(rest);
         }
     } else {
         out.push('0');
@@ -616,6 +773,313 @@ fn quote_string_ascii_go(s: &str) -> String {
     out
 }
 
+fn format_q_verb_go(arg: &Option<Value>, plus: bool, sharp: bool) -> Option<String> {
+    let Some(value) = arg.as_ref() else {
+        return None;
+    };
+    format_q_value_ref(value, plus, sharp)
+}
+
+fn format_q_value_ref(value: &Value, plus: bool, sharp: bool) -> Option<String> {
+    if let Some(bytes) = value_as_byte_slice(value) {
+        return Some(quote_bytes_go(&bytes, plus));
+    }
+    match value {
+        Value::String(s) => {
+            if sharp {
+                if can_backquote_string(s) {
+                    let mut raw = String::with_capacity(s.len() + 2);
+                    raw.push('`');
+                    raw.push_str(s);
+                    raw.push('`');
+                    return Some(raw);
+                }
+                return Some(format!("{s:?}"));
+            }
+            if plus {
+                return Some(quote_string_ascii_go(s));
+            }
+            Some(format!("{s:?}"))
+        }
+        Value::Array(items) => Some(format_q_array_go(items, plus, sharp)),
+        Value::Number(n) => value_number_to_rune_go(n).map(quote_rune_go),
+        _ => None,
+    }
+}
+
+fn format_q_array_go(items: &[Value], plus: bool, sharp: bool) -> String {
+    let mut out = String::from("[");
+    for (idx, item) in items.iter().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        let rendered = format_q_value_ref(item, plus, sharp)
+            .unwrap_or_else(|| format_printf_mismatch('q', &Some(item.clone())));
+        out.push_str(&rendered);
+    }
+    out.push(']');
+    out
+}
+
+fn quote_rune_go(ch: char) -> String {
+    let mut out = String::with_capacity(12);
+    out.push('\'');
+    match ch {
+        '\u{0007}' => out.push_str("\\a"),
+        '\u{0008}' => out.push_str("\\b"),
+        '\u{000C}' => out.push_str("\\f"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{000B}' => out.push_str("\\v"),
+        '\\' => out.push_str("\\\\"),
+        '\'' => out.push_str("\\'"),
+        c => push_go_escaped_rune(&mut out, c),
+    }
+    out.push('\'');
+    out
+}
+
+fn push_go_escaped_rune(out: &mut String, ch: char) {
+    let code = ch as u32;
+    if ch.is_control() {
+        if code <= 0xFF {
+            out.push_str(&format!("\\x{code:02x}"));
+        } else if code <= 0xFFFF {
+            out.push_str(&format!("\\u{code:04x}"));
+        } else {
+            out.push_str(&format!("\\U{code:08x}"));
+        }
+        return;
+    }
+
+    let escaped = ch.escape_debug().to_string();
+    if escaped.len() == 1 {
+        out.push(ch);
+        return;
+    }
+    if escaped == "\\0" {
+        out.push_str("\\x00");
+        return;
+    }
+    if let Some(hex) = escaped
+        .strip_prefix("\\u{")
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
+        if let Ok(v) = u32::from_str_radix(hex, 16) {
+            if v <= 0xFFFF {
+                out.push_str(&format!("\\u{v:04x}"));
+            } else {
+                out.push_str(&format!("\\U{v:08x}"));
+            }
+            return;
+        }
+    }
+    out.push_str(&escaped);
+}
+
+fn quote_bytes_go(bytes: &[u8], _ascii_only: bool) -> String {
+    let mut out = String::with_capacity(bytes.len() + 8);
+    out.push('"');
+    for &b in bytes {
+        match b {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x0C => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x0B => out.push_str("\\v"),
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            0x20..=0x7E => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn format_integer_go(
+    n: i64,
+    verb: char,
+    plus: bool,
+    space: bool,
+    sharp: bool,
+    zero: bool,
+    minus: bool,
+    width: Option<usize>,
+    precision: Option<usize>,
+) -> String {
+    let negative = n < 0;
+    let u = n.unsigned_abs();
+    let mut body = match verb {
+        'd' => u.to_string(),
+        'x' => format!("{u:x}"),
+        'X' => format!("{u:X}"),
+        'o' => format!("{u:o}"),
+        'b' => format!("{u:b}"),
+        _ => u.to_string(),
+    };
+
+    if precision == Some(0) && u == 0 {
+        body.clear();
+    }
+
+    if let Some(p) = precision {
+        while body.len() < p {
+            body.insert(0, '0');
+        }
+    }
+
+    let mut prefix = String::new();
+    if negative {
+        prefix.push('-');
+    } else if plus {
+        prefix.push('+');
+    } else if space {
+        prefix.push(' ');
+    }
+
+    if sharp {
+        match verb {
+            'x' => prefix.push_str("0x"),
+            'X' => prefix.push_str("0X"),
+            'b' => prefix.push_str("0b"),
+            'o' => {
+                if !body.starts_with('0') {
+                    prefix.push('0');
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if precision.is_none() && zero && !minus {
+        if let Some(w) = width {
+            let cur = prefix.len() + body.len();
+            if cur < w {
+                let zeros = w - cur;
+                let mut z = String::with_capacity(zeros + body.len());
+                for _ in 0..zeros {
+                    z.push('0');
+                }
+                z.push_str(&body);
+                body = z;
+            }
+        }
+    }
+
+    let mut rendered = prefix;
+    rendered.push_str(&body);
+    rendered
+}
+
+fn format_unicode_verb_go(u: u64, sharp: bool, precision: Option<usize>) -> String {
+    let mut body = format!("{u:X}");
+    let mut min_digits = 4usize;
+    if let Some(p) = precision {
+        if p > min_digits {
+            min_digits = p;
+        }
+    }
+    while body.len() < min_digits {
+        body.insert(0, '0');
+    }
+    let mut out = String::from("U+");
+    out.push_str(&body);
+    if sharp && u <= 0x10FFFF {
+        if let Some(ch) = char::from_u32(u as u32) {
+            if !ch.is_control() {
+                out.push_str(" '");
+                out.push(ch);
+                out.push('\'');
+            }
+        }
+    }
+    out
+}
+
+fn format_bytes_hex_go(
+    bytes: &[u8],
+    upper: bool,
+    alt: bool,
+    spaced: bool,
+    precision: Option<usize>,
+) -> String {
+    let length = precision.unwrap_or(bytes.len()).min(bytes.len());
+    if length == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(length * if spaced { 5 } else { 2 } + 4);
+    let prefix = if upper { "0X" } else { "0x" };
+
+    if !spaced {
+        if alt {
+            out.push_str(prefix);
+        }
+        for &b in bytes.iter().take(length) {
+            push_hex_byte(&mut out, b, upper);
+        }
+        return out;
+    }
+
+    for (idx, &b) in bytes.iter().take(length).enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        if alt {
+            out.push_str(prefix);
+        }
+        push_hex_byte(&mut out, b, upper);
+    }
+    out
+}
+
+fn format_byte_slice_list_go(
+    bytes: &[u8],
+    verb: char,
+    sharp: bool,
+    precision: Option<usize>,
+) -> String {
+    let mut out = String::from("[");
+    for (idx, b) in bytes.iter().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        let item = match verb {
+            'd' | 'v' => b.to_string(),
+            'o' => {
+                let n = i64::from(*b);
+                format_integer_go(n, 'o', false, false, sharp, false, false, None, precision)
+            }
+            'b' => {
+                let n = i64::from(*b);
+                format_integer_go(n, 'b', false, false, sharp, false, false, None, precision)
+            }
+            'c' => {
+                let ch = char::from_u32(u32::from(*b)).unwrap_or('\u{FFFD}');
+                ch.to_string()
+            }
+            'U' => format_unicode_verb_go(u64::from(*b), sharp, precision),
+            _ => b.to_string(),
+        };
+        out.push_str(&item);
+    }
+    out.push(']');
+    out
+}
+
+fn push_hex_byte(out: &mut String, b: u8, upper: bool) {
+    let table = if upper {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    out.push(table[(b >> 4) as usize] as char);
+    out.push(table[(b & 0x0F) as usize] as char);
+}
+
 fn apply_printf_sign_flags(
     rendered: String,
     non_negative: bool,
@@ -654,14 +1118,394 @@ fn value_to_f64(v: &Option<Value>) -> Option<f64> {
     }
 }
 
-fn format_value_for_printf(v: &Option<Value>, verb: char) -> String {
+fn value_to_rune_go(v: &Option<Value>) -> Option<char> {
+    let Some(Value::Number(n)) = v.as_ref() else {
+        return None;
+    };
+    value_number_to_rune_go(n)
+}
+
+fn value_number_to_rune_go(n: &Number) -> Option<char> {
+    let raw = if let Some(i) = n.as_i64() {
+        i as i128
+    } else if let Some(u) = n.as_u64() {
+        u as i128
+    } else {
+        return None;
+    };
+    let code = if (0..=0x10FFFF).contains(&raw) {
+        raw as u32
+    } else {
+        0xFFFD
+    };
+    Some(char::from_u32(code).unwrap_or('\u{FFFD}'))
+}
+
+fn value_to_int_for_width_prec(v: &Option<Value>) -> Option<i64> {
+    match v.as_ref() {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok())),
+        _ => None,
+    }
+}
+
+fn value_to_u64_for_unicode(v: &Option<Value>) -> Option<u64> {
+    match v.as_ref() {
+        Some(Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                Some(i as u64)
+            } else {
+                n.as_u64()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn value_to_byte_slice(v: &Option<Value>) -> Option<Vec<u8>> {
+    let Some(value) = v.as_ref() else {
+        return None;
+    };
+    decode_go_bytes_value(value)
+}
+
+fn value_as_byte_slice(v: &Value) -> Option<Vec<u8>> {
+    decode_go_bytes_value(v)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ParsedPrintfSpec {
+    arg_index: Option<usize>,
+    bad_index: bool,
+    no_verb: bool,
+    sharp: bool,
+    zero: bool,
+    plus: bool,
+    minus: bool,
+    space: bool,
+    width_from_arg: bool,
+    width_arg_index: Option<usize>,
+    width: Option<usize>,
+    precision_from_arg: bool,
+    precision_arg_index: Option<usize>,
+    precision: Option<usize>,
+}
+
+fn parse_printf_spec_flags(spec: &str) -> ParsedPrintfSpec {
+    let mut out = ParsedPrintfSpec::default();
+    let bytes = spec.as_bytes();
+    let mut i = 0usize;
+    let mut after_index = false;
+
+    if i < bytes.len() && bytes[i] as char == '[' {
+        match parse_printf_arg_index(spec, i) {
+            Some((idx, ni)) => {
+                out.arg_index = Some(idx);
+                i = ni;
+                after_index = true;
+            }
+            None => out.bad_index = true,
+        }
+    }
+
+    while i < bytes.len() {
+        match bytes[i] as char {
+            '#' => out.sharp = true,
+            '0' => out.zero = true,
+            '+' => out.plus = true,
+            '-' => out.minus = true,
+            ' ' => out.space = true,
+            _ => break,
+        }
+        i += 1;
+    }
+
+    if i < bytes.len() && bytes[i] as char == '*' {
+        out.width_from_arg = true;
+        i += 1;
+        after_index = false;
+        if i < bytes.len() && bytes[i] as char == '[' {
+            match parse_printf_arg_index(spec, i) {
+                Some((idx, ni)) => {
+                    out.width_arg_index = Some(idx);
+                    i = ni;
+                    after_index = true;
+                }
+                None => out.bad_index = true,
+            }
+        }
+    } else {
+        let start = i;
+        while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+            i += 1;
+        }
+        if i > start {
+            out.width = spec[start..i].parse::<usize>().ok();
+            if out.width.map_or(true, |w| w > GO_PRINTF_NUM_LIMIT) {
+                out.no_verb = true;
+            }
+            if after_index {
+                out.bad_index = true;
+            }
+        }
+    }
+
+    if i < bytes.len() && bytes[i] as char == '.' {
+        if after_index {
+            out.bad_index = true;
+        }
+        i += 1;
+        if i < bytes.len() && bytes[i] as char == '*' {
+            out.precision_from_arg = true;
+            i += 1;
+            if i < bytes.len() && bytes[i] as char == '[' {
+                match parse_printf_arg_index(spec, i) {
+                    Some((idx, _)) => {
+                        out.precision_arg_index = Some(idx);
+                    }
+                    None => out.bad_index = true,
+                }
+            }
+        } else {
+            let start = i;
+            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                i += 1;
+            }
+            if i == start {
+                out.precision = Some(0);
+            } else {
+                out.precision = spec[start..i].parse::<usize>().ok();
+                if out.precision.map_or(true, |p| p > GO_PRINTF_NUM_LIMIT) {
+                    out.no_verb = true;
+                }
+            }
+        }
+    }
+
+    if i < bytes.len() {
+        match bytes[i] as char {
+            '[' | ']' => out.bad_index = true,
+            _ => out.no_verb = true,
+        }
+    }
+
+    out
+}
+
+fn parse_printf_arg_index(spec: &str, start: usize) -> Option<(usize, usize)> {
+    let bytes = spec.as_bytes();
+    if start >= bytes.len() || bytes[start] as char != '[' {
+        return None;
+    }
+    let mut i = start + 1;
+    let digits_start = i;
+    while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start || i >= bytes.len() || bytes[i] as char != ']' {
+        return None;
+    }
+    let raw = spec[digits_start..i].parse::<usize>().ok()?;
+    if raw == 0 {
+        return None;
+    }
+    Some((raw - 1, i + 1))
+}
+
+fn format_missing_arg(verb: char) -> String {
+    format!("%!{verb}(MISSING)")
+}
+
+fn format_bad_index(verb: char) -> String {
+    format!("%!{verb}(BADINDEX)")
+}
+
+fn format_extra_args(extra: &[Option<Value>]) -> String {
+    let mut out = String::from("%!(EXTRA ");
+    for (idx, arg) in extra.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format_extra_arg(arg));
+    }
+    out.push(')');
+    out
+}
+
+fn format_extra_arg(arg: &Option<Value>) -> String {
+    match arg {
+        None | Some(Value::Null) => "<nil>".to_string(),
+        Some(v) => format!("{}={}", printf_type_name(v), format_value_like_go(v)),
+    }
+}
+
+fn format_value_for_printf(v: &Option<Value>, verb: char, sharp: bool) -> String {
     match (verb, v) {
         (_, None) | (_, Some(Value::Null)) => "<nil>".to_string(),
         ('s', Some(Value::String(s))) => s.clone(),
-        ('v', Some(value)) => format_value_like_go(value),
+        ('v', Some(value)) => {
+            if sharp {
+                format_value_go_syntax(value)
+            } else {
+                format_value_like_go(value)
+            }
+        }
         (_, Some(Value::String(s))) => s.clone(),
         (_, Some(value)) => format_value_like_go(value),
     }
+}
+
+fn format_value_go_syntax(v: &Value) -> String {
+    if let Some(bytes) = value_as_byte_slice(v) {
+        let mut out = String::from("[]byte{");
+        for (idx, b) in bytes.iter().enumerate() {
+            if idx > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("0x{:x}", b));
+        }
+        out.push('}');
+        return out;
+    }
+    match v {
+        Value::Null => "interface {}(nil)".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => format_number_sharp_v_go(n),
+        Value::String(s) => format!("{s:?}"),
+        Value::Array(items) => {
+            let slice_ty = infer_slice_type_for_sharp_v(items);
+            let mut out = format!("[]{slice_ty}{{");
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&format_value_go_syntax_item(item, slice_ty));
+            }
+            out.push('}');
+            out
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            let val_ty = infer_map_value_type_for_sharp_v(map.values());
+            let mut out = format!("map[string]{val_ty}{{");
+            for (idx, k) in keys.iter().enumerate() {
+                if idx > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&format!("{k:?}:"));
+                if let Some(v) = map.get(*k) {
+                    out.push_str(&format_value_go_syntax_item(v, val_ty));
+                } else {
+                    out.push_str("interface {}(nil)");
+                }
+            }
+            out.push('}');
+            out
+        }
+    }
+}
+
+fn infer_slice_type_for_sharp_v(items: &[Value]) -> &'static str {
+    if items.is_empty() {
+        return "interface {}";
+    }
+    if items.iter().all(|item| matches!(item, Value::String(_))) {
+        return "string";
+    }
+    if items.iter().all(|item| matches!(item, Value::Bool(_))) {
+        return "bool";
+    }
+    if items
+        .iter()
+        .all(|item| matches!(item, Value::Number(n) if n.as_i64().is_some()))
+    {
+        return "int";
+    }
+    if items
+        .iter()
+        .all(|item| matches!(item, Value::Number(n) if n.as_u64().is_some()))
+    {
+        return "uint";
+    }
+    if items
+        .iter()
+        .all(|item| matches!(item, Value::Number(n) if n.as_f64().is_some()))
+    {
+        return "float64";
+    }
+    "interface {}"
+}
+
+fn infer_map_value_type_for_sharp_v<'a>(values: impl Iterator<Item = &'a Value>) -> &'static str {
+    let vals: Vec<&Value> = values.collect();
+    if vals.is_empty() {
+        return "interface {}";
+    }
+    if vals.iter().all(|v| matches!(v, Value::String(_))) {
+        return "string";
+    }
+    if vals.iter().all(|v| matches!(v, Value::Bool(_))) {
+        return "bool";
+    }
+    if vals
+        .iter()
+        .all(|v| matches!(v, Value::Number(n) if n.as_i64().is_some()))
+    {
+        return "int";
+    }
+    if vals
+        .iter()
+        .all(|v| matches!(v, Value::Number(n) if n.as_u64().is_some()))
+    {
+        return "uint";
+    }
+    if vals
+        .iter()
+        .all(|v| matches!(v, Value::Number(n) if n.as_f64().is_some()))
+    {
+        return "float64";
+    }
+    "interface {}"
+}
+
+fn format_value_go_syntax_item(v: &Value, ty: &str) -> String {
+    if ty == "interface {}" {
+        return format_value_go_syntax(v);
+    }
+    match v {
+        Value::String(s) => format!("{s:?}"),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => {
+            if ty == "float64" {
+                format_number_sharp_v_go(n)
+            } else if ty == "uint" {
+                if let Some(u) = n.as_u64() {
+                    format!("0x{u:x}")
+                } else {
+                    n.to_string()
+                }
+            } else {
+                n.to_string()
+            }
+        }
+        Value::Null => "nil".to_string(),
+        _ => format_value_go_syntax(v),
+    }
+}
+
+fn format_number_sharp_v_go(n: &Number) -> String {
+    if n.as_i64().is_some() {
+        return n.to_string();
+    }
+    if let Some(u) = n.as_u64() {
+        return format!("0x{u:x}");
+    }
+    if let Some(f) = n.as_f64() {
+        return format_float_general_go_default(f, false);
+    }
+    n.to_string()
 }
 
 fn format_type_for_printf(v: &Option<Value>) -> String {
@@ -683,12 +1527,18 @@ fn format_printf_mismatch(verb: char, arg: &Option<Value>) -> String {
 }
 
 fn printf_type_name(v: &Value) -> String {
+    if value_as_byte_slice(v).is_some() {
+        return "[]uint8".to_string();
+    }
     match v {
         Value::Null => "<nil>".to_string(),
         Value::Bool(_) => "bool".to_string(),
         Value::String(_) => "string".to_string(),
-        Value::Array(_) => "[]interface {}".to_string(),
-        Value::Object(_) => "map[string]interface {}".to_string(),
+        Value::Array(items) => format!("[]{}", infer_slice_type_for_sharp_v(items)),
+        Value::Object(map) => {
+            let ty = infer_map_value_type_for_sharp_v(map.values());
+            format!("map[string]{ty}")
+        }
         Value::Number(n) => {
             if n.as_i64().is_some() {
                 "int".to_string()
@@ -702,10 +1552,21 @@ fn printf_type_name(v: &Value) -> String {
 }
 
 fn format_value_like_go(v: &Value) -> String {
+    if let Some(bytes) = value_as_byte_slice(v) {
+        let mut out = String::from("[");
+        for (idx, b) in bytes.iter().enumerate() {
+            if idx > 0 {
+                out.push(' ');
+            }
+            out.push_str(&b.to_string());
+        }
+        out.push(']');
+        return out;
+    }
     match v {
         Value::Null => "<no value>".to_string(),
         Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
+        Value::Number(n) => format_number_like_go(n),
         Value::String(s) => s.clone(),
         Value::Array(items) => {
             let mut out = String::from("[");
@@ -736,6 +1597,16 @@ fn format_value_like_go(v: &Value) -> String {
             out
         }
     }
+}
+
+fn format_number_like_go(n: &Number) -> String {
+    if n.as_i64().is_some() || n.as_u64().is_some() {
+        return n.to_string();
+    }
+    if let Some(f) = n.as_f64() {
+        return format_float_general_go_default(f, false);
+    }
+    n.to_string()
 }
 
 fn has_valid_go_numeric_underscores(expr: &str) -> bool {
@@ -921,6 +1792,9 @@ fn parse_go_char_escape(rest: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn typed_bytes(bytes: &[u8]) -> Value {
+        crate::gotemplates::encode_go_bytes_value(bytes)
+    }
 
     #[test]
     fn width_zero_precision_parser_matches_go_shape() {
@@ -981,6 +1855,48 @@ mod tests {
     }
 
     #[test]
+    fn go_printf_formats_q_for_integer_as_rune_literal() {
+        let args = vec![Some(Value::Number(Number::from('⌘' as i64)))];
+        assert_eq!(go_printf("%q", &args).expect("must render"), "'⌘'");
+
+        let args = vec![Some(Value::Number(Number::from('\n' as i64)))];
+        assert_eq!(go_printf("%q", &args).expect("must render"), "'\\n'");
+
+        let args = vec![Some(Value::Number(Number::from(0x0e00i64)))];
+        assert_eq!(go_printf("%q", &args).expect("must render"), "'\\u0e00'");
+
+        let args = vec![Some(Value::Number(Number::from(0x10ffffi64)))];
+        assert_eq!(go_printf("%q", &args).expect("must render"), "'\\U0010ffff'");
+
+        let args = vec![Some(Value::Number(Number::from(0x11_0000i64)))];
+        assert_eq!(go_printf("%q", &args).expect("must render"), "'�'");
+    }
+
+    #[test]
+    fn go_printf_reports_mismatch_for_q_on_unsupported_type() {
+        let args = vec![Some(Value::Bool(true))];
+        assert_eq!(
+            go_printf("%q", &args).expect("must render"),
+            "%!q(bool=true)"
+        );
+    }
+
+    #[test]
+    fn go_printf_reports_typed_names_for_slices_and_maps() {
+        let bytes = vec![Some(typed_bytes(&[1, 2]))];
+        assert_eq!(go_printf("%T", &bytes).expect("must render"), "[]uint8");
+
+        let map = vec![Some(serde_json::json!({"a":1}))];
+        assert_eq!(
+            go_printf("%d", &map).expect("must render"),
+            "%!d(map[string]int=map[a:1])"
+        );
+
+        let n = vec![Some(Value::Number(Number::from(7)))];
+        assert_eq!(go_printf("%s", &n).expect("must render"), "%!s(int=7)");
+    }
+
+    #[test]
     fn go_printf_applies_rune_precision_for_s() {
         let args = vec![Some(Value::String("абв".to_string()))];
         let out = go_printf("%.2s", &args).expect("must render");
@@ -989,5 +1905,348 @@ mod tests {
         assert_eq!(out, "   аб");
         let out = go_printf("%-5.2s", &args).expect("must render");
         assert_eq!(out, "аб   ");
+    }
+
+    #[test]
+    fn go_printf_formats_strings_for_x_and_x_flags() {
+        let args = vec![Some(Value::String("xyz".to_string()))];
+        assert_eq!(go_printf("%x", &args).expect("must render"), "78797a");
+        assert_eq!(go_printf("%X", &args).expect("must render"), "78797A");
+        assert_eq!(go_printf("% x", &args).expect("must render"), "78 79 7a");
+        assert_eq!(go_printf("% X", &args).expect("must render"), "78 79 7A");
+        assert_eq!(go_printf("%#x", &args).expect("must render"), "0x78797a");
+        assert_eq!(go_printf("%#X", &args).expect("must render"), "0X78797A");
+        assert_eq!(
+            go_printf("%# x", &args).expect("must render"),
+            "0x78 0x79 0x7a"
+        );
+        assert_eq!(
+            go_printf("%# X", &args).expect("must render"),
+            "0X78 0X79 0X7A"
+        );
+    }
+
+    #[test]
+    fn go_printf_formats_byte_arrays_for_s_q_x() {
+        let args = vec![Some(typed_bytes(&[97, 98]))];
+        assert_eq!(go_printf("%s", &args).expect("must render"), "ab");
+        assert_eq!(go_printf("%q", &args).expect("must render"), "\"ab\"");
+        assert_eq!(go_printf("%x", &args).expect("must render"), "6162");
+        assert_eq!(go_printf("%b", &args).expect("must render"), "[1100001 1100010]");
+        assert_eq!(go_printf("%o", &args).expect("must render"), "[141 142]");
+        assert_eq!(go_printf("%c", &args).expect("must render"), "[a b]");
+        assert_eq!(go_printf("%U", &args).expect("must render"), "[U+0061 U+0062]");
+
+        let args = vec![Some(typed_bytes(&[255]))];
+        assert_eq!(go_printf("%q", &args).expect("must render"), "\"\\xff\"");
+    }
+
+    #[test]
+    fn go_printf_formats_q_for_non_byte_arrays() {
+        let args = vec![Some(Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ]))];
+        assert_eq!(go_printf("%q", &args).expect("must render"), "[\"a\" \"b\"]");
+    }
+
+    #[test]
+    fn go_printf_formats_sharp_v_go_syntax_subset() {
+        let s = vec![Some(Value::String("foo".to_string()))];
+        assert_eq!(go_printf("%#v", &s).expect("must render"), "\"foo\"");
+
+        let n = vec![Some(Value::Number(Number::from(1_000_000)))];
+        assert_eq!(go_printf("%#v", &n).expect("must render"), "1000000");
+
+        let f1 = vec![Number::from_f64(1.0).map(Value::Number)];
+        assert_eq!(go_printf("%#v", &f1).expect("must render"), "1");
+
+        let f2 = vec![Number::from_f64(1_000_000.0).map(Value::Number)];
+        assert_eq!(go_printf("%#v", &f2).expect("must render"), "1e+06");
+
+        let u = vec![Some(Value::Number(Number::from(u64::MAX)))];
+        assert_eq!(
+            go_printf("%#v", &u).expect("must render"),
+            "0xffffffffffffffff"
+        );
+
+        let bytes = vec![Some(typed_bytes(&[1, 11, 111]))];
+        assert_eq!(
+            go_printf("%#v", &bytes).expect("must render"),
+            "[]byte{0x1, 0xb, 0x6f}"
+        );
+
+        let strs = vec![Some(Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ]))];
+        assert_eq!(
+            go_printf("%#v", &strs).expect("must render"),
+            "[]string{\"a\", \"b\"}"
+        );
+
+        let map = serde_json::json!({"a":1});
+        let obj = vec![Some(map)];
+        assert_eq!(
+            go_printf("%#v", &obj).expect("must render"),
+            "map[string]int{\"a\":1}"
+        );
+
+        let ints = vec![Some(Value::Array(vec![
+            Value::Number(Number::from(1)),
+            Value::Number(Number::from(2)),
+        ]))];
+        assert_eq!(go_printf("%#v", &ints).expect("must render"), "[]int{1, 2}");
+
+        let map_s = serde_json::json!({"a":"x","b":"y"});
+        let obj_s = vec![Some(map_s)];
+        assert_eq!(
+            go_printf("%#v", &obj_s).expect("must render"),
+            "map[string]string{\"a\":\"x\", \"b\":\"y\"}"
+        );
+
+        let empty_arr = vec![Some(Value::Array(vec![]))];
+        assert_eq!(
+            go_printf("%#v", &empty_arr).expect("must render"),
+            "[]interface {}{}"
+        );
+
+        let empty_map = vec![Some(Value::Object(serde_json::Map::new()))];
+        assert_eq!(
+            go_printf("%#v", &empty_map).expect("must render"),
+            "map[string]interface {}{}"
+        );
+
+        let mut map_u = serde_json::Map::new();
+        map_u.insert(
+            "a".to_string(),
+            Value::Number(Number::from(u64::MAX)),
+        );
+        let obj_u = vec![Some(Value::Object(map_u))];
+        assert_eq!(
+            go_printf("%#v", &obj_u).expect("must render"),
+            "map[string]uint{\"a\":0xffffffffffffffff}"
+        );
+    }
+
+    #[test]
+    fn go_printf_formats_v_float_like_go_g() {
+        let v = vec![Number::from_f64(1.0).map(Value::Number)];
+        assert_eq!(go_printf("%v", &v).expect("must render"), "1");
+    }
+
+    #[test]
+    fn go_printf_formats_c_like_go() {
+        let args = vec![Some(Value::Number(Number::from('⌘' as i64)))];
+        assert_eq!(go_printf("%.0c", &args).expect("must render"), "⌘");
+        assert_eq!(go_printf("%3c", &args).expect("must render"), "  ⌘");
+        assert_eq!(go_printf("%03c", &args).expect("must render"), "00⌘");
+    }
+
+    #[test]
+    fn go_printf_handles_missing_extra_and_noverb_markers() {
+        assert_eq!(go_printf("%", &[]).expect("must render"), "%!(NOVERB)");
+        assert_eq!(go_printf("%d", &[]).expect("must render"), "%!d(MISSING)");
+        let args = vec![
+            Some(Value::Number(Number::from(1))),
+            Some(Value::Number(Number::from(2))),
+        ];
+        assert_eq!(
+            go_printf("%d", &args).expect("must render"),
+            "1%!(EXTRA int=2)"
+        );
+    }
+
+    #[test]
+    fn go_printf_handles_star_width_and_precision() {
+        let bad_width = vec![
+            Some(Value::String("x".to_string())),
+            Some(Value::Number(Number::from(7))),
+        ];
+        assert_eq!(
+            go_printf("%*d", &bad_width).expect("must render"),
+            "%!(BADWIDTH)7"
+        );
+
+        let bad_prec = vec![
+            Some(Value::String("x".to_string())),
+            Some(Value::Number(Number::from(7))),
+        ];
+        assert_eq!(
+            go_printf("%.*d", &bad_prec).expect("must render"),
+            "%!(BADPREC)7"
+        );
+
+        let ok = vec![
+            Some(Value::Number(Number::from(8))),
+            Some(Value::Number(Number::from(2))),
+            Number::from_f64(1.2).map(Value::Number),
+        ];
+        assert_eq!(go_printf("%*.*f", &ok).expect("must render"), "    1.20");
+    }
+
+    #[test]
+    fn go_printf_handles_too_large_width_precision_like_go() {
+        let args = vec![Some(Value::Number(Number::from(42)))];
+        assert_eq!(
+            go_printf("%2147483648d", &args).expect("must render"),
+            "%!(NOVERB)%!(EXTRA int=42)"
+        );
+        assert_eq!(
+            go_printf("%-2147483648d", &args).expect("must render"),
+            "%!(NOVERB)%!(EXTRA int=42)"
+        );
+        assert_eq!(
+            go_printf("%.2147483648d", &args).expect("must render"),
+            "%!(NOVERB)%!(EXTRA int=42)"
+        );
+
+        let bad_width = vec![
+            Some(Value::Number(Number::from(10_000_000))),
+            Some(Value::Number(Number::from(42))),
+        ];
+        assert_eq!(
+            go_printf("%*d", &bad_width).expect("must render"),
+            "%!(BADWIDTH)42"
+        );
+
+        let bad_prec = vec![
+            Some(Value::Number(Number::from(10_000_000))),
+            Some(Value::Number(Number::from(42))),
+        ];
+        assert_eq!(
+            go_printf("%.*d", &bad_prec).expect("must render"),
+            "%!(BADPREC)42"
+        );
+
+        let huge_prec = vec![
+            Some(Value::Number(Number::from(1u64 << 63))),
+            Some(Value::Number(Number::from(42))),
+        ];
+        assert_eq!(
+            go_printf("%.*d", &huge_prec).expect("must render"),
+            "%!(BADPREC)42"
+        );
+
+        let no_verb = vec![Some(Value::Number(Number::from(4)))];
+        assert_eq!(go_printf("%*", &no_verb).expect("must render"), "%!(NOVERB)");
+    }
+
+    #[test]
+    fn go_printf_handles_argument_indexes_like_go() {
+        let args = vec![
+            Some(Value::Number(Number::from(1))),
+            Some(Value::Number(Number::from(2))),
+        ];
+        assert_eq!(
+            go_printf("%[d", &args).expect("must render"),
+            "%!d(BADINDEX)"
+        );
+        assert_eq!(
+            go_printf("%[]d", &args).expect("must render"),
+            "%!d(BADINDEX)"
+        );
+        assert_eq!(
+            go_printf("%[-3]d", &args).expect("must render"),
+            "%!d(BADINDEX)"
+        );
+        assert_eq!(
+            go_printf("%[99]d", &args).expect("must render"),
+            "%!d(BADINDEX)"
+        );
+        assert_eq!(
+            go_printf("%[3]", &args).expect("must render"),
+            "%!(NOVERB)"
+        );
+
+        assert_eq!(go_printf("%[2]d %[1]d", &args).expect("must render"), "2 1");
+
+        let args = vec![
+            Some(Value::Number(Number::from(1))),
+            Some(Value::Number(Number::from(2))),
+            Some(Value::Number(Number::from(3))),
+        ];
+        assert_eq!(
+            go_printf("%[5]d %[2]d %d", &args).expect("must render"),
+            "%!d(BADINDEX) 2 3"
+        );
+
+        let args = vec![
+            Some(Value::Number(Number::from(1))),
+            Some(Value::Number(Number::from(2))),
+        ];
+        assert_eq!(
+            go_printf("%d %[3]d %d", &args).expect("must render"),
+            "1 %!d(BADINDEX) 2"
+        );
+
+        let args = vec![
+            Some(Value::Number(Number::from(1))),
+            Some(Value::Number(Number::from(2))),
+        ];
+        assert_eq!(
+            go_printf("%[2]2d", &args).expect("must render"),
+            "%!d(BADINDEX)"
+        );
+        assert_eq!(
+            go_printf("%[2].2d", &args).expect("must render"),
+            "%!d(BADINDEX)"
+        );
+        assert_eq!(
+            go_printf("%3.[2]d", &args).expect("must render"),
+            "%!d(BADINDEX)"
+        );
+        assert_eq!(
+            go_printf("%.[2]d", &args).expect("must render"),
+            "%!d(BADINDEX)"
+        );
+        assert_eq!(
+            go_printf("%.[]", &[]).expect("must render"),
+            "%!](BADINDEX)"
+        );
+    }
+
+    #[test]
+    fn go_printf_formats_integers_with_precision_and_sharp() {
+        let zero = vec![Some(Value::Number(Number::from(0)))];
+        assert_eq!(go_printf("%.d", &zero).expect("must render"), "");
+        assert_eq!(go_printf("%6.0d", &zero).expect("must render"), "      ");
+        assert_eq!(go_printf("%06.0d", &zero).expect("must render"), "      ");
+
+        let n = vec![Some(Value::Number(Number::from(-1234)))];
+        assert_eq!(
+            go_printf("%020.8d", &n).expect("must render"),
+            "           -00001234"
+        );
+
+        let x = vec![Some(Value::Number(Number::from(0x1234abc)))];
+        assert_eq!(
+            go_printf("%-#20.8x", &x).expect("must render"),
+            "0x01234abc          "
+        );
+
+        let o = vec![Some(Value::Number(Number::from(-668)))];
+        assert_eq!(go_printf("%#o", &o).expect("must render"), "-01234");
+    }
+
+    #[test]
+    fn go_printf_formats_unicode_verb_u_like_go() {
+        let zero = vec![Some(Value::Number(Number::from(0)))];
+        assert_eq!(go_printf("%U", &zero).expect("must render"), "U+0000");
+
+        let minus_one = vec![Some(Value::Number(Number::from(-1)))];
+        assert_eq!(
+            go_printf("%U", &minus_one).expect("must render"),
+            "U+FFFFFFFFFFFFFFFF"
+        );
+
+        let smile = vec![Some(Value::Number(Number::from('☺' as i64)))];
+        assert_eq!(go_printf("%#U", &smile).expect("must render"), "U+263A '☺'");
+
+        let cmd = vec![Some(Value::Number(Number::from('⌘' as i64)))];
+        assert_eq!(
+            go_printf("%#14.6U", &cmd).expect("must render"),
+            "  U+002318 '⌘'"
+        );
     }
 }

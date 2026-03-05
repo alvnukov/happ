@@ -4,6 +4,7 @@ mod functions;
 mod parser;
 mod planner;
 mod scanner;
+mod typedvalue;
 
 pub use executor::{
     render_template_native, render_template_native_with_options, MissingValueMode,
@@ -20,6 +21,7 @@ pub use scanner::{
     collect_action_spans, contains_template_markup, parse_template_tokens,
     parse_template_tokens_strict, parse_template_tokens_strict_with_options, scan_template_actions,
 };
+pub use typedvalue::{decode_go_bytes_value, encode_go_bytes_value, GO_TYPE_BYTES, GO_TYPE_KEY, GO_VALUE_KEY};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoTemplateToken {

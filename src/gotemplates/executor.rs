@@ -3320,6 +3320,25 @@ mod tests {
     }
 
     #[test]
+    fn native_renderer_external_resolver_can_return_typed_go_bytes() {
+        let data = json!({});
+        let out = render_template_native_with_resolver(
+            "{{printf \"%s\" (ext)}}",
+            &data,
+            NativeRenderOptions::default(),
+            Some(&|name: &str, _args: &[Option<Value>]| {
+                if name == "ext" {
+                    Ok(Some(crate::gotemplates::encode_go_bytes_value(b"ab")))
+                } else {
+                    Err(NativeFunctionResolverError::UnknownFunction)
+                }
+            }),
+        )
+        .expect("must render");
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
     fn native_renderer_reports_external_function_error() {
         let data = json!({});
         let err = render_template_native_with_resolver(
