@@ -77,22 +77,24 @@ Examples:
 
 ```bash
 # print to stdout
-happ completion --shell zsh
+happ completion zsh
 ```
 
 ```bash
 # write to file
-happ completion --shell bash --output /tmp/happ.bash
+happ completion bash --output /tmp/happ.bash
 ```
+
+Compatibility: `happ completion --shell zsh` also works.
 
 Quick one-liner for current shell session (similar to `kubectl`):
 
 ```bash
 # zsh
-source <(happ completion --shell zsh)
+source <(happ completion zsh)
 
 # bash
-source <(happ completion --shell bash)
+source <(happ completion bash)
 ```
 
 ### Configure completion in your shell
@@ -101,7 +103,7 @@ source <(happ completion --shell bash)
 
 ```bash
 mkdir -p "${HOME}/.zsh/completions"
-happ completion --shell zsh --output "${HOME}/.zsh/completions/_happ"
+happ completion zsh --output "${HOME}/.zsh/completions/_happ"
 ```
 
 Add to `~/.zshrc`:
@@ -121,7 +123,7 @@ exec zsh
 
 ```bash
 mkdir -p "${HOME}/.local/share/bash-completion/completions"
-happ completion --shell bash --output "${HOME}/.local/share/bash-completion/completions/happ"
+happ completion bash --output "${HOME}/.local/share/bash-completion/completions/happ"
 ```
 
 Reload shell:
@@ -134,7 +136,7 @@ exec bash
 
 ```bash
 mkdir -p "${HOME}/.config/fish/completions"
-happ completion --shell fish --output "${HOME}/.config/fish/completions/happ.fish"
+happ completion fish --output "${HOME}/.config/fish/completions/happ.fish"
 ```
 
 Reload shell:
@@ -148,7 +150,7 @@ exec fish
 ```powershell
 $dir = Split-Path -Parent $PROFILE
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
-happ completion --shell powershell | Out-String | Add-Content -Path $PROFILE
+happ completion powershell | Out-String | Add-Content -Path $PROFILE
 ```
 
 Restart PowerShell session.
@@ -157,7 +159,7 @@ Restart PowerShell session.
 
 ```bash
 mkdir -p "${HOME}/.config/elvish/lib"
-happ completion --shell elvish --output "${HOME}/.config/elvish/lib/happ.elv"
+happ completion elvish --output "${HOME}/.config/elvish/lib/happ.elv"
 ```
 
 Add to `~/.config/elvish/rc.elv`:

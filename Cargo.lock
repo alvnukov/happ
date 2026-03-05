@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "happ"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "base64",
  "clap",

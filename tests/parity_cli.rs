@@ -193,7 +193,7 @@ fn parity_compose_import_contract() {
 
 #[test]
 fn parity_completion_contract() {
-    let out = run_happ(&["completion", "--shell", "zsh"]);
+    let out = run_happ(&["completion", "zsh"]);
     assert_ok(&out, "completion zsh");
     let text = stdout_text(&out);
     assert!(

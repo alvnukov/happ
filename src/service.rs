@@ -147,7 +147,17 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
         }
         Command::Lsp(args) => Ok(crate::lsp::run(args)?),
         Command::Completion(args) => {
-            let shell = match args.shell.as_str() {
+            let shell_name = args
+                .shell_flag
+                .as_deref()
+                .or(args.shell.as_deref())
+                .ok_or_else(|| {
+                    Error::Convert(
+                        "missing shell, expected one of: bash,zsh,fish,powershell,elvish"
+                            .to_string(),
+                    )
+                })?;
+            let shell = match shell_name {
                 "bash" => Shell::Bash,
                 "zsh" => Shell::Zsh,
                 "fish" => Shell::Fish,
@@ -156,7 +166,7 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
                 _ => {
                     return Err(Error::Convert(format!(
                         "unsupported shell '{}', expected one of: bash,zsh,fish,powershell,elvish",
-                        args.shell
+                        shell_name
                     )));
                 }
             };
@@ -1007,7 +1017,8 @@ mod tests {
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
             command: Some(Command::Completion(CompletionArgs {
-                shell: "bash".to_string(),
+                shell: Some("bash".to_string()),
+                shell_flag: None,
                 output: Some(out.to_string_lossy().to_string()),
             })),
         };

@@ -117,11 +117,21 @@ pub struct LspArgs {
 #[derive(clap::Args, Debug, Clone)]
 pub struct CompletionArgs {
     #[arg(
-        long,
+        value_name = "SHELL",
         value_parser = ["bash", "zsh", "fish", "powershell", "elvish"],
+        required_unless_present = "shell_flag",
+        help = "Target shell (kubectl style: happ completion zsh)"
+    )]
+    pub shell: Option<String>,
+    #[arg(
+        long = "shell",
+        id = "shell_flag",
+        value_name = "SHELL",
+        value_parser = ["bash", "zsh", "fish", "powershell", "elvish"],
+        required_unless_present = "shell",
         help = "Target shell"
     )]
-    pub shell: String,
+    pub shell_flag: Option<String>,
     #[arg(long, help = "Write completion script to file (stdout by default)")]
     pub output: Option<String>,
 }
@@ -184,7 +194,21 @@ mod tests {
             .expect("parse completion");
         match cli.command.expect("command") {
             Command::Completion(args) => {
-                assert_eq!(args.shell, "zsh");
+                assert_eq!(args.shell.as_deref(), None);
+                assert_eq!(args.shell_flag.as_deref(), Some("zsh"));
+                assert_eq!(args.output, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_completion_subcommand_kubectl_style() {
+        let cli = Cli::try_parse_from(["happ", "completion", "zsh"]).expect("parse completion");
+        match cli.command.expect("command") {
+            Command::Completion(args) => {
+                assert_eq!(args.shell.as_deref(), Some("zsh"));
+                assert_eq!(args.shell_flag.as_deref(), None);
                 assert_eq!(args.output, None);
             }
             other => panic!("unexpected command: {other:?}"),
