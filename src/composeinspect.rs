@@ -307,6 +307,7 @@ pub fn as_service_map(report: &Report) -> BTreeMap<String, ServiceNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_yaml::from_str;
     use tempfile::TempDir;
 
     #[test]
@@ -374,5 +375,116 @@ services:
         assert_eq!(app.env.get("LOG_LEVEL").map(String::as_str), Some("debug"));
         assert_eq!(app.expose, vec!["8080"]);
         assert!(app.healthcheck.is_some());
+    }
+
+    #[test]
+    fn load_returns_no_services_when_services_missing() {
+        let td = TempDir::new().expect("tmp");
+        let file = td.path().join("compose.yaml");
+        fs::write(&file, "name: demo\n").expect("write");
+        let err = load(td.path().to_str().expect("path")).expect_err("must fail");
+        assert!(matches!(err, Error::NoServices));
+    }
+
+    #[test]
+    fn resolve_compose_path_prefers_standard_name_order() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(td.path().join("docker-compose.yml"), "services: {}\n").expect("write");
+        fs::write(td.path().join("compose.yaml"), "services: {}\n").expect("write");
+        let path = resolve_compose_path(td.path().to_str().expect("path")).expect("resolve");
+        assert!(path.ends_with("compose.yaml"));
+    }
+
+    #[test]
+    fn parse_depends_on_mapping_is_sorted_and_parse_string_map_ignores_complex_values() {
+        let depends_doc: Value = from_str(
+            r#"
+cache:
+  condition: service_started
+db:
+  condition: service_healthy
+"#,
+        )
+        .expect("yaml");
+        let depends = parse_depends_on(Some(&depends_doc));
+        assert_eq!(depends, vec!["cache", "db"]);
+
+        let labels_doc: Value = from_str(
+            r#"
+str: x
+num: 42
+bool: true
+nullish: null
+nested:
+  a: b
+"#,
+        )
+        .expect("yaml");
+        let labels = parse_string_map(Some(&labels_doc));
+        assert_eq!(labels.get("str").map(String::as_str), Some("x"));
+        assert_eq!(labels.get("num").map(String::as_str), Some("42"));
+        assert_eq!(labels.get("bool").map(String::as_str), Some("true"));
+        assert_eq!(labels.get("nullish").map(String::as_str), Some(""));
+        assert!(!labels.contains_key("nested"));
+    }
+
+    #[test]
+    fn parse_healthcheck_shell_and_duration_semantics() {
+        let doc: Value = from_str(
+            r#"
+test: "curl -f http://127.0.0.1:8080/healthz || exit 1"
+interval: 2m
+timeout: 1h
+retries: -3
+start_period: 7s
+"#,
+        )
+        .expect("yaml");
+        let hc = parse_healthcheck(Some(&doc)).expect("healthcheck");
+        assert!(hc.test.is_empty());
+        assert_eq!(
+            hc.test_shell.as_deref(),
+            Some("curl -f http://127.0.0.1:8080/healthz || exit 1")
+        );
+        assert_eq!(hc.interval_seconds, 120);
+        assert_eq!(hc.timeout_seconds, 3600);
+        assert_eq!(hc.retries, 0);
+        assert_eq!(hc.start_period_seconds, 7);
+    }
+
+    #[test]
+    fn parse_healthcheck_disable_short_circuits() {
+        let doc: Value = from_str(
+            r#"
+disable: true
+test: ["CMD", "echo", "ok"]
+"#,
+        )
+        .expect("yaml");
+        assert!(parse_healthcheck(Some(&doc)).is_none());
+    }
+
+    #[test]
+    fn parse_duration_literal_rejects_invalid_and_trims_spaces() {
+        assert_eq!(parse_duration_literal("15"), 15);
+        assert_eq!(parse_duration_literal(" 3m "), 180);
+        assert_eq!(parse_duration_literal("2h"), 7200);
+        assert_eq!(parse_duration_literal("9x"), 0);
+        assert_eq!(parse_duration_literal(""), 0);
+        assert_eq!(parse_duration_literal("abc"), 0);
+    }
+
+    #[test]
+    fn resolve_and_write_rejects_unknown_format() {
+        let td = TempDir::new().expect("tmp");
+        let file = td.path().join("compose.yaml");
+        fs::write(&file, "services:\n  app:\n    image: nginx\n").expect("write");
+        let err = resolve_and_write(
+            td.path().to_str().expect("path"),
+            "toml",
+            Some(td.path().join("out.txt").to_str().expect("out")),
+        )
+        .expect_err("must fail");
+        assert!(matches!(err, Error::Format(v) if v == "toml"));
     }
 }

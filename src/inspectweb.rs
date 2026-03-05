@@ -387,6 +387,11 @@ fn handle_connection(
             .get("includeCrds")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let allow_template_includes = payload_string_list(&payload, "allowTemplateIncludes");
+        let unsupported_template_mode = payload
+            .get("unsupportedTemplateMode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
         let chart_values_yaml = payload
             .get("chartValuesYaml")
             .and_then(|v| v.as_str())
@@ -411,6 +416,8 @@ fn handle_connection(
             kube_version,
             api_versions,
             include_crds,
+            allow_template_includes,
+            unsupported_template_mode,
             chart_values_yaml,
         ) {
             Ok((values, msg, cnt)) => (true, values, msg, cnt),
@@ -488,6 +495,11 @@ fn handle_connection(
             .get("includeCrds")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let allow_template_includes = payload_string_list(&payload, "allowTemplateIncludes");
+        let unsupported_template_mode = payload
+            .get("unsupportedTemplateMode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
         let chart_values_yaml = payload
             .get("chartValuesYaml")
             .and_then(|v| v.as_str())
@@ -523,6 +535,8 @@ fn handle_connection(
                 kube_version,
                 api_versions,
                 include_crds,
+                allow_template_includes,
+                unsupported_template_mode,
                 chart_values_yaml,
                 generated_values_yaml,
                 library_chart_path.as_deref(),
@@ -690,6 +704,11 @@ fn handle_connection(
             .get("includeCrds")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let allow_template_includes = payload_string_list(&payload, "allowTemplateIncludes");
+        let unsupported_template_mode = payload
+            .get("unsupportedTemplateMode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
         let chart_values_yaml = payload
             .get("chartValuesYaml")
             .and_then(|v| v.as_str())
@@ -729,6 +748,8 @@ fn handle_connection(
             kube_version,
             api_versions,
             include_crds,
+            allow_template_includes,
+            unsupported_template_mode,
             chart_values_yaml,
         ) {
             Ok((values, msg, cnt)) => (true, values, msg, cnt),
@@ -1027,6 +1048,8 @@ fn import_payload(
     kube_version: Option<String>,
     api_versions: Vec<String>,
     include_crds: bool,
+    allow_template_includes: Vec<String>,
+    unsupported_template_mode: &str,
     chart_values_yaml: Option<String>,
 ) -> Result<(String, String, usize), String> {
     if path.trim().is_empty() {
@@ -1053,6 +1076,8 @@ fn import_payload(
         chart_name: None,
         library_chart_path: None,
         import_strategy: import_strategy.to_string(),
+        allow_template_includes,
+        unsupported_template_mode: unsupported_template_mode.to_string(),
         verify_equivalence: false,
         release_name: release_name.to_string(),
         namespace,
@@ -1135,13 +1160,56 @@ fn save_chart_payload(
         serde_yaml::from_str(values_yaml).map_err(|e| format!("values yaml parse error: {e}"))?;
     crate::output::generate_consumer_chart(out_chart_dir, chart_name, &values, library_chart_path)
         .map_err(|e| format!("save chart error: {e}"))?;
+    let mut notes = Vec::new();
+    if source_type.trim().eq_ignore_ascii_case("chart") && !source_path.trim().is_empty() {
+        match crate::output::sync_imported_include_helpers_from_source_chart(
+            source_path,
+            out_chart_dir,
+            values_yaml,
+        ) {
+            Ok(sync) => {
+                if !sync.added.is_empty() || !sync.missing.is_empty() {
+                    notes.push(format!(
+                        "include helpers: added {}, missing {}",
+                        sync.added.len(),
+                        sync.missing.len()
+                    ));
+                }
+            }
+            Err(e) => {
+                notes.push(format!("include helpers sync warning: {e}"));
+            }
+        }
+        match crate::output::ensure_values_examples_for_imported_helpers(out_chart_dir) {
+            Ok(added) => {
+                if !added.is_empty() {
+                    notes.push(format!("values examples added {}", added.len()));
+                }
+            }
+            Err(e) => {
+                notes.push(format!("values examples warning: {e}"));
+            }
+        }
+    }
+    let extra_note = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", notes.join("; "))
+    };
     let mut copied_crds = false;
     if source_type.trim().eq_ignore_ascii_case("chart") && !source_path.trim().is_empty() {
         copied_crds = crate::output::copy_chart_crds_if_any(source_path, out_chart_dir)
             .map_err(|e| format!("copy crds error: {e}"))?;
     }
-    if copied_crds {
+    if copied_crds && !extra_note.is_empty() {
+        Ok(format!(
+            "Chart saved: {} (CRDs copied){}",
+            out_chart_dir, extra_note
+        ))
+    } else if copied_crds {
         Ok(format!("Chart saved: {} (CRDs copied)", out_chart_dir))
+    } else if !extra_note.is_empty() {
+        Ok(format!("Chart saved: {}{}", out_chart_dir, extra_note))
     } else {
         Ok(format!("Chart saved: {}", out_chart_dir))
     }
@@ -1167,6 +1235,8 @@ fn compare_render_payload(
     kube_version: Option<String>,
     api_versions: Vec<String>,
     include_crds: bool,
+    allow_template_includes: Vec<String>,
+    unsupported_template_mode: &str,
     chart_values_yaml: Option<String>,
     generated_values_yaml: &str,
     library_chart_path: Option<&str>,
@@ -1201,6 +1271,8 @@ fn compare_render_payload(
         chart_name: None,
         library_chart_path: None,
         import_strategy: import_strategy.to_string(),
+        allow_template_includes,
+        unsupported_template_mode: unsupported_template_mode.to_string(),
         verify_equivalence: false,
         release_name: release_name.to_string(),
         namespace,
@@ -1325,10 +1397,10 @@ fn jq_payload(
     raw_output: bool,
 ) -> Result<String, String> {
     let docs = crate::query::parse_input_docs_prefer_json(input)
-        .map_err(|e| format!("jq parse error: {e}"))?;
+        .map_err(|e| format_web_query_error("jq", "input", input, &e))?;
     let selected = select_docs_for_web(docs, doc_mode, doc_index, "jq")?;
     let out = crate::query::run_query_stream(query, selected)
-        .map_err(|e| format!("jq query error: {e}"))?;
+        .map_err(|e| format_web_query_error("jq", "query", query, &e))?;
     let mut lines = Vec::with_capacity(out.len());
     for v in out {
         if raw_output {
@@ -1345,6 +1417,72 @@ fn jq_payload(
         lines.push(line);
     }
     Ok(lines.join("\n"))
+}
+
+fn format_web_query_error(
+    tool: &str,
+    source_label: &str,
+    source_text: &str,
+    err: &crate::query::Error,
+) -> String {
+    let base = format!("{tool} {source_label} error: {err}");
+    let Some((line, col)) = extract_query_error_line_col(&base) else {
+        return base;
+    };
+    let ctx = render_query_error_context(source_label, source_text, line, col);
+    if ctx.is_empty() {
+        base
+    } else {
+        format!("{base}\n{ctx}\nHint: check {source_label} near ^")
+    }
+}
+
+fn extract_query_error_line_col(msg: &str) -> Option<(usize, usize)> {
+    use std::sync::OnceLock;
+
+    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        vec![
+            regex::Regex::new(r"(?:at\s+)?line\s+(\d+)\s+column\s+(\d+)").expect("regex"),
+            regex::Regex::new(r"(?:at\s+)?line\s+(\d+)\s*,\s*column\s+(\d+)").expect("regex"),
+            regex::Regex::new(r"line\s*:\s*(\d+)\s*,\s*column\s*:\s*(\d+)").expect("regex"),
+        ]
+    });
+    for re in patterns {
+        if let Some(caps) = re.captures(msg) {
+            let line = caps.get(1)?.as_str().parse::<usize>().ok()?;
+            let col = caps.get(2)?.as_str().parse::<usize>().ok()?;
+            return Some((line, col));
+        }
+    }
+    None
+}
+
+fn render_query_error_context(
+    source_label: &str,
+    source_text: &str,
+    line: usize,
+    col: usize,
+) -> String {
+    let lines: Vec<&str> = source_text.lines().collect();
+    if lines.is_empty() || line == 0 {
+        return String::new();
+    }
+    let from = line.saturating_sub(2).max(1);
+    let to = (line + 2).min(lines.len());
+    let mut out = String::new();
+    out.push_str(source_label);
+    out.push_str(" context:\n");
+    for i in from..=to {
+        let marker = if i == line { '>' } else { ' ' };
+        let text = lines.get(i - 1).copied().unwrap_or_default();
+        out.push_str(&format!("{marker} {:>5} | {text}\n", i));
+        if i == line {
+            let caret_pad = col.saturating_sub(1);
+            out.push_str(&format!("  {:>5} | {}^\n", "", " ".repeat(caret_pad)));
+        }
+    }
+    out.trim_end().to_string()
 }
 
 fn dyff_payload(
@@ -2172,6 +2310,61 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
   height:100%;
 }}
 .import-output .code-output {{ min-height:520px; max-height:72vh; }}
+.import-issues {{
+  margin-top:8px;
+  border:1px solid #694f20;
+  background:linear-gradient(180deg,#2b2317 0%, #251d14 100%);
+  border-radius:10px;
+  padding:8px;
+}}
+.import-issues-head {{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  margin-bottom:6px;
+}}
+.import-issues-list {{
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+}}
+.import-issues-actions {{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:8px;
+}}
+.import-issues-note {{
+  margin-top:6px;
+  font-size:12px;
+  color:#d8c69b;
+}}
+.import-issue-chip {{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  font-size:12px;
+  padding:4px 8px;
+  border:1px solid #5c4a29;
+  border-radius:8px;
+  background:#1f1a12;
+}}
+.import-issue-chip code {{
+  color:#f7d59a;
+}}
+.import-issue-item {{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  font-size:12px;
+  padding:4px 8px;
+}}
+.import-issue-item .issue-line {{
+  font-family:ui-monospace, Menlo, monospace;
+  color:#fbbf24;
+  min-width:32px;
+}}
 .import-title {{
   display:flex;
   align-items:flex-start;
@@ -2386,6 +2579,11 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
 }}
 .import-editor-shell > * {{
   flex:1 1 auto;
+  min-width:0;
+  min-height:0;
+}}
+.import-layout .editor-shell {{
+  min-height:0;
 }}
 .source-editor-area {{
   display:flex;
@@ -2446,6 +2644,61 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
 .import-layout .yaml-editor-input {{
   min-height:0;
   height:100%;
+  min-width:0;
+}}
+.import-layout .yaml-editor-highlight,
+.import-layout .yaml-editor-input,
+.import-layout .yaml-fold-view {{
+  overflow-y:scroll;
+  overflow-x:scroll;
+  scrollbar-gutter:stable both-edges;
+  scrollbar-color:#77829a #1a1f28;
+  scrollbar-width:thin;
+}}
+.import-layout .editor-host .cm-editor {{
+  height:100%;
+  min-width:0;
+}}
+.import-layout .editor-host .cm-scroller {{
+  overflow-y:scroll !important;
+  overflow-x:scroll !important;
+  min-width:0;
+  scrollbar-gutter:stable both-edges;
+  scrollbar-color:#77829a #1a1f28;
+  scrollbar-width:thin;
+}}
+.import-layout .yaml-editor-highlight::-webkit-scrollbar,
+.import-layout .yaml-editor-input::-webkit-scrollbar,
+.import-layout .yaml-fold-view::-webkit-scrollbar,
+.import-layout .editor-host .cm-scroller::-webkit-scrollbar {{
+  width:12px;
+  height:12px;
+}}
+.import-layout .yaml-editor-highlight::-webkit-scrollbar-track,
+.import-layout .yaml-editor-input::-webkit-scrollbar-track,
+.import-layout .yaml-fold-view::-webkit-scrollbar-track,
+.import-layout .editor-host .cm-scroller::-webkit-scrollbar-track {{
+  background:#1a1f28;
+}}
+.import-layout .yaml-editor-highlight::-webkit-scrollbar-thumb,
+.import-layout .yaml-editor-input::-webkit-scrollbar-thumb,
+.import-layout .yaml-fold-view::-webkit-scrollbar-thumb,
+.import-layout .editor-host .cm-scroller::-webkit-scrollbar-thumb {{
+  background:#77829a;
+  border-radius:10px;
+  border:2px solid #1a1f28;
+}}
+.import-layout .yaml-editor-highlight::-webkit-scrollbar-thumb:hover,
+.import-layout .yaml-editor-input::-webkit-scrollbar-thumb:hover,
+.import-layout .yaml-fold-view::-webkit-scrollbar-thumb:hover,
+.import-layout .editor-host .cm-scroller::-webkit-scrollbar-thumb:hover {{
+  background:#8d97ad;
+}}
+.import-layout .yaml-editor-highlight::-webkit-scrollbar-corner,
+.import-layout .yaml-editor-input::-webkit-scrollbar-corner,
+.import-layout .yaml-fold-view::-webkit-scrollbar-corner,
+.import-layout .editor-host .cm-scroller::-webkit-scrollbar-corner {{
+  background:#1a1f28;
 }}
 .fallback-fold {{
   padding:10px;
@@ -2503,6 +2756,10 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
   display:block;
   padding:0 4px;
   border-radius:4px;
+}}
+.yamlline.template-issue {{
+  border-left:2px solid #f59e0b;
+  background:rgba(245,158,11,0.08);
 }}
 .yamlline.hidden {{
   display:none;
@@ -2728,7 +2985,20 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
 .tok-diff-add {{ color:var(--ok); font-weight:700; }}
 .tok-diff-rem {{ color:#ff8e8e; font-weight:700; }}
 .tok-diff-chg {{ color:#ffd37b; font-weight:700; }}
-.err {{ color:var(--danger); font-weight:600; }}
+.err {{ color:var(--danger); font-weight:600; white-space:pre-wrap; }}
+.err-compiler {{
+  color:#d7dce6;
+  background:#1a1f28;
+  border:1px solid #30394a;
+  border-left:3px solid #5b6880;
+  border-radius:10px;
+  padding:10px 12px;
+  font-weight:500;
+  font-family:ui-monospace, Menlo, monospace;
+  font-size:12px;
+  line-height:1.45;
+  overflow:auto;
+}}
 @media (max-width: 960px) {{
   body {{ padding:12px; }}
   .title {{ font-size:34px; }}
@@ -2837,6 +3107,28 @@ window.addEventListener('error', function(e) {{
       <span class='import-status'>source: {{{{ mainImportSourceType }}}}</span>
       <span class='path-chip' :title='mainImportPath || "-"'>path: {{{{ mainImportPath || "-" }}}}</span>
     </div>
+    <div v-if='mainImportNeedsTemplateDecision' class='import-issues'>
+      <div class='import-issues-head'>
+        <strong>Unsupported template includes</strong>
+        <span class='import-status'>{{{{ mainImportUnsupportedIncludeNames.length }}}}</span>
+      </div>
+      <div class='import-issues-list'>
+        <span v-for='(name, idx) in mainImportUnsupportedIncludeNames' :key='"tmpl-err-name-" + idx' class='import-issue-chip'>
+          <code>{{{{ name }}}}</code>
+        </span>
+      </div>
+      <div class='import-issues-actions'>
+        <button class='primary' @click='allowDetectedTemplateIncludesAndRetry' :disabled='mainImportRunning'>Allow listed includes + Retry</button>
+        <button class='secondary' @click='escapeUnsupportedTemplatesAndRetry' :disabled='mainImportRunning'>Escape unsupported templates + Retry</button>
+        <button class='secondary' @click='appendDetectedTemplateIncludes' :disabled='mainImportRunning'>Add includes to allow list</button>
+        <button class='secondary' @click='openMainImportConfig' :disabled='mainImportRunning'>Review import config</button>
+      </div>
+      <div class='import-issues-note'>Default mode is strict. Choose one action to continue import.</div>
+      <details class='advanced-details' style='margin-top:8px;' v-if='mainImportRawError && mainImportRawError !== mainImportError'>
+        <summary>Technical error details</summary>
+        <pre class='wrap' style='min-height:0; margin-top:8px;'>{{{{ mainImportRawError }}}}</pre>
+      </details>
+    </div>
     <div class='import-layout'>
       <div class='import-section'>
         <h4>Source chart values.yaml</h4>
@@ -2847,6 +3139,7 @@ window.addEventListener('error', function(e) {{
               <button class='secondary' @click='loadChartValuesFromPath'>Load values.yaml</button>
               <button class='secondary' @click='pasteMainImportFromStdin' :disabled='!mainImportStdinText'>Paste stdin</button>
               <button class='secondary' @click='resetChartValuesEditor'>Reset</button>
+              <button class='secondary' @click='clearChartValuesEditor' :disabled='!mainImportChartValuesEditor'>Clear values</button>
             </div>
             <div class='right'>
               <label class='chk'><input type='checkbox' v-model='mainImportUseChartValuesEditor'/> use edited chart values</label>
@@ -2905,9 +3198,27 @@ window.addEventListener('error', function(e) {{
             <pre class='code-output yaml-fold-view' v-html='mainImportPreviewHtml'></pre>
           </div>
         </div>
+        <div v-if='mainImportTemplateIssues.length' class='import-issues'>
+          <div class='import-issues-head'>
+            <strong>Template issues</strong>
+            <span class='import-status'>{{{{ mainImportTemplateIssues.length }}}}</span>
+          </div>
+          <div class='import-issues-list'>
+            <button
+              v-for='(issue, issueIdx) in mainImportTemplateIssues'
+              :key='"tmpl-issue-" + issueIdx'
+              class='secondary import-issue-item'
+              @click='focusMainImportTemplateIssue(issue)'>
+              <span class='issue-line'>{{{{ issue.lineNo ? ("L" + issue.lineNo) : "L?" }}}}</span>
+              <code>{{{{ issue.include }}}}</code>
+              <span class='muted'>{{{{ issue.mode }}}}</span>
+            </button>
+          </div>
+          <div class='field-hint'>Escaped template includes are highlighted in generated values.</div>
+        </div>
       </div>
     </div>
-    <div class='err' v-if='mainImportError' style='margin-top:8px;'>{{{{ mainImportError }}}}</div>
+    <div class='err' v-if='mainImportError && !mainImportNeedsTemplateDecision' style='margin-top:8px;'>{{{{ mainImportError }}}}</div>
     <div class='muted' v-if='!cmAvailable && cmProbeReason' style='margin-top:6px;'>CodeMirror: {{{{ cmProbeReason }}}}</div>
     <div class='err' v-if='mainImportCompareError' style='margin-top:8px;'>{{{{ mainImportCompareError }}}}</div>
     <div class='muted' v-if='mainImportCompareMessage' style='margin-top:8px;'>{{{{ mainImportCompareMessage }}}}</div>
@@ -2988,6 +3299,19 @@ window.addEventListener('error', function(e) {{
                 <label class='chk'><input type='checkbox' v-model='mainImportIncludeCrds'/> include CRDs</label>
               </div>
               <div class='field-hint'>Use CRDs when you want generated chart to include source chart CRDs.</div>
+            </div>
+            <div class='form-field'>
+              <label>Unsupported templates</label>
+              <select v-model='mainImportUnsupportedTemplateMode'>
+                <option value='error'>error (recommended)</option>
+                <option value='escape'>escape as literal</option>
+              </select>
+              <div class='field-hint'>In <code>error</code> mode import stops and asks for explicit decision.</div>
+            </div>
+            <div class='form-field path-field'>
+              <label>Allow template includes (one per line)</label>
+              <textarea v-model='mainImportAllowTemplateIncludesText' spellcheck='false' style='min-height:90px;'></textarea>
+              <div class='field-hint'>Examples: <code>opensearch-cluster.*</code>, <code>custom.helper</code>.</div>
             </div>
           </div>
         </div>
@@ -3296,7 +3620,7 @@ window.addEventListener('error', function(e) {{
       <span>results: {{{{ jqResultCount }}}}, chars: {{{{ (jqOutput || '').length }}}}</span>
       <span>compact: {{{{ jqCompact ? "on" : "off" }}}}, raw: {{{{ jqRawOutput ? "on" : "off" }}}}</span>
     </div>
-    <div class='err' v-if='jqError' style='margin-top:8px;'>{{{{ jqError }}}}</div>
+    <div class='err err-compiler' v-if='jqError' style='margin-top:8px;'>{{{{ jqError }}}}</div>
   </div>
 
   <div v-else-if='activeUtilityKey === "dyff-compare"' class='card'>
@@ -3491,8 +3815,11 @@ const app = Vue.createApp({{
       mainImportSetText: '',
       mainImportExtraSetText: '',
       mainImportApiVersionsText: '',
+      mainImportAllowTemplateIncludesText: '',
+      mainImportUnsupportedTemplateMode: 'error',
       mainImportOutput: '',
       mainImportError: '',
+      mainImportRawError: '',
       mainImportMessage: '',
       mainImportSourceCount: 0,
       mainImportRunning: false,
@@ -3756,6 +4083,43 @@ const app = Vue.createApp({{
     mainImportPreviewMeta() {{
       return this.mainImportPreview.meta || [];
     }},
+    mainImportTemplateIssues() {{
+      const out = [];
+      const lines = String(this.mainImportOutput || '').split('\n');
+      for (let i = 0; i < lines.length; i++) {{
+        const includeName = this.extractEscapedIncludeName(lines[i]);
+        if (!includeName) continue;
+        out.push({{
+          lineNo: i + 1,
+          include: includeName,
+          mode: 'escaped',
+        }});
+      }}
+      return out;
+    }},
+    mainImportTemplateIssueLineMap() {{
+      const map = {{}};
+      for (const issue of this.mainImportTemplateIssues || []) {{
+        if (!issue || !issue.lineNo) continue;
+        map[String(issue.lineNo)] = issue;
+      }}
+      return map;
+    }},
+    mainImportUnsupportedIncludeNames() {{
+      const names = this.parseUnsupportedIncludesFromError(this.mainImportRawError || this.mainImportError || '');
+      const out = [];
+      const seen = new Set();
+      for (const raw of names) {{
+        const name = String(raw || '').trim();
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        out.push(name);
+      }}
+      return out;
+    }},
+    mainImportNeedsTemplateDecision() {{
+      return !!(this.mainImportError && this.mainImportUnsupportedIncludeNames.length);
+    }},
     jqSuggestions() {{
       const meta = this.currentJqTokenMeta();
       const token = (meta.term || '').toLowerCase();
@@ -3881,6 +4245,8 @@ const app = Vue.createApp({{
         this.mainImportSetText = s.mainImportSetText || '';
         this.mainImportExtraSetText = s.mainImportExtraSetText || '';
         this.mainImportApiVersionsText = s.mainImportApiVersionsText || '';
+        this.mainImportAllowTemplateIncludesText = s.mainImportAllowTemplateIncludesText || '';
+        this.mainImportUnsupportedTemplateMode = s.mainImportUnsupportedTemplateMode || 'error';
         this.mainImportPickedFilesLabel = s.mainImportPickedFilesLabel || '';
         this.mainImportConfigOpen = !!s.mainImportConfigOpen;
         this.mainImportChartValuesEditor = s.mainImportChartValuesEditor || '';
@@ -4098,6 +4464,8 @@ const app = Vue.createApp({{
     mainImportSetText: 'saveSettings',
     mainImportExtraSetText: 'saveSettings',
     mainImportApiVersionsText: 'saveSettings',
+    mainImportAllowTemplateIncludesText: 'saveSettings',
+    mainImportUnsupportedTemplateMode: 'saveSettings',
     mainImportConfigOpen: 'saveSettings',
     mainImportOutput() {{
       this.saveSettings();
@@ -4501,6 +4869,8 @@ const app = Vue.createApp({{
           mainImportSetText: this.mainImportSetText,
           mainImportExtraSetText: this.mainImportExtraSetText,
           mainImportApiVersionsText: this.mainImportApiVersionsText,
+          mainImportAllowTemplateIncludesText: this.mainImportAllowTemplateIncludesText,
+          mainImportUnsupportedTemplateMode: this.mainImportUnsupportedTemplateMode,
           mainImportConfigOpen: this.mainImportConfigOpen,
           mainImportPickedFilesLabel: this.mainImportPickedFilesLabel,
           mainImportChartValuesEditor: this.mainImportChartValuesEditor,
@@ -4588,6 +4958,104 @@ const app = Vue.createApp({{
       }}
       return out;
     }},
+    parseUnsupportedIncludesFromError(msg) {{
+      const text = String(msg || '');
+      const marker = /unsupported source template includes:\s*/i.exec(text);
+      if (!marker) return [];
+      let tail = text.slice(marker.index + marker[0].length);
+      const decide = /\bDecide explicitly:/i.exec(tail);
+      if (decide) {{
+        tail = tail.slice(0, decide.index);
+      }}
+      return String(tail || '')
+        .replace(/\\.+\\s*$/, '')
+        .split(',')
+        .map((x) => String(x || '').trim())
+        .filter(Boolean);
+    }},
+    appendMainImportAllowedIncludes(items) {{
+      const existing = this.parseLines(this.mainImportAllowTemplateIncludesText);
+      const set = new Set(existing);
+      for (const raw of (items || [])) {{
+        const name = String(raw || '').trim();
+        if (!name || set.has(name)) continue;
+        existing.push(name);
+        set.add(name);
+      }}
+      this.mainImportAllowTemplateIncludesText = existing.join('\n');
+    }},
+    appendDetectedTemplateIncludes() {{
+      this.appendMainImportAllowedIncludes(this.mainImportUnsupportedIncludeNames);
+      this.mainImportConfigOpen = true;
+    }},
+    applyMainImportRunError(msg) {{
+      const raw = String(msg || '').trim();
+      this.mainImportRawError = raw;
+      const includes = this.parseUnsupportedIncludesFromError(raw);
+      if (includes.length > 0) {{
+        this.mainImportError = 'Unsupported template includes detected. Choose action in the decision block above.';
+        return;
+      }}
+      this.mainImportError = raw || 'Import failed';
+    }},
+    async allowDetectedTemplateIncludesAndRetry() {{
+      this.appendMainImportAllowedIncludes(this.mainImportUnsupportedIncludeNames);
+      await this.runMainImport();
+    }},
+    async escapeUnsupportedTemplatesAndRetry() {{
+      this.mainImportUnsupportedTemplateMode = 'escape';
+      await this.runMainImport();
+    }},
+    extractEscapedIncludeName(line) {{
+      const text = String(line || '');
+      const m = /\{{\{{\s*["']\{{\{{["']\s*\}}\}}\s*include\s+["']([^"']+)["']/i.exec(text);
+      return m && m[1] ? String(m[1]) : '';
+    }},
+    highlightMainImportOutputLine(line, lineNo) {{
+      const base = this.highlightStructured(line);
+      const issue = (this.mainImportTemplateIssueLineMap || {{}})[String(lineNo)];
+      if (!issue) return base;
+      return "<span class='tok-diff-chg'>" + base + "</span>";
+    }},
+    lineOffsetRange(text, lineNo) {{
+      const lines = String(text || '').split('\n');
+      const target = Number(lineNo || 0);
+      if (!Number.isFinite(target) || target < 1 || target > lines.length) return null;
+      let from = 0;
+      for (let i = 0; i < target - 1; i++) from += lines[i].length + 1;
+      const to = from + lines[target - 1].length;
+      return {{ from, to }};
+    }},
+    resetMainImportGeneratedScrollX() {{
+      const host = this.$refs && this.$refs.mainImportGeneratedCmHost ? this.$refs.mainImportGeneratedCmHost : null;
+      const scroller = host && host.querySelector ? host.querySelector('.cm-scroller') : null;
+      if (scroller && typeof scroller.scrollLeft === 'number' && scroller.scrollLeft !== 0) {{
+        scroller.scrollLeft = 0;
+      }}
+    }},
+    focusMainImportTemplateIssue(issue) {{
+      const lineNo = Number(issue && issue.lineNo ? issue.lineNo : 0);
+      if (!lineNo) {{
+        this.mainImportConfigOpen = true;
+        return;
+      }}
+      const range = this.lineOffsetRange(this.mainImportOutput || '', lineNo);
+      if (!range) return;
+      if (this.mainImportGeneratedCm && typeof this.mainImportGeneratedCm.setSelection === 'function') {{
+        this.mainImportGeneratedCm.setSelection(range.from, range.from);
+        if (typeof this.mainImportGeneratedCm.setVirtualCursor === 'function') {{
+          this.mainImportGeneratedCm.setVirtualCursor(range.from);
+        }}
+        this.$nextTick(() => this.resetMainImportGeneratedScrollX());
+        return;
+      }}
+      this.$nextTick(() => {{
+        const el = document.getElementById('main-yaml-line-' + String(lineNo));
+        if (el && typeof el.scrollIntoView === 'function') {{
+          el.scrollIntoView({{ block:'center', behavior:'smooth' }});
+        }}
+      }});
+    }},
     countIndent(line) {{
       const m = /^(\s*)/.exec(String(line || ''));
       return m ? m[1].length : 0;
@@ -4616,6 +5084,7 @@ const app = Vue.createApp({{
           .map((k) => Number(k))
           .filter((n) => Number.isFinite(n) && n > 0)
       );
+      const issueLines = this.mainImportTemplateIssueLineMap || {{}};
       const hidden = new Set();
       for (let i = 0; i < meta.length; i++) {{
         const m = meta[i];
@@ -4629,10 +5098,11 @@ const app = Vue.createApp({{
         const m = meta[idx];
         const cls = ['yamlline'];
         if (hidden.has(m.lineNo)) cls.push('hidden');
+        if (issueLines[String(m.lineNo)]) cls.push('template-issue');
         const mark = m.collapsible
           ? '<span class="foldmark" data-fold-line="' + String(m.lineNo) + '" title="Toggle fold">' + (collapsed.has(m.lineNo) ? '▸' : '▾') + '</span>'
           : '<span class="foldmark sp"> </span>';
-        return '<span id="main-yaml-line-' + String(m.lineNo) + '" data-line="' + String(m.lineNo) + '" data-indent="' + String(m.indent) + '" class="' + cls.join(' ') + '" title="' + this.escapeAttr(line) + '">' + mark + this.highlightStructured(line) + '</span>';
+        return '<span id="main-yaml-line-' + String(m.lineNo) + '" data-line="' + String(m.lineNo) + '" data-indent="' + String(m.indent) + '" class="' + cls.join(' ') + '" title="' + this.escapeAttr(line) + '">' + mark + this.highlightMainImportOutputLine(line, m.lineNo) + '</span>';
       }}).join('');
       return {{ meta, html }};
     }},
@@ -4739,6 +5209,11 @@ const app = Vue.createApp({{
       if (this.mainImportLoadedChartValues) {{
         this.mainImportChartValuesEditor = this.mainImportLoadedChartValues;
       }}
+    }},
+    clearChartValuesEditor() {{
+      this.mainImportChartValuesEditor = '';
+      this.mainImportUseChartValuesEditor = true;
+      this.mainImportMessage = 'Source values editor cleared';
     }},
     pasteMainImportFromStdin() {{
       if (!this.mainImportStdinText) return;
@@ -4875,6 +5350,7 @@ const app = Vue.createApp({{
     }},
     async runMainImport() {{
       this.mainImportError = '';
+      this.mainImportRawError = '';
       this.mainImportMessage = '';
       this.mainImportCompareError = '';
       this.mainImportCompareMessage = '';
@@ -4908,6 +5384,8 @@ const app = Vue.createApp({{
             setFileValues: extra.setFileValues,
             setJsonValues: extra.setJsonValues,
             apiVersions: this.parseLines(this.mainImportApiVersionsText),
+            allowTemplateIncludes: this.parseLines(this.mainImportAllowTemplateIncludesText),
+            unsupportedTemplateMode: this.mainImportUnsupportedTemplateMode || 'error',
             chartValuesYaml: this.mainImportUseChartValuesEditor ? (this.mainImportChartValuesEditor || '') : undefined,
           }}),
           signal: ctrl && ctrl.signal ? ctrl.signal : undefined,
@@ -4925,10 +5403,11 @@ const app = Vue.createApp({{
         if(!data.ok) {{
           this.mainImportOutput = '';
           this.mainImportSourceCount = Number(data.sourceCount || 0);
-          this.mainImportError = data.message || 'Import failed';
+          this.applyMainImportRunError(data.message || 'Import failed');
           return;
         }}
         this.mainImportOutput = data.valuesYaml || '';
+        this.$nextTick(() => this.resetMainImportGeneratedScrollX());
         this.mainImportSourceCount = Number(data.sourceCount || 0);
         this.mainImportMessage = data.message || 'Import completed';
         this.mainImportConfigOpen = false;
@@ -4937,7 +5416,7 @@ const app = Vue.createApp({{
         if (this.isAbortError(e)) return;
         this.mainImportOutput = '';
         this.mainImportSourceCount = 0;
-        this.mainImportError = String(e);
+        this.applyMainImportRunError(String(e));
       }} finally {{
         this.finishAbortableRequest('import', ctrl);
         this.mainImportRunning = false;
@@ -4984,6 +5463,8 @@ const app = Vue.createApp({{
             setFileValues: extra.setFileValues,
             setJsonValues: extra.setJsonValues,
             apiVersions: this.parseLines(this.mainImportApiVersionsText),
+            allowTemplateIncludes: this.parseLines(this.mainImportAllowTemplateIncludesText),
+            unsupportedTemplateMode: this.mainImportUnsupportedTemplateMode || 'error',
             chartValuesYaml: this.mainImportUseChartValuesEditor ? (this.mainImportChartValuesEditor || '') : undefined,
             valuesYaml: this.mainImportOutput,
             libraryChartPath: this.mainImportLibraryChartPath || undefined,
@@ -5021,6 +5502,7 @@ const app = Vue.createApp({{
     clearMainImport() {{
       this.mainImportOutput = '';
       this.mainImportError = '';
+      this.mainImportRawError = '';
       this.mainImportMessage = '';
       this.mainImportSourceCount = 0;
       this.mainImportCompareError = '';
@@ -5099,6 +5581,8 @@ const app = Vue.createApp({{
       this.mainImportSetText = '';
       this.mainImportExtraSetText = '';
       this.mainImportApiVersionsText = '';
+      this.mainImportAllowTemplateIncludesText = '';
+      this.mainImportUnsupportedTemplateMode = 'error';
     }},
     resetMainImportConfig() {{
       this.mainImportSourceType = 'chart';
@@ -5118,6 +5602,8 @@ const app = Vue.createApp({{
       this.mainImportSetText = '';
       this.mainImportExtraSetText = '';
       this.mainImportApiVersionsText = '';
+      this.mainImportAllowTemplateIncludesText = '';
+      this.mainImportUnsupportedTemplateMode = 'error';
       this.mainImportLibraryChartPath = '';
     }},
     decodeBase64Url(s) {{
@@ -5677,7 +6163,25 @@ const app = Vue.createApp({{
       this.replaceCurrentJqToken(s.snippet, s.cursor || 0);
       this.jqSuggestOpen = false;
     }},
+    isJqUndoShortcut(e) {{
+      const key = String((e && e.key) || '').toLowerCase();
+      return (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && key === 'z';
+    }},
+    isJqRedoShortcut(e) {{
+      const key = String((e && e.key) || '').toLowerCase();
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return false;
+      if (e.metaKey) {{
+        return e.shiftKey && key === 'z';
+      }}
+      return (!e.shiftKey && key === 'y') || (e.shiftKey && key === 'z');
+    }},
     onJqKeydown(e) {{
+      if (this.isJqUndoShortcut(e) || this.isJqRedoShortcut(e)) {{
+        this.jqSuggestOpen = false;
+        // Let textarea perform native undo/redo while preventing global shortcut handlers.
+        e.stopPropagation();
+        return;
+      }}
       if(!this.jqSuggestOpen || !this.jqSuggestions.length) {{
         if((e.ctrlKey || e.metaKey) && e.key === ' ') {{
           e.preventDefault();
@@ -6632,8 +7136,14 @@ mod tests {
         assert!(html.contains("localStorage"));
         assert!(html.contains("Copy values"));
         assert!(html.contains("Save as chart"));
+        assert!(html.contains("Clear values"));
         assert!(html.contains("/api/save-chart"));
         assert!(html.contains("Compare renders"));
+        assert!(html.contains("Template issues"));
+        assert!(html.contains("Unsupported templates"));
+        assert!(html.contains("Unsupported template includes"));
+        assert!(html.contains("Allow listed includes + Retry"));
+        assert!(html.contains("Escape unsupported templates + Retry"));
         assert!(html.contains("/api/compare-renders"));
         assert!(html.contains("/api/semantic-map"));
     }
@@ -6814,6 +7324,36 @@ text: |-
     }
 
     #[test]
+    fn format_web_query_error_adds_query_context_and_hint() {
+        let err = format_web_query_error(
+            "jq",
+            "query",
+            ".items[\n",
+            &crate::query::Error::Unsupported("parse failed at line 1, column 7".to_string()),
+        );
+        assert!(err.contains("jq query error"));
+        assert!(err.contains("query context:"));
+        assert!(err.contains(">     1 | .items["));
+        assert!(err.contains("^"));
+        assert!(err.contains("Hint: check query near ^"));
+    }
+
+    #[test]
+    fn format_web_query_error_adds_input_context_and_hint() {
+        let err = format_web_query_error(
+            "jq",
+            "input",
+            "a: 1\nb: [\n",
+            &crate::query::Error::Unsupported("yaml parse failed at line 2, column 4".to_string()),
+        );
+        assert!(err.contains("jq input error"));
+        assert!(err.contains("input context:"));
+        assert!(err.contains(">     2 | b: ["));
+        assert!(err.contains("^"));
+        assert!(err.contains("Hint: check input near ^"));
+    }
+
+    #[test]
     fn dyff_payload_finds_changes() {
         let out = dyff_payload("a: 1\n", "a: 2\n", false, false).expect("dyff");
         assert!(out.contains("changed: doc[0].a"));
@@ -6846,6 +7386,8 @@ text: |-
             None,
             Vec::new(),
             false,
+            Vec::new(),
+            "error",
             None,
         )
         .expect_err("expected error");
@@ -6873,6 +7415,8 @@ text: |-
             None,
             Vec::new(),
             false,
+            Vec::new(),
+            "error",
             None,
         )
         .expect_err("expected error");
@@ -6900,6 +7444,8 @@ text: |-
             None,
             Vec::new(),
             false,
+            Vec::new(),
+            "error",
             None,
             "global:\n  env: dev\n",
             None,
@@ -6929,6 +7475,8 @@ text: |-
             None,
             Vec::new(),
             false,
+            Vec::new(),
+            "error",
             None,
             "",
             None,
@@ -7002,6 +7550,47 @@ text: |-
         .expect("save");
         assert!(msg.contains("CRDs copied"));
         assert!(out.join("crds/widgets.example.com.yaml").exists());
+    }
+
+    #[test]
+    fn save_chart_payload_adds_imported_include_helpers_to_templates() {
+        let td = TempDir::new().expect("tmp");
+        let src = td.path().join("source-chart");
+        let out = td.path().join("generated-chart");
+        std::fs::create_dir_all(src.join("templates")).expect("mkdir");
+        std::fs::write(
+            src.join("templates/_helpers.tpl"),
+            r#"
+{{- define "opensearch-cluster.cluster-name" -}}
+{{- default "demo" .Values.cluster.name -}}
+{{- end -}}
+{{- define "opensearch-cluster.serviceAccountName" -}}
+{{- default (include "opensearch-cluster.cluster-name" .) .Values.serviceAccount.name -}}
+{{- end -}}
+"#,
+        )
+        .expect("write");
+
+        let msg = save_chart_payload(
+            "chart",
+            src.to_str().expect("src"),
+            out.to_str().expect("out"),
+            Some("demo"),
+            None,
+            "global:\n  env: dev\napps-k8s-manifests:\n  job-a:\n    spec: |\n      serviceAccountName: '{{ include \"opensearch-cluster.serviceAccountName\" . }}'\n",
+        )
+        .expect("save");
+        assert!(msg.contains("include helpers: added 2, missing 0"));
+        assert!(msg.contains("values examples added 2"));
+        let imported = std::fs::read_to_string(out.join("templates/imported-source-includes.tpl"))
+            .expect("read imported helpers");
+        assert!(imported.contains(r#"define "opensearch-cluster.cluster-name""#));
+        assert!(imported.contains(r#"define "opensearch-cluster.serviceAccountName""#));
+        assert!(!imported.contains(r#"define "opensearch-cluster.serviceAccountName.""#));
+        let values = std::fs::read_to_string(out.join("values.yaml")).expect("read values");
+        assert!(values.contains("cluster:"));
+        assert!(values.contains("serviceAccount:"));
+        assert!(values.contains("name: <example>"));
     }
 
     #[test]

@@ -510,6 +510,8 @@ fn render_manifest_for_entity(
         chart_name: None,
         library_chart_path: None,
         import_strategy: "helpers".into(),
+        allow_template_includes: Vec::new(),
+        unsupported_template_mode: "error".into(),
         verify_equivalence: false,
         release_name: "happ-lsp-preview".into(),
         namespace: None,
@@ -1435,6 +1437,9 @@ fn as_obj(value: &JsonValue) -> Option<&JsonMap<String, JsonValue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
 
     #[test]
     fn include_analysis_detects_unresolved_and_unused() {
@@ -1534,5 +1539,87 @@ apps-stateless:
             !yaml_text.contains("$serde_json::private::Number"),
             "must not leak serde_json::Number internals into YAML: {yaml_text}"
         );
+    }
+
+    #[test]
+    fn parse_key_and_include_list_tokens_validate_shape() {
+        assert_eq!(
+            parse_key_line("  good-key_1: value"),
+            Some((2, "good-key_1", "value"))
+        );
+        assert!(parse_key_line("  bad/key: value").is_none());
+        assert_eq!(
+            parse_list_item_token("    - \"profile-a\""),
+            Some((4, "profile-a".to_string()))
+        );
+        assert!(parse_list_item_token("    - bad/path").is_none());
+    }
+
+    #[test]
+    fn find_parent_key_uses_nearest_less_indented_key() {
+        let lines = vec![
+            "global:",
+            "  _includes:",
+            "    base:",
+            "      enabled: true",
+        ];
+        assert_eq!(find_parent_key(&lines, 3, 6).as_deref(), Some("base"));
+        assert_eq!(find_parent_key(&lines, 1, 2).as_deref(), Some("global"));
+    }
+
+    #[test]
+    fn diagnostics_report_missing_include_file_but_skip_templated_path() {
+        let td = TempDir::new().expect("tmp");
+        let profiles_dir = td.path().join("profiles");
+        fs::create_dir_all(&profiles_dir).expect("mkdir");
+        fs::write(profiles_dir.join("base.yaml"), "x: 1\n").expect("write");
+        let values_path = td.path().join("values.yaml");
+        fs::write(&values_path, "global: {}\n").expect("write values");
+
+        let src = r#"
+global:
+  _include_files:
+    - profiles/base.yaml
+    - profiles/missing.yaml
+    - '{{ printf "profiles/%s.yaml" .Values.env }}'
+apps-stateless:
+  api:
+    _include:
+      - base
+"#;
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        let missing: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Include file not found"))
+            .collect();
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].message.contains("profiles/missing.yaml"));
+        assert!(diagnostics
+            .iter()
+            .all(|d| !d.message.contains("profiles/%s.yaml")));
+    }
+
+    #[test]
+    fn include_name_from_path_strips_yaml_extensions_case_insensitively() {
+        assert_eq!(include_name_from_path("profiles/base.yaml"), "base");
+        assert_eq!(include_name_from_path("profiles/base.yml"), "base");
+        assert_eq!(include_name_from_path("profiles/UPPER.YAML"), "UPPER");
+        assert_eq!(include_name_from_path("profiles/noext"), "noext");
+    }
+
+    #[test]
+    fn uri_and_candidate_helpers_handle_relative_and_absolute_paths() {
+        assert!(file_path_from_uri_string("https://example.org/a.yaml").is_none());
+        assert!(file_path_from_uri_string("file://").is_none());
+
+        let base = Path::new("/tmp/happ-tests");
+        let rel = build_include_candidates("profiles/base.yaml", Some(base));
+        assert_eq!(rel, vec![base.join("profiles/base.yaml")]);
+
+        let abs = build_include_candidates("/etc/hosts", Some(base));
+        assert_eq!(abs, vec![Path::new("/etc/hosts").to_path_buf()]);
     }
 }

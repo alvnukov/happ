@@ -51,6 +51,7 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
         Command::Chart(args) => {
             let docs = crate::source::load_documents_for_chart(&args)?;
             let values = crate::convert::build_values(&args, &docs).map_err(Error::Convert)?;
+            let values_yaml_for_chart = crate::output::values_yaml(&values)?;
             let mut verify_chart_dir: Option<String> = None;
             let mut verify_temp_dir: Option<tempfile::TempDir> = None;
             if let Some(out) = args.out_chart_dir.as_deref() {
@@ -60,6 +61,12 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
                     &values,
                     args.library_chart_path.as_deref(),
                 )?;
+                let _ = crate::output::sync_imported_include_helpers_from_source_chart(
+                    &args.path,
+                    out,
+                    &values_yaml_for_chart,
+                )?;
+                let _ = crate::output::ensure_values_examples_for_imported_helpers(out)?;
                 let _ = crate::output::copy_chart_crds_if_any(&args.path, out)?;
                 verify_chart_dir = Some(out.to_string());
             }
@@ -77,6 +84,14 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
                         args.chart_name.as_deref(),
                         &values,
                         args.library_chart_path.as_deref(),
+                    )?;
+                    let _ = crate::output::sync_imported_include_helpers_from_source_chart(
+                        &args.path,
+                        &generated_chart_dir_text,
+                        &values_yaml_for_chart,
+                    )?;
+                    let _ = crate::output::ensure_values_examples_for_imported_helpers(
+                        &generated_chart_dir_text,
                     )?;
                     let _ = crate::output::copy_chart_crds_if_any(
                         &args.path,
@@ -226,6 +241,8 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
                     chart_name: None,
                     library_chart_path: None,
                     import_strategy: "raw".into(),
+                    allow_template_includes: Vec::new(),
+                    unsupported_template_mode: "error".into(),
                     verify_equivalence: false,
                     release_name: "imported".into(),
                     namespace: None,
@@ -304,6 +321,8 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
                 chart_name: None,
                 library_chart_path: None,
                 import_strategy: "helpers".into(),
+                allow_template_includes: Vec::new(),
+                unsupported_template_mode: "error".into(),
                 verify_equivalence: false,
                 release_name: args.release_name.clone(),
                 namespace: args.namespace.clone(),
@@ -1169,6 +1188,8 @@ mod tests {
             chart_name: None,
             library_chart_path: None,
             import_strategy: "helpers".to_string(),
+            allow_template_includes: Vec::new(),
+            unsupported_template_mode: "error".into(),
             verify_equivalence: true,
             release_name: "imported".to_string(),
             namespace: None,

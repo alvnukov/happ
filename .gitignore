@@ -5,3 +5,10 @@ dist/
 web/node_modules/
 web/test-results/
 web/test-artifacts/
+
+# Local upstream research (do not commit)
+_upstream/
+helm-upstream/
+third_party/helm/
+tests/templateanalyzer/chart-fixtures/
+tests/templateanalyzer/chart-golden/

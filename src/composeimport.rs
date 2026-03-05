@@ -234,6 +234,8 @@ mod tests {
             chart_name: None,
             library_chart_path: None,
             import_strategy: "raw".into(),
+            allow_template_includes: Vec::new(),
+            unsupported_template_mode: "error".into(),
             verify_equivalence: false,
             release_name: "imported".into(),
             namespace: None,
@@ -289,6 +291,8 @@ mod tests {
             chart_name: None,
             library_chart_path: None,
             import_strategy: "raw".into(),
+            allow_template_includes: Vec::new(),
+            unsupported_template_mode: "error".into(),
             verify_equivalence: false,
             release_name: "imported".into(),
             namespace: None,
@@ -349,5 +353,152 @@ mod tests {
         assert!(txt.contains("readinessProbe:"));
         assert!(txt.contains("failureThreshold: 4"));
         assert!(txt.contains("initialDelaySeconds: 20"));
+    }
+
+    #[test]
+    fn parse_target_port_handles_compose_port_forms() {
+        assert_eq!(parse_target_port("8080"), Some(8080));
+        assert_eq!(parse_target_port("127.0.0.1:8081:81"), Some(81));
+        assert_eq!(parse_target_port("9090:90/tcp"), Some(90));
+        assert_eq!(parse_target_port("  "), None);
+        assert_eq!(parse_target_port("invalid"), None);
+    }
+
+    #[test]
+    fn readiness_probe_shell_uses_sh_lc_and_omits_zero_thresholds() {
+        let svc = ServiceNode {
+            id: "service:api".into(),
+            name: "api".into(),
+            image: Some("nginx".into()),
+            command: Vec::new(),
+            command_shell: None,
+            entrypoint: Vec::new(),
+            entrypoint_shell: None,
+            working_dir: None,
+            env: BTreeMap::new(),
+            expose: Vec::new(),
+            healthcheck: Some(crate::composeinspect::Healthcheck {
+                test: Vec::new(),
+                test_shell: Some("curl -f http://127.0.0.1:8080/ready || exit 1".into()),
+                interval_seconds: 0,
+                timeout_seconds: 5,
+                retries: 0,
+                start_period_seconds: 0,
+            }),
+            labels: BTreeMap::new(),
+            profiles: Vec::new(),
+            depends_on: Vec::new(),
+            ports: Vec::new(),
+        };
+        let probe = readiness_probe(&svc).expect("probe");
+        let exec_cmd = probe
+            .get(Value::String("exec".to_string()))
+            .and_then(Value::as_mapping)
+            .and_then(|m| m.get(Value::String("command".to_string())))
+            .and_then(Value::as_sequence)
+            .expect("command");
+        assert_eq!(
+            exec_cmd,
+            &vec![
+                Value::String("/bin/sh".to_string()),
+                Value::String("-lc".to_string()),
+                Value::String("curl -f http://127.0.0.1:8080/ready || exit 1".to_string()),
+            ]
+        );
+        assert!(probe.contains_key(Value::String("timeoutSeconds".to_string())));
+        assert!(!probe.contains_key(Value::String("periodSeconds".to_string())));
+        assert!(!probe.contains_key(Value::String("failureThreshold".to_string())));
+        assert!(!probe.contains_key(Value::String("initialDelaySeconds".to_string())));
+    }
+
+    #[test]
+    fn build_values_uses_expose_when_ports_missing_and_defaults_image() {
+        let args = minimal_args();
+        let rep = Report {
+            source_path: "compose.yaml".into(),
+            project: None,
+            services: vec![ServiceNode {
+                id: "service:web".into(),
+                name: "web".into(),
+                image: None,
+                command: Vec::new(),
+                command_shell: None,
+                entrypoint: Vec::new(),
+                entrypoint_shell: None,
+                working_dir: None,
+                env: BTreeMap::new(),
+                expose: vec!["8080".into()],
+                healthcheck: None,
+                labels: BTreeMap::new(),
+                profiles: Vec::new(),
+                depends_on: vec![],
+                ports: vec![],
+            }],
+        };
+        let txt = serde_yaml::to_string(&build_values(&args, &rep)).expect("yaml");
+        assert!(txt.contains("name: busybox"));
+        assert!(txt.contains("containerPort: 8080"));
+        assert!(txt.contains("targetPort: 8080"));
+    }
+
+    #[test]
+    fn build_values_prefers_ports_over_expose_for_container_and_service() {
+        let args = minimal_args();
+        let rep = Report {
+            source_path: "compose.yaml".into(),
+            project: None,
+            services: vec![ServiceNode {
+                id: "service:web".into(),
+                name: "web".into(),
+                image: Some("nginx".into()),
+                command: Vec::new(),
+                command_shell: None,
+                entrypoint: Vec::new(),
+                entrypoint_shell: None,
+                working_dir: None,
+                env: BTreeMap::new(),
+                expose: vec!["8080".into()],
+                healthcheck: None,
+                labels: BTreeMap::new(),
+                profiles: Vec::new(),
+                depends_on: vec![],
+                ports: vec!["9000:90".into()],
+            }],
+        };
+        let txt = serde_yaml::to_string(&build_values(&args, &rep)).expect("yaml");
+        assert!(txt.contains("containerPort: 90"));
+        assert!(txt.contains("port: 90"));
+        assert!(!txt.contains("containerPort: 8080"));
+        assert!(!txt.contains("targetPort: 90"));
+    }
+
+    fn minimal_args() -> ImportArgs {
+        ImportArgs {
+            path: "x".into(),
+            env: "dev".into(),
+            group_name: "apps-k8s-manifests".into(),
+            group_type: "apps-k8s-manifests".into(),
+            min_include_bytes: 24,
+            include_status: false,
+            output: None,
+            out_chart_dir: None,
+            chart_name: None,
+            library_chart_path: None,
+            import_strategy: "raw".into(),
+            allow_template_includes: Vec::new(),
+            unsupported_template_mode: "error".into(),
+            verify_equivalence: false,
+            release_name: "imported".into(),
+            namespace: None,
+            values_files: vec![],
+            set_values: vec![],
+            set_string_values: vec![],
+            set_file_values: vec![],
+            set_json_values: vec![],
+            kube_version: None,
+            api_versions: vec![],
+            include_crds: false,
+            write_rendered_output: None,
+        }
     }
 }

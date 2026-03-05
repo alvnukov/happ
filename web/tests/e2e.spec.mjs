@@ -28,3 +28,22 @@ test("accessibility smoke has no critical issues", async ({ page }) => {
   const severe = results.violations.filter((v) => v.impact === "critical");
   expect(severe, `Critical axe violations: ${JSON.stringify(severe, null, 2)}`).toEqual([]);
 });
+
+test("jq playground query supports undo and redo shortcuts", async ({ page }) => {
+  await page.goto("/");
+  await stabilizePage(page);
+  await openUtility(page, "jq Playground");
+
+  const queryEditor = page.locator(".jq-query-input");
+  await queryEditor.click();
+  await page.keyboard.press("ControlOrMeta+A");
+  await page.keyboard.type(".");
+  await page.keyboard.type("a");
+  await expect(queryEditor).toHaveValue(".a");
+
+  await page.keyboard.press("ControlOrMeta+Z");
+  await expect(queryEditor).toHaveValue(".");
+
+  await page.keyboard.press("ControlOrMeta+Shift+Z");
+  await expect(queryEditor).toHaveValue(".a");
+});

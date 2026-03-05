@@ -2366,6 +2366,8 @@ mod tests {
             chart_name: None,
             library_chart_path: None,
             import_strategy: strategy.into(),
+            allow_template_includes: vec![],
+            unsupported_template_mode: "error".into(),
             verify_equivalence: false,
             release_name: "imported".into(),
             namespace: None,

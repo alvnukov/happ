@@ -460,6 +460,45 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
     }
+
+    #[test]
+    fn parses_chart_allow_template_include_flags() {
+        let cli = Cli::try_parse_from([
+            "happ",
+            "chart",
+            "--path",
+            "/tmp/chart",
+            "--allow-template-include",
+            "opensearch-cluster.*",
+            "--allow-template-include",
+            "my-helper",
+        ])
+        .expect("parse chart allow template includes");
+        match cli.command.expect("command") {
+            Command::Chart(args) => assert_eq!(
+                args.allow_template_includes,
+                vec!["opensearch-cluster.*", "my-helper"]
+            ),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_chart_unsupported_template_mode_flag() {
+        let cli = Cli::try_parse_from([
+            "happ",
+            "chart",
+            "--path",
+            "/tmp/chart",
+            "--unsupported-template-mode",
+            "escape",
+        ])
+        .expect("parse chart unsupported template mode");
+        match cli.command.expect("command") {
+            Command::Chart(args) => assert_eq!(args.unsupported_template_mode, "escape"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -486,6 +525,19 @@ pub struct ImportArgs {
     pub library_chart_path: Option<String>,
     #[arg(long, default_value = "raw")]
     pub import_strategy: String,
+    #[arg(
+        long = "allow-template-include",
+        value_name = "NAME|PREFIX*",
+        help = "Keep extra include helpers as templated values during import (repeatable; supports '*' suffix wildcard)"
+    )]
+    pub allow_template_includes: Vec<String>,
+    #[arg(
+        long = "unsupported-template-mode",
+        default_value = "error",
+        value_parser = ["error", "escape"],
+        help = "How to handle source includes not supported by library chart: error or escape as literal template"
+    )]
+    pub unsupported_template_mode: String,
     #[arg(
         long,
         action = ArgAction::SetTrue,
