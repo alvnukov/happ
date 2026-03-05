@@ -52,6 +52,8 @@ fn native_executor_matches_go_std_exec_success_subset() {
         "{{range $x, $y := .SI}}<{{$x}}={{$y}}>{{end}}",
         "{{range 3}}{{.}}{{end}}",
         "{{range $i, $v := 3}}{{$i}}={{$v}};{{end}}",
+        "{{range 4}}{{if eq . 2}}{{break}}{{end}}{{.}}{{end}}",
+        "{{range 4}}{{if eq . 2}}{{continue}}{{end}}{{.}}{{end}}",
         "{{range .MSI}}-{{.}}-{{else}}EMPTY{{end}}",
         "{{if eq 1 3}}{{else if eq 3 3}}3{{end}}",
         "{{not true}} {{not false}}",
@@ -93,6 +95,8 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{index .SI \"1\"}}",
         "{{len 3}}",
         "{{range 1.5}}{{.}}{{end}}",
+        "{{break}}",
+        "{{continue}}",
         "{{or 0 0 (index nil 0)}}",
         "{{and 1 1 (index nil 0)}}",
     ];

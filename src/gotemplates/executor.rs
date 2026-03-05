@@ -66,6 +66,8 @@ enum Terminator {
     Eof,
     End,
     Else(ElseClause),
+    Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,7 +139,7 @@ pub fn render_template_native_with_resolver(
     )?;
     match eval.term {
         Terminator::Eof => Ok(eval.out),
-        Terminator::End | Terminator::Else(_) => {
+        Terminator::End | Terminator::Else(_) | Terminator::Break | Terminator::Continue => {
             Err(NativeRenderError::Parse(GoTemplateScanError {
                 code: "unexpected_token",
                 message: "unexpected control terminator at top level",
@@ -265,6 +267,13 @@ fn eval_block(
                             state,
                         )?;
                         out.push_str(&eval.out);
+                        if matches!(eval.term, Terminator::Break | Terminator::Continue) {
+                            return Ok(BlockEval {
+                                out,
+                                next_idx: eval.next_idx,
+                                term: eval.term,
+                            });
+                        }
                         idx = eval.next_idx;
                     }
                     ActionKind::With(expr) => {
@@ -281,6 +290,13 @@ fn eval_block(
                             state,
                         )?;
                         out.push_str(&eval.out);
+                        if matches!(eval.term, Terminator::Break | Terminator::Continue) {
+                            return Ok(BlockEval {
+                                out,
+                                next_idx: eval.next_idx,
+                                term: eval.term,
+                            });
+                        }
                         idx = eval.next_idx;
                     }
                     ActionKind::Range(expr) => {
@@ -297,6 +313,13 @@ fn eval_block(
                             state,
                         )?;
                         out.push_str(&eval.out);
+                        if matches!(eval.term, Terminator::Break | Terminator::Continue) {
+                            return Ok(BlockEval {
+                                out,
+                                next_idx: eval.next_idx,
+                                term: eval.term,
+                            });
+                        }
                         idx = eval.next_idx;
                     }
                     ActionKind::Define { .. } => {
@@ -336,10 +359,14 @@ fn eval_block(
                         idx += 1;
                     }
                     ActionKind::Break | ActionKind::Continue => {
-                        return Err(NativeRenderError::UnsupportedAction {
-                            action: action.clone(),
-                            reason: "break/continue require full range runtime semantics"
-                                .to_string(),
+                        return Ok(BlockEval {
+                            out,
+                            next_idx: idx + 1,
+                            term: if matches!(kind, ActionKind::Break) {
+                                Terminator::Break
+                            } else {
+                                Terminator::Continue
+                            },
                         });
                     }
                     ActionKind::Else(_) | ActionKind::End => {
@@ -392,6 +419,7 @@ fn eval_if(
             let next_idx = match then_eval.term {
                 Terminator::End => then_eval.next_idx,
                 Terminator::Else(_) => find_matching_end(tokens, then_eval.next_idx)?,
+                Terminator::Break | Terminator::Continue => then_eval.next_idx,
                 Terminator::Eof => {
                     return Err(NativeRenderError::Parse(GoTemplateScanError {
                         code: "unexpected_eof",
@@ -403,7 +431,11 @@ fn eval_if(
             return Ok(BlockEval {
                 out: then_eval.out,
                 next_idx,
-                term: Terminator::Eof,
+                term: match then_eval.term {
+                    Terminator::Break => Terminator::Break,
+                    Terminator::Continue => Terminator::Continue,
+                    _ => Terminator::Eof,
+                },
             });
         }
 
@@ -427,18 +459,19 @@ fn eval_if(
                     call_depth,
                     state,
                 )?;
-                if !matches!(else_eval.term, Terminator::End) {
-                    return Err(NativeRenderError::Parse(GoTemplateScanError {
+                match else_eval.term {
+                    Terminator::End => Ok(BlockEval {
+                        out: else_eval.out,
+                        next_idx: else_eval.next_idx,
+                        term: Terminator::Eof,
+                    }),
+                    Terminator::Break | Terminator::Continue => Ok(else_eval),
+                    _ => Err(NativeRenderError::Parse(GoTemplateScanError {
                         code: "unexpected_eof",
                         message: "unexpected EOF",
                         offset: 0,
-                    }));
+                    })),
                 }
-                Ok(BlockEval {
-                    out: else_eval.out,
-                    next_idx: else_eval.next_idx,
-                    term: Terminator::Eof,
-                })
             }
             Terminator::Else(ElseClause::If(next_expr)) => eval_if(
                 tokens,
@@ -459,6 +492,13 @@ fn eval_if(
                     offset: 0,
                 }))
             }
+            Terminator::Break | Terminator::Continue => Err(NativeRenderError::Parse(
+                GoTemplateScanError {
+                    code: "unexpected_token",
+                    message: "unexpected break/continue outside range",
+                    offset: 0,
+                },
+            )),
             Terminator::Eof => Err(NativeRenderError::Parse(GoTemplateScanError {
                 code: "unexpected_eof",
                 message: "unexpected EOF",
@@ -503,6 +543,7 @@ fn eval_with(
             let next_idx = match then_eval.term {
                 Terminator::End => then_eval.next_idx,
                 Terminator::Else(_) => find_matching_end(tokens, then_eval.next_idx)?,
+                Terminator::Break | Terminator::Continue => then_eval.next_idx,
                 Terminator::Eof => {
                     return Err(NativeRenderError::Parse(GoTemplateScanError {
                         code: "unexpected_eof",
@@ -514,7 +555,11 @@ fn eval_with(
             return Ok(BlockEval {
                 out: then_eval.out,
                 next_idx,
-                term: Terminator::Eof,
+                term: match then_eval.term {
+                    Terminator::Break => Terminator::Break,
+                    Terminator::Continue => Terminator::Continue,
+                    _ => Terminator::Eof,
+                },
             });
         }
 
@@ -538,18 +583,19 @@ fn eval_with(
                     call_depth,
                     state,
                 )?;
-                if !matches!(else_eval.term, Terminator::End) {
-                    return Err(NativeRenderError::Parse(GoTemplateScanError {
+                match else_eval.term {
+                    Terminator::End => Ok(BlockEval {
+                        out: else_eval.out,
+                        next_idx: else_eval.next_idx,
+                        term: Terminator::Eof,
+                    }),
+                    Terminator::Break | Terminator::Continue => Ok(else_eval),
+                    _ => Err(NativeRenderError::Parse(GoTemplateScanError {
                         code: "unexpected_eof",
                         message: "unexpected EOF",
                         offset: 0,
-                    }));
+                    })),
                 }
-                Ok(BlockEval {
-                    out: else_eval.out,
-                    next_idx: else_eval.next_idx,
-                    term: Terminator::Eof,
-                })
             }
             Terminator::Else(ElseClause::With(next_expr)) => eval_with(
                 tokens,
@@ -570,6 +616,13 @@ fn eval_with(
                     offset: 0,
                 }))
             }
+            Terminator::Break | Terminator::Continue => Err(NativeRenderError::Parse(
+                GoTemplateScanError {
+                    code: "unexpected_token",
+                    message: "unexpected break/continue outside range",
+                    offset: 0,
+                },
+            )),
             Terminator::Eof => Err(NativeRenderError::Parse(GoTemplateScanError {
                 code: "unexpected_eof",
                 message: "unexpected EOF",
@@ -618,6 +671,7 @@ fn eval_range(
             }
         }
         let items = range_items(expr, source)?;
+        let range_end_idx = find_matching_end(tokens, start_idx)?;
         if items.is_empty() {
             let split = find_else_or_end(tokens, start_idx)?;
             return match split.term {
@@ -639,24 +693,38 @@ fn eval_range(
                         call_depth,
                         state,
                     )?;
-                    if !matches!(else_eval.term, Terminator::End) {
-                        return Err(NativeRenderError::Parse(GoTemplateScanError {
+                    match else_eval.term {
+                        Terminator::End => Ok(BlockEval {
+                            out: else_eval.out,
+                            next_idx: else_eval.next_idx,
+                            term: Terminator::Eof,
+                        }),
+                        Terminator::Break | Terminator::Continue => {
+                            Err(NativeRenderError::Parse(GoTemplateScanError {
+                                code: "unexpected_token",
+                                message: "break/continue outside range",
+                                offset: 0,
+                            }))
+                        }
+                        _ => Err(NativeRenderError::Parse(GoTemplateScanError {
                             code: "unexpected_eof",
                             message: "unexpected EOF",
                             offset: 0,
-                        }));
+                        })),
                     }
-                    Ok(BlockEval {
-                        out: else_eval.out,
-                        next_idx: else_eval.next_idx,
-                        term: Terminator::Eof,
-                    })
                 }
                 Terminator::Else(_) => Err(NativeRenderError::Parse(GoTemplateScanError {
                     code: "unexpected_token",
                     message: "unexpected else-chain in range",
                     offset: 0,
                 })),
+                Terminator::Break | Terminator::Continue => Err(NativeRenderError::Parse(
+                    GoTemplateScanError {
+                        code: "unexpected_token",
+                        message: "unexpected break/continue outside range",
+                        offset: 0,
+                    },
+                )),
                 Terminator::Eof => Err(NativeRenderError::Parse(GoTemplateScanError {
                     code: "unexpected_eof",
                     message: "unexpected EOF",
@@ -666,7 +734,6 @@ fn eval_range(
         }
 
         let mut out = String::new();
-        let mut resolved_next = None;
         for (key, item) in items {
             state.push_scope();
             if let Some(d) = &decl {
@@ -686,25 +753,24 @@ fn eval_range(
             )?;
             state.pop_scope();
             out.push_str(&eval.out);
-            if resolved_next.is_none() {
-                let next_idx = match eval.term {
-                    Terminator::End => eval.next_idx,
-                    Terminator::Else(_) => find_matching_end(tokens, eval.next_idx)?,
-                    Terminator::Eof => {
-                        return Err(NativeRenderError::Parse(GoTemplateScanError {
-                            code: "unexpected_eof",
-                            message: "unexpected EOF",
-                            offset: 0,
-                        }));
-                    }
-                };
-                resolved_next = Some(next_idx);
+            match eval.term {
+                Terminator::End | Terminator::Else(_) | Terminator::Continue => {}
+                Terminator::Break => {
+                    break;
+                }
+                Terminator::Eof => {
+                    return Err(NativeRenderError::Parse(GoTemplateScanError {
+                        code: "unexpected_eof",
+                        message: "unexpected EOF",
+                        offset: 0,
+                    }));
+                }
             }
         }
 
         Ok(BlockEval {
             out,
-            next_idx: resolved_next.unwrap_or(start_idx),
+            next_idx: range_end_idx,
             term: Terminator::Eof,
         })
     })();
@@ -865,7 +931,7 @@ fn eval_template_invocation(
     )?;
     match eval.term {
         Terminator::Eof => Ok(eval.out),
-        Terminator::End | Terminator::Else(_) => {
+        Terminator::End | Terminator::Else(_) | Terminator::Break | Terminator::Continue => {
             Err(NativeRenderError::Parse(GoTemplateScanError {
                 code: "unexpected_token",
                 message: "template body terminated unexpectedly",
@@ -914,7 +980,7 @@ fn eval_block_invocation(
     )?;
     match eval.term {
         Terminator::Eof => Ok(eval.out),
-        Terminator::End | Terminator::Else(_) => {
+        Terminator::End | Terminator::Else(_) | Terminator::Break | Terminator::Continue => {
             Err(NativeRenderError::Parse(GoTemplateScanError {
                 code: "unexpected_token",
                 message: "template body terminated unexpectedly",
@@ -3237,6 +3303,22 @@ mod tests {
         let out = render_template_native("{{range $i, $v := 3}}{{$i}}={{$v}};{{end}}", &data)
             .expect("must render");
         assert_eq!(out, "0=0;1=1;2=2;");
+    }
+
+    #[test]
+    fn native_renderer_supports_range_break_and_continue() {
+        let data = json!({});
+        let out = render_template_native("{{range 4}}{{if eq . 2}}{{break}}{{end}}{{.}}{{end}}", &data)
+            .expect("must render");
+        assert_eq!(out, "01");
+        let out = render_template_native(
+            "{{range 4}}{{if eq . 2}}{{continue}}{{end}}{{.}}{{end}}",
+            &data,
+        )
+        .expect("must render");
+        assert_eq!(out, "013");
+        assert!(render_template_native("{{break}}", &data).is_err());
+        assert!(render_template_native("{{continue}}", &data).is_err());
     }
 
     #[test]
