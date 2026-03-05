@@ -114,6 +114,7 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{len 1 2}}",
         "{{index}}",
         "{{index .SI \"1\"}}",
+        "{{index .MSI 1}}",
         "{{slice}}",
         "{{printf}}",
         "{{len 3}}",

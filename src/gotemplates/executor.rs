@@ -1767,7 +1767,7 @@ fn builtin_index(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
                 let key =
                     value_to_map_key(idx).ok_or_else(|| NativeRenderError::UnsupportedAction {
                         action: action.to_string(),
-                        reason: "error calling index: map key must be scalar".to_string(),
+                        reason: "error calling index: map key must be string".to_string(),
                     })?;
                 map.get(&key).cloned()
             }
@@ -2461,9 +2461,6 @@ fn value_to_f64(v: &Option<Value>) -> Option<f64> {
 fn value_to_map_key(v: &Option<Value>) -> Option<String> {
     match v.as_ref() {
         Some(Value::String(s)) => Some(s.clone()),
-        Some(Value::Bool(b)) => Some(b.to_string()),
-        Some(Value::Number(n)) => Some(n.to_string()),
-        Some(Value::Null) | None => None,
         _ => None,
     }
 }
@@ -3379,13 +3376,20 @@ mod tests {
 
     #[test]
     fn native_renderer_keeps_go_type_strictness_for_numeric_ops() {
-        let data = json!({"items":["x","y"]});
+        let data = json!({"items":["x","y"], "m":{"1":"v"}});
         let out = render_template_native("{{printf \"%d\" \"7\"}}", &data).expect("must render");
         assert_eq!(out, "%!d(string=7)");
         let err = render_template_native("{{index .items \"1\"}}", &data).expect_err("must fail");
         match err {
             NativeRenderError::UnsupportedAction { reason, .. } => {
                 assert!(reason.contains("array index must be integer"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let err = render_template_native("{{index .m 1}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("map key must be string"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
