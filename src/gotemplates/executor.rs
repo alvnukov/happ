@@ -35,6 +35,33 @@ pub enum NativeRenderError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeFunctionResolverError {
+    UnknownFunction,
+    Failed { reason: String },
+}
+
+pub trait NativeFunctionResolver {
+    fn call(
+        &self,
+        name: &str,
+        args: &[Option<Value>],
+    ) -> Result<Option<Value>, NativeFunctionResolverError>;
+}
+
+impl<F> NativeFunctionResolver for F
+where
+    F: Fn(&str, &[Option<Value>]) -> Result<Option<Value>, NativeFunctionResolverError>,
+{
+    fn call(
+        &self,
+        name: &str,
+        args: &[Option<Value>],
+    ) -> Result<Option<Value>, NativeFunctionResolverError> {
+        self(name, args)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Terminator {
     Eof,
     End,
@@ -73,6 +100,15 @@ pub fn render_template_native_with_options(
     root: &Value,
     options: NativeRenderOptions,
 ) -> Result<String, NativeRenderError> {
+    render_template_native_with_resolver(src, root, options, None)
+}
+
+pub fn render_template_native_with_resolver(
+    src: &str,
+    root: &Value,
+    options: NativeRenderOptions,
+    resolver: Option<&dyn NativeFunctionResolver>,
+) -> Result<String, NativeRenderError> {
     let mut tokens = parse_template_tokens_strict_with_options(
         src,
         ParseCompatOptions {
@@ -95,6 +131,7 @@ pub fn render_template_native_with_options(
         &dot,
         false,
         options,
+        resolver,
         0,
         &mut state,
     )?;
@@ -173,6 +210,7 @@ fn eval_block(
     dot: &Value,
     stop_on_else_end: bool,
     options: NativeRenderOptions,
+    resolver: Option<&dyn NativeFunctionResolver>,
     call_depth: usize,
     state: &mut EvalState,
 ) -> Result<BlockEval, NativeRenderError> {
@@ -209,7 +247,7 @@ fn eval_block(
                     ActionKind::Noop => idx += 1,
                     ActionKind::Output(expr) => {
                         out.push_str(&render_output_expr(
-                            action, &expr, root, dot, options, state,
+                            action, &expr, root, dot, options, state, resolver,
                         )?);
                         idx += 1;
                     }
@@ -222,6 +260,7 @@ fn eval_block(
                             root,
                             dot,
                             options,
+                            resolver,
                             call_depth,
                             state,
                         )?;
@@ -237,6 +276,7 @@ fn eval_block(
                             root,
                             dot,
                             options,
+                            resolver,
                             call_depth,
                             state,
                         )?;
@@ -252,6 +292,7 @@ fn eval_block(
                             root,
                             dot,
                             options,
+                            resolver,
                             call_depth,
                             state,
                         )?;
@@ -265,8 +306,17 @@ fn eval_block(
                         let end_idx = find_matching_end(tokens, idx + 1)?;
                         let fallback = &tokens[idx + 1..end_idx.saturating_sub(1)];
                         out.push_str(&eval_block_invocation(
-                            &name, &arg, fallback, templates, root, dot, options, call_depth,
-                            state, action,
+                            &name,
+                            &arg,
+                            fallback,
+                            templates,
+                            root,
+                            dot,
+                            options,
+                            resolver,
+                            call_depth,
+                            state,
+                            action,
                         )?);
                         idx = end_idx;
                     }
@@ -278,6 +328,7 @@ fn eval_block(
                             root,
                             dot,
                             options,
+                            resolver,
                             call_depth,
                             action,
                             state,
@@ -318,15 +369,25 @@ fn eval_if(
     root: &Value,
     dot: &Value,
     options: NativeRenderOptions,
+    resolver: Option<&dyn NativeFunctionResolver>,
     call_depth: usize,
     state: &mut EvalState,
 ) -> Result<BlockEval, NativeRenderError> {
     state.push_scope();
     let result = (|| -> Result<BlockEval, NativeRenderError> {
-        let cond = eval_expr_truthy(expr, root, dot, state)?;
+        let cond = eval_expr_truthy(expr, root, dot, state, resolver)?;
         if cond {
             let then_eval = eval_block(
-                tokens, start_idx, templates, root, dot, true, options, call_depth, state,
+                tokens,
+                start_idx,
+                templates,
+                root,
+                dot,
+                true,
+                options,
+                resolver,
+                call_depth,
+                state,
             )?;
             let next_idx = match then_eval.term {
                 Terminator::End => then_eval.next_idx,
@@ -362,6 +423,7 @@ fn eval_if(
                     dot,
                     true,
                     options,
+                    resolver,
                     call_depth,
                     state,
                 )?;
@@ -386,6 +448,7 @@ fn eval_if(
                 root,
                 dot,
                 options,
+                resolver,
                 call_depth,
                 state,
             ),
@@ -415,12 +478,13 @@ fn eval_with(
     root: &Value,
     dot: &Value,
     options: NativeRenderOptions,
+    resolver: Option<&dyn NativeFunctionResolver>,
     call_depth: usize,
     state: &mut EvalState,
 ) -> Result<BlockEval, NativeRenderError> {
     state.push_scope();
     let result = (|| -> Result<BlockEval, NativeRenderError> {
-        let value = eval_expr_value(expr, root, dot, state)?;
+        let value = eval_expr_value(expr, root, dot, state, resolver)?;
         let truthy = is_truthy(&value);
 
         if truthy {
@@ -432,6 +496,7 @@ fn eval_with(
                 value.as_ref().unwrap_or(dot),
                 true,
                 options,
+                resolver,
                 call_depth,
                 state,
             )?;
@@ -469,6 +534,7 @@ fn eval_with(
                     dot,
                     true,
                     options,
+                    resolver,
                     call_depth,
                     state,
                 )?;
@@ -493,6 +559,7 @@ fn eval_with(
                 root,
                 dot,
                 options,
+                resolver,
                 call_depth,
                 state,
             ),
@@ -522,6 +589,7 @@ fn eval_range(
     root: &Value,
     dot: &Value,
     options: NativeRenderOptions,
+    resolver: Option<&dyn NativeFunctionResolver>,
     call_depth: usize,
     state: &mut EvalState,
 ) -> Result<BlockEval, NativeRenderError> {
@@ -535,7 +603,7 @@ fn eval_range(
             });
         }
 
-        let source = eval_expr_value(&source_expr, root, dot, state)?;
+        let source = eval_expr_value(&source_expr, root, dot, state, resolver)?;
         if let Some(d) = &decl {
             let default_value = source.clone();
             for name in &d.names {
@@ -567,6 +635,7 @@ fn eval_range(
                         dot,
                         true,
                         options,
+                        resolver,
                         call_depth,
                         state,
                     )?;
@@ -604,7 +673,16 @@ fn eval_range(
                 apply_range_iteration_bindings(expr, d, key, &item, state)?;
             }
             let eval = eval_block(
-                tokens, start_idx, templates, root, &item, true, options, call_depth, state,
+                tokens,
+                start_idx,
+                templates,
+                root,
+                &item,
+                true,
+                options,
+                resolver,
+                call_depth,
+                state,
             )?;
             state.pop_scope();
             out.push_str(&eval.out);
@@ -751,6 +829,7 @@ fn eval_template_invocation(
     root: &Value,
     dot: &Value,
     options: NativeRenderOptions,
+    resolver: Option<&dyn NativeFunctionResolver>,
     call_depth: usize,
     _action: &str,
     state: &mut EvalState,
@@ -767,7 +846,7 @@ fn eval_template_invocation(
             name: name.to_string(),
         })?;
     let next_dot = if let Some(expr) = arg_expr {
-        eval_expr_value(expr, root, dot, state)?.unwrap_or(Value::Null)
+        eval_expr_value(expr, root, dot, state, resolver)?.unwrap_or(Value::Null)
     } else {
         dot.clone()
     };
@@ -780,6 +859,7 @@ fn eval_template_invocation(
         &next_dot,
         false,
         options,
+        resolver,
         call_depth + 1,
         &mut isolated_state,
     )?;
@@ -803,6 +883,7 @@ fn eval_block_invocation(
     root: &Value,
     dot: &Value,
     options: NativeRenderOptions,
+    resolver: Option<&dyn NativeFunctionResolver>,
     call_depth: usize,
     state: &mut EvalState,
     _action: &str,
@@ -813,7 +894,7 @@ fn eval_block_invocation(
             depth: call_depth,
         });
     }
-    let next_dot = eval_expr_value(arg_expr, root, dot, state)?.unwrap_or(Value::Null);
+    let next_dot = eval_expr_value(arg_expr, root, dot, state, resolver)?.unwrap_or(Value::Null);
     let render_body = templates
         .get(name)
         .map(Vec::as_slice)
@@ -827,6 +908,7 @@ fn eval_block_invocation(
         &next_dot,
         false,
         options,
+        resolver,
         call_depth + 1,
         &mut isolated_state,
     )?;
@@ -968,8 +1050,9 @@ fn eval_expr_truthy(
     root: &Value,
     dot: &Value,
     state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<bool, NativeRenderError> {
-    let val = eval_expr_value(expr, root, dot, state)?;
+    let val = eval_expr_value(expr, root, dot, state, resolver)?;
     Ok(is_truthy(&val))
 }
 
@@ -994,8 +1077,9 @@ fn eval_expr_value(
     root: &Value,
     dot: &Value,
     state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<Option<Value>, NativeRenderError> {
-    eval_expr_value_result("", expr, root, dot, state)
+    eval_expr_value_result("", expr, root, dot, state, resolver)
 }
 
 fn eval_expr_value_result(
@@ -1004,9 +1088,10 @@ fn eval_expr_value_result(
     root: &Value,
     dot: &Value,
     state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<Option<Value>, NativeRenderError> {
     if is_complex_expression(expr) {
-        return eval_pipeline_expr(action, expr, root, dot, state);
+        return eval_pipeline_expr(action, expr, root, dot, state, resolver);
     }
     ensure_variable_is_defined(expr, state)?;
     Ok(eval_simple_expr_value(expr, root, dot, state))
@@ -1046,9 +1131,10 @@ fn render_output_expr(
     dot: &Value,
     options: NativeRenderOptions,
     state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<String, NativeRenderError> {
     let has_decl = extract_pipeline_declaration(expr).0.is_some();
-    let value = eval_expr_value_result(action, expr, root, dot, state)?;
+    let value = eval_expr_value_result(action, expr, root, dot, state, resolver)?;
     if has_decl {
         return Ok(String::new());
     }
@@ -1070,6 +1156,7 @@ fn eval_pipeline_expr(
     root: &Value,
     dot: &Value,
     state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<Option<Value>, NativeRenderError> {
     let (decl, runtime_expr) = extract_pipeline_declaration(expr);
     if decl.as_ref().is_some_and(|d| d.names.len() > 1) {
@@ -1087,7 +1174,7 @@ fn eval_pipeline_expr(
     }
     let mut pipe: Option<Value> = None;
     for (idx, command) in commands.iter().enumerate() {
-        pipe = eval_pipeline_command(action, command, root, dot, idx > 0, pipe, state)?;
+        pipe = eval_pipeline_command(action, command, root, dot, idx > 0, pipe, state, resolver)?;
     }
     if let Some(d) = decl {
         let Some(name) = d.names.first() else {
@@ -1113,6 +1200,7 @@ fn eval_pipeline_command(
     has_pipe_input: bool,
     pipe_input: Option<Value>,
     state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<Option<Value>, NativeRenderError> {
     let tokens = split_command_tokens(command);
     if tokens.is_empty() {
@@ -1123,16 +1211,44 @@ fn eval_pipeline_command(
     }
 
     let head = tokens[0].as_str();
+    if head == "and" || head == "or" {
+        return eval_short_circuit_builtin(
+            action,
+            head,
+            &tokens[1..],
+            root,
+            dot,
+            has_pipe_input,
+            pipe_input,
+            state,
+            resolver,
+        );
+    }
+
     if is_builtin_function_name(head) {
         let mut args =
             Vec::with_capacity(tokens.len().saturating_sub(1) + usize::from(has_pipe_input));
         for token in tokens.iter().skip(1) {
-            args.push(eval_command_token_value(action, token, root, dot, state)?);
+            args.push(eval_command_token_value(action, token, root, dot, state, resolver)?);
         }
         if has_pipe_input {
             args.push(pipe_input);
         }
         return eval_builtin_function(action, head, &args);
+    }
+
+    if let Some(result) = try_eval_external_function(
+        action,
+        head,
+        &tokens[1..],
+        root,
+        dot,
+        has_pipe_input,
+        pipe_input.clone(),
+        state,
+        resolver,
+    )? {
+        return Ok(result);
     }
 
     if has_pipe_input {
@@ -1143,13 +1259,102 @@ fn eval_pipeline_command(
     }
 
     if tokens.len() == 1 {
-        return eval_command_token_value(action, &tokens[0], root, dot, state);
+        return eval_command_token_value(action, &tokens[0], root, dot, state, resolver);
     }
 
     Err(NativeRenderError::UnsupportedAction {
         action: action.to_string(),
-        reason: "command form requires function runtime".to_string(),
+        reason: format!("unknown function: {head}"),
     })
+}
+
+fn eval_short_circuit_builtin(
+    action: &str,
+    name: &str,
+    arg_tokens: &[String],
+    root: &Value,
+    dot: &Value,
+    has_pipe_input: bool,
+    pipe_input: Option<Value>,
+    state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
+) -> Result<Option<Value>, NativeRenderError> {
+    let mut last = None;
+
+    for token in arg_tokens {
+        let val = eval_command_token_value(action, token, root, dot, state, resolver)?;
+        let truth = is_truthy(&val);
+        last = val.clone();
+        match name {
+            "and" if !truth => return Ok(val),
+            "or" if truth => return Ok(val),
+            _ => {}
+        }
+    }
+
+    if has_pipe_input {
+        let val = pipe_input;
+        let truth = is_truthy(&val);
+        last = val.clone();
+        match name {
+            "and" if !truth => return Ok(val),
+            "or" if truth => return Ok(val),
+            _ => {}
+        }
+    }
+
+    Ok(last)
+}
+
+fn try_eval_external_function(
+    action: &str,
+    name: &str,
+    arg_tokens: &[String],
+    root: &Value,
+    dot: &Value,
+    has_pipe_input: bool,
+    pipe_input: Option<Value>,
+    state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
+) -> Result<Option<Option<Value>>, NativeRenderError> {
+    let Some(resolver) = resolver else {
+        return Ok(None);
+    };
+    if !is_identifier_name(name) {
+        return Ok(None);
+    }
+
+    let mut args = Vec::with_capacity(arg_tokens.len() + usize::from(has_pipe_input));
+    for token in arg_tokens {
+        args.push(eval_command_token_value(
+            action, token, root, dot, state, Some(resolver),
+        )?);
+    }
+    if has_pipe_input {
+        args.push(pipe_input);
+    }
+
+    match resolver.call(name, &args) {
+        Ok(v) => Ok(Some(v)),
+        Err(NativeFunctionResolverError::UnknownFunction) => Ok(None),
+        Err(NativeFunctionResolverError::Failed { reason }) => {
+            Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!("error calling {name}: {reason}"),
+            })
+        }
+    }
+}
+
+fn is_identifier_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn eval_command_token_value(
@@ -1158,9 +1363,10 @@ fn eval_command_token_value(
     root: &Value,
     dot: &Value,
     state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<Option<Value>, NativeRenderError> {
     if let Some(inner) = strip_outer_parens(token) {
-        return eval_pipeline_expr(action, inner, root, dot, state);
+        return eval_pipeline_expr(action, inner, root, dot, state, resolver);
     }
     ensure_variable_is_defined(token, state)?;
     Ok(eval_simple_expr_value(token, root, dot, state))
@@ -1272,6 +1478,8 @@ fn is_builtin_function_name(name: &str) -> bool {
             | "len"
             | "index"
             | "slice"
+            | "html"
+            | "js"
             | "print"
             | "printf"
             | "println"
@@ -1301,6 +1509,8 @@ fn eval_builtin_function(
         ))),
         "index" => builtin_index(action, args)?,
         "slice" => builtin_slice(action, args)?,
+        "html" => Some(Value::String(builtin_html(args))),
+        "js" => Some(Value::String(builtin_js(args))),
         "print" => Some(Value::String(builtin_print(args, false))),
         "println" => Some(Value::String(builtin_print(args, true))),
         "printf" => Some(Value::String(builtin_printf(action, args)?)),
@@ -1560,6 +1770,18 @@ fn builtin_print(args: &[Option<Value>], with_newline: bool) -> String {
 }
 
 fn builtin_urlquery(args: &[Option<Value>]) -> String {
+    query_escape(&join_text_template_args(args))
+}
+
+fn builtin_html(args: &[Option<Value>]) -> String {
+    html_escape(&join_text_template_args(args))
+}
+
+fn builtin_js(args: &[Option<Value>]) -> String {
+    js_escape(&join_text_template_args(args))
+}
+
+fn join_text_template_args(args: &[Option<Value>]) -> String {
     let mut joined = String::new();
     let mut prev_is_string = false;
     for (idx, arg) in args.iter().enumerate() {
@@ -1574,7 +1796,7 @@ fn builtin_urlquery(args: &[Option<Value>]) -> String {
         joined.push_str(&piece);
         prev_is_string = cur_is_string;
     }
-    query_escape(&joined)
+    joined
 }
 
 fn query_escape(input: &str) -> String {
@@ -1593,6 +1815,73 @@ fn query_escape(input: &str) -> String {
         }
     }
     out
+}
+
+fn html_escape(input: &str) -> String {
+    if !input
+        .chars()
+        .any(|ch| matches!(ch, '\'' | '"' | '&' | '<' | '>' | '\0'))
+    {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len() + input.len() / 4);
+    for ch in input.chars() {
+        match ch {
+            '\0' => out.push('\u{FFFD}'),
+            '"' => out.push_str("&#34;"),
+            '\'' => out.push_str("&#39;"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn js_escape(input: &str) -> String {
+    if !input.chars().any(js_is_special) {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len() + input.len() / 4);
+    for ch in input.chars() {
+        if !js_is_special(ch) {
+            out.push(ch);
+            continue;
+        }
+        if ch.is_ascii() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("\\'"),
+                '"' => out.push_str("\\\""),
+                '<' => out.push_str("\\u003C"),
+                '>' => out.push_str("\\u003E"),
+                '&' => out.push_str("\\u0026"),
+                '=' => out.push_str("\\u003D"),
+                _ => {
+                    let v = ch as u32;
+                    out.push_str("\\u00");
+                    out.push(hex_upper(((v >> 4) & 0x0F) as u8));
+                    out.push(hex_upper((v & 0x0F) as u8));
+                }
+            }
+            continue;
+        }
+
+        if ch.is_control() {
+            let v = ch as u32;
+            let code = format!("{v:04X}");
+            out.push_str("\\u");
+            out.push_str(&code);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn js_is_special(ch: char) -> bool {
+    matches!(ch, '\\' | '\'' | '"' | '<' | '>' | '&' | '=') || ch < ' ' || !ch.is_ascii()
 }
 
 fn hex_upper(n: u8) -> char {
@@ -1672,38 +1961,38 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
                 write!(&mut out, "{rendered:?}").ok();
             }
             'd' => {
-                let n = value_to_i64(arg).ok_or_else(|| NativeRenderError::UnsupportedAction {
-                    action: action.to_string(),
-                    reason: format!("printf expected integer for specifier at {spec_start}"),
-                })?;
-                let rendered = n.to_string();
-                push_with_width(&mut out, &rendered, width, zero_pad);
+                if let Some(n) = value_to_i64(arg) {
+                    let rendered = n.to_string();
+                    push_with_width(&mut out, &rendered, width, zero_pad);
+                } else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                }
             }
             'x' | 'X' => {
-                let n = value_to_i64(arg).ok_or_else(|| NativeRenderError::UnsupportedAction {
-                    action: action.to_string(),
-                    reason: format!("printf expected integer for specifier at {spec_start}"),
-                })?;
-                let rendered = if verb == 'x' {
-                    format!("{:x}", n)
+                if let Some(n) = value_to_i64(arg) {
+                    let rendered = if verb == 'x' {
+                        format!("{:x}", n)
+                    } else {
+                        format!("{:X}", n)
+                    };
+                    push_with_width(&mut out, &rendered, width, zero_pad);
                 } else {
-                    format!("{:X}", n)
-                };
-                push_with_width(&mut out, &rendered, width, zero_pad);
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                }
             }
             'f' => {
-                let n = value_to_f64(arg).ok_or_else(|| NativeRenderError::UnsupportedAction {
-                    action: action.to_string(),
-                    reason: format!("printf expected float for specifier at {spec_start}"),
-                })?;
-                write!(&mut out, "{n}").ok();
+                if let Some(n) = value_to_f64(arg) {
+                    write!(&mut out, "{n}").ok();
+                } else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                }
             }
             't' => {
-                let b = value_to_bool(arg).ok_or_else(|| NativeRenderError::UnsupportedAction {
-                    action: action.to_string(),
-                    reason: format!("printf expected bool for specifier at {spec_start}"),
-                })?;
-                write!(&mut out, "{b}").ok();
+                if let Some(b) = value_to_bool(arg) {
+                    write!(&mut out, "{b}").ok();
+                } else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                }
             }
             _ => {
                 return Err(NativeRenderError::UnsupportedAction {
@@ -1720,6 +2009,33 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
         });
     }
     Ok(out)
+}
+
+fn format_printf_mismatch(verb: char, arg: &Option<Value>) -> String {
+    match arg {
+        None | Some(Value::Null) => format!("%!{verb}(<nil>)"),
+        Some(v) => {
+            let type_name = printf_type_name(v);
+            let value = format_value_like_go(v);
+            format!("%!{verb}({type_name}={value})")
+        }
+    }
+}
+
+fn printf_type_name(v: &Value) -> String {
+    match v {
+        Value::Null => "<nil>".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::String(_) => "string".to_string(),
+        Value::Array(_) => "[]interface {}".to_string(),
+        Value::Object(_) => "map[string]interface {}".to_string(),
+        Value::Number(_) => match number_kind(&Some(v.clone())) {
+            Some(NumberKind::Int(_)) => "int".to_string(),
+            Some(NumberKind::Uint(_)) => "uint".to_string(),
+            Some(NumberKind::Float(_)) => "float64".to_string(),
+            None => "number".to_string(),
+        },
+    }
 }
 
 fn parse_width_and_zero(flags: &str) -> (Option<usize>, bool) {
@@ -1818,11 +2134,14 @@ fn compare_eq(
         (Some(Value::Null), Some(Value::Null)) => Ok(true),
         (Some(Value::Bool(av)), Some(Value::Bool(bv))) => Ok(av == bv),
         (Some(Value::String(av)), Some(Value::String(bv))) => Ok(av == bv),
-        (Some(Value::Number(_)), Some(Value::Number(_))) => {
-            Ok(compare_ordering(action, a, b)? == std::cmp::Ordering::Equal)
+        (Some(Value::Number(_)), Some(Value::Number(_))) => compare_number_eq(action, a, b),
+        (Some(Value::Array(_)), Some(Value::Array(_)))
+        | (Some(Value::Object(_)), Some(Value::Object(_))) => {
+            Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: "error calling eq: non-comparable types for comparison".to_string(),
+            })
         }
-        (Some(Value::Array(av)), Some(Value::Array(bv))) => Ok(av == bv),
-        (Some(Value::Object(av)), Some(Value::Object(bv))) => Ok(av == bv),
         (None, _) | (_, None) | (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(false),
         _ => Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
@@ -1836,13 +2155,8 @@ fn compare_ordering(
     a: &Option<Value>,
     b: &Option<Value>,
 ) -> Result<std::cmp::Ordering, NativeRenderError> {
-    if let (Some(na), Some(nb)) = (value_to_f64(a), value_to_f64(b)) {
-        return na
-            .partial_cmp(&nb)
-            .ok_or_else(|| NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: "comparison failed".to_string(),
-            });
+    if let (Some(na), Some(nb)) = (number_kind(a), number_kind(b)) {
+        return compare_number_ordering(action, na, nb);
     }
     if let (Some(sa), Some(sb)) = (
         a.as_ref().and_then(Value::as_str),
@@ -1856,6 +2170,96 @@ fn compare_ordering(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NumberKind {
+    Int(i64),
+    Uint(u64),
+    Float(f64),
+}
+
+fn number_kind(v: &Option<Value>) -> Option<NumberKind> {
+    let Some(Value::Number(n)) = v.as_ref() else {
+        return None;
+    };
+    if let Some(i) = n.as_i64() {
+        return Some(NumberKind::Int(i));
+    }
+    if let Some(u) = n.as_u64() {
+        return Some(NumberKind::Uint(u));
+    }
+    n.as_f64().map(NumberKind::Float)
+}
+
+fn compare_number_eq(
+    action: &str,
+    a: &Option<Value>,
+    b: &Option<Value>,
+) -> Result<bool, NativeRenderError> {
+    let Some(na) = number_kind(a) else {
+        return Err(NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: "error calling eq: incompatible types for comparison".to_string(),
+        });
+    };
+    let Some(nb) = number_kind(b) else {
+        return Err(NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: "error calling eq: incompatible types for comparison".to_string(),
+        });
+    };
+    match (na, nb) {
+        (NumberKind::Int(x), NumberKind::Int(y)) => Ok(x == y),
+        (NumberKind::Uint(x), NumberKind::Uint(y)) => Ok(x == y),
+        (NumberKind::Float(x), NumberKind::Float(y)) => Ok(x == y),
+        (NumberKind::Int(x), NumberKind::Uint(y)) => Ok(x >= 0 && (x as u64) == y),
+        (NumberKind::Uint(x), NumberKind::Int(y)) => Ok(y >= 0 && x == (y as u64)),
+        _ => Err(NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: "error calling eq: incompatible types for comparison".to_string(),
+        }),
+    }
+}
+
+fn compare_number_ordering(
+    action: &str,
+    a: NumberKind,
+    b: NumberKind,
+) -> Result<std::cmp::Ordering, NativeRenderError> {
+    use std::cmp::Ordering;
+    let ord = match (a, b) {
+        (NumberKind::Int(x), NumberKind::Int(y)) => x.cmp(&y),
+        (NumberKind::Uint(x), NumberKind::Uint(y)) => x.cmp(&y),
+        (NumberKind::Float(x), NumberKind::Float(y)) => {
+            x.partial_cmp(&y)
+                .ok_or_else(|| NativeRenderError::UnsupportedAction {
+                    action: action.to_string(),
+                    reason: "comparison failed".to_string(),
+                })?
+        }
+        (NumberKind::Int(x), NumberKind::Uint(y)) => {
+            if x < 0 {
+                Ordering::Less
+            } else {
+                (x as u64).cmp(&y)
+            }
+        }
+        (NumberKind::Uint(x), NumberKind::Int(y)) => {
+            if y < 0 {
+                Ordering::Greater
+            } else {
+                x.cmp(&(y as u64))
+            }
+        }
+        _ => {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: "error calling comparison: incompatible types for comparison".to_string(),
+            });
+        }
+    };
+    Ok(ord)
+}
+
 fn value_to_bool(v: &Option<Value>) -> Option<bool> {
     v.as_ref().and_then(Value::as_bool)
 }
@@ -1865,7 +2269,6 @@ fn value_to_i64(v: &Option<Value>) -> Option<i64> {
         Some(Value::Number(n)) => n
             .as_i64()
             .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok())),
-        Some(Value::String(s)) => s.parse::<i64>().ok(),
         _ => None,
     }
 }
@@ -1873,7 +2276,6 @@ fn value_to_i64(v: &Option<Value>) -> Option<i64> {
 fn value_to_f64(v: &Option<Value>) -> Option<f64> {
     match v.as_ref() {
         Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::String(s)) => s.parse::<f64>().ok(),
         _ => None,
     }
 }
@@ -2170,6 +2572,31 @@ fn range_items(
                 )
             })
             .collect()),
+        Value::Number(n) => {
+            let count = if let Some(i) = n.as_i64() {
+                if i <= 0 {
+                    return Ok(Vec::new());
+                }
+                u64::try_from(i).ok()
+            } else {
+                n.as_u64()
+            }
+            .ok_or_else(|| NativeRenderError::UnsupportedAction {
+                action: format!("{{{{range {expr}}}}}"),
+                reason: "range over non-integer number is not supported".to_string(),
+            })?;
+
+            let max = usize::try_from(count).map_err(|_| NativeRenderError::UnsupportedAction {
+                action: format!("{{{{range {expr}}}}}"),
+                reason: "range iteration count is too large".to_string(),
+            })?;
+            Ok((0..max)
+                .map(|idx| {
+                    let v = Value::Number(Number::from(idx as u64));
+                    (Some(v.clone()), v)
+                })
+                .collect())
+        }
         _ => Err(NativeRenderError::UnsupportedAction {
             action: format!("{{{{range {expr}}}}}"),
             reason: "range over scalar value is not supported by native executor".to_string(),
@@ -2322,6 +2749,50 @@ fn split_first_segment(path: &str) -> Option<(&str, &str)> {
 
 fn parse_number_value(expr: &str) -> Option<Value> {
     let compact = expr.replace('_', "");
+    if compact.is_empty() {
+        return None;
+    }
+    let (negative, body) = if let Some(rest) = compact.strip_prefix('+') {
+        (false, rest)
+    } else if let Some(rest) = compact.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, compact.as_str())
+    };
+
+    if let Some(intv) = parse_go_integer_literal(body) {
+        if negative {
+            let signed = if let Ok(v) = i128::try_from(intv) {
+                -v
+            } else {
+                let fv = -(intv as f64);
+                return Number::from_f64(fv).map(Value::Number);
+            };
+            if let Ok(v) = i64::try_from(signed) {
+                return Some(Value::Number(Number::from(v)));
+            }
+            if let Some(v) = Number::from_f64(signed as f64) {
+                return Some(Value::Number(v));
+            }
+            return None;
+        }
+        if let Ok(v) = i64::try_from(intv) {
+            return Some(Value::Number(Number::from(v)));
+        }
+        if let Ok(v) = u64::try_from(intv) {
+            return Some(Value::Number(Number::from(v)));
+        }
+        if let Some(v) = Number::from_f64(intv as f64) {
+            return Some(Value::Number(v));
+        }
+        return None;
+    }
+
+    if let Some(fv) = parse_go_hex_float_literal(body) {
+        let signed = if negative { -fv } else { fv };
+        return Number::from_f64(signed).map(Value::Number);
+    }
+
     if let Ok(v) = compact.parse::<i64>() {
         return Some(Value::Number(Number::from(v)));
     }
@@ -2334,23 +2805,85 @@ fn parse_number_value(expr: &str) -> Option<Value> {
     None
 }
 
+fn parse_go_integer_literal(body: &str) -> Option<u128> {
+    if body.is_empty() {
+        return None;
+    }
+    if let Some(rest) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        if rest.is_empty() || !rest.bytes().all(|b| matches!(b, b'0' | b'1')) {
+            return None;
+        }
+        return u128::from_str_radix(rest, 2).ok();
+    }
+    if let Some(rest) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        if rest.is_empty() || !rest.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+            return None;
+        }
+        return u128::from_str_radix(rest, 8).ok();
+    }
+    if let Some(rest) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        if rest.is_empty() || !rest.bytes().all(|b| (b as char).is_ascii_hexdigit()) {
+            return None;
+        }
+        return u128::from_str_radix(rest, 16).ok();
+    }
+
+    if body.len() > 1 && body.starts_with('0') && body.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return u128::from_str_radix(body, 8).ok();
+    }
+
+    if body.bytes().all(|b| b.is_ascii_digit()) {
+        return body.parse::<u128>().ok();
+    }
+    None
+}
+
+fn parse_go_hex_float_literal(body: &str) -> Option<f64> {
+    let lower = body.to_ascii_lowercase();
+    let rest = lower.strip_prefix("0x")?;
+    let p_idx = rest.find('p')?;
+    let mantissa = &rest[..p_idx];
+    let exp_str = &rest[p_idx + 1..];
+    if mantissa.is_empty() || exp_str.is_empty() {
+        return None;
+    }
+    let exp = exp_str.parse::<i32>().ok()?;
+
+    let (int_part, frac_part) = if let Some(dot_idx) = mantissa.find('.') {
+        (&mantissa[..dot_idx], &mantissa[dot_idx + 1..])
+    } else {
+        (mantissa, "")
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+
+    let mut value = 0f64;
+    if !int_part.is_empty() {
+        for ch in int_part.chars() {
+            let d = ch.to_digit(16)? as f64;
+            value = value * 16.0 + d;
+        }
+    }
+    if !frac_part.is_empty() {
+        let mut scale = 16.0;
+        for ch in frac_part.chars() {
+            let d = ch.to_digit(16)? as f64;
+            value += d / scale;
+            scale *= 16.0;
+        }
+    }
+    Some(value * 2f64.powi(exp))
+}
+
 fn parse_char_constant(expr: &str) -> Option<i64> {
     if !(expr.starts_with('\'') && expr.ends_with('\'')) || expr.len() < 3 {
         return None;
     }
     let inner = &expr[1..expr.len() - 1];
     if let Some(rest) = inner.strip_prefix('\\') {
-        let ch = match rest {
-            "n" => '\n',
-            "t" => '\t',
-            "r" => '\r',
-            "\\" => '\\',
-            "'" => '\'',
-            "\"" => '"',
-            "0" => '\0',
-            _ => return None,
-        };
-        return Some(i64::from(ch as u32));
+        let codepoint = parse_go_char_escape(rest)?;
+        return Some(i64::from(codepoint));
     }
     let mut chars = inner.chars();
     let first = chars.next()?;
@@ -2358,6 +2891,52 @@ fn parse_char_constant(expr: &str) -> Option<i64> {
         return None;
     }
     Some(i64::from(first as u32))
+}
+
+fn parse_go_char_escape(rest: &str) -> Option<u32> {
+    if rest.is_empty() {
+        return None;
+    }
+    match rest {
+        "a" => return Some('\u{0007}' as u32),
+        "b" => return Some('\u{0008}' as u32),
+        "f" => return Some('\u{000C}' as u32),
+        "n" => return Some('\n' as u32),
+        "r" => return Some('\r' as u32),
+        "t" => return Some('\t' as u32),
+        "v" => return Some('\u{000B}' as u32),
+        "\\" => return Some('\\' as u32),
+        "'" => return Some('\'' as u32),
+        "\"" => return Some('"' as u32),
+        _ => {}
+    }
+
+    if let Some(hex) = rest.strip_prefix('x') {
+        if hex.len() != 2 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    if let Some(hex) = rest.strip_prefix('u') {
+        if hex.len() != 4 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        return char::from_u32(v).map(|ch| ch as u32);
+    }
+    if let Some(hex) = rest.strip_prefix('U') {
+        if hex.len() != 8 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        return char::from_u32(v).map(|ch| ch as u32);
+    }
+
+    if rest.chars().all(|c| matches!(c, '0'..='7')) && rest.len() <= 3 {
+        return u32::from_str_radix(rest, 8).ok();
+    }
+
+    None
 }
 
 fn format_value_like_go(v: &Value) -> String {
@@ -2614,6 +3193,24 @@ mod tests {
         assert_eq!(out, "a+b%2B");
         let out = render_template_native("{{urlquery .missing}}", &data).expect("must render");
         assert_eq!(out, "%3Cno+value%3E");
+        let out = render_template_native("{{html \"<x&'\\\"\\u0000>\"}}", &data).expect("must render");
+        assert_eq!(out, "&lt;x&amp;&#39;&#34;\u{FFFD}&gt;");
+        let out = render_template_native("{{js \"<x&'\\\"=\\n>\"}}", &data).expect("must render");
+        assert_eq!(out, "\\u003Cx\\u0026\\'\\\"\\u003D\\u000A\\u003E");
+    }
+
+    #[test]
+    fn native_renderer_keeps_go_type_strictness_for_numeric_ops() {
+        let data = json!({"items":["x","y"]});
+        let out = render_template_native("{{printf \"%d\" \"7\"}}", &data).expect("must render");
+        assert_eq!(out, "%!d(string=7)");
+        let err = render_template_native("{{index .items \"1\"}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("array index must be integer"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -2630,6 +3227,16 @@ mod tests {
         let out = render_template_native("{{range $i, $v := .items}}{{$i}}={{$v}};{{end}}", &data)
             .expect("must render");
         assert_eq!(out, "0=a;1=b;");
+    }
+
+    #[test]
+    fn native_renderer_supports_range_over_integer() {
+        let data = json!({});
+        let out = render_template_native("{{range 3}}{{.}}{{end}}", &data).expect("must render");
+        assert_eq!(out, "012");
+        let out = render_template_native("{{range $i, $v := 3}}{{$i}}={{$v}};{{end}}", &data)
+            .expect("must render");
+        assert_eq!(out, "0=0;1=1;2=2;");
     }
 
     #[test]
@@ -2657,6 +3264,100 @@ mod tests {
         let out = render_template_native("{{block \"b\" .user}}{{.name}}{{end}}", &data)
             .expect("must render");
         assert_eq!(out, "alice");
+    }
+
+    #[test]
+    fn native_renderer_and_or_short_circuit_matches_go() {
+        let data = json!({});
+        let out = render_template_native("{{or 0 1 (index nil 0)}}", &data).expect("must render");
+        assert_eq!(out, "1");
+
+        let out = render_template_native("{{and 1 0 (index nil 0)}}", &data).expect("must render");
+        assert_eq!(out, "0");
+
+        assert!(render_template_native("{{or 0 0 (index nil 0)}}", &data).is_err());
+        assert!(render_template_native("{{and 1 1 (index nil 0)}}", &data).is_err());
+    }
+
+    #[test]
+    fn native_renderer_supports_external_function_resolver_with_args() {
+        let data = json!({});
+        let out = render_template_native_with_resolver(
+            "{{ext \"a\" 2}}",
+            &data,
+            NativeRenderOptions::default(),
+            Some(&|name: &str, args: &[Option<Value>]| {
+                if name != "ext" {
+                    return Err(NativeFunctionResolverError::UnknownFunction);
+                }
+                assert_eq!(args.len(), 2);
+                Ok(Some(Value::String(format!(
+                    "{}:{}",
+                    format_value_for_print(&args[0]),
+                    format_value_for_print(&args[1])
+                ))))
+            }),
+        )
+        .expect("must render");
+        assert_eq!(out, "a:2");
+    }
+
+    #[test]
+    fn native_renderer_supports_external_niladic_function() {
+        let data = json!({"ext":"value-from-data"});
+        let out = render_template_native_with_resolver(
+            "{{ext}}",
+            &data,
+            NativeRenderOptions::default(),
+            Some(&|name: &str, _args: &[Option<Value>]| {
+                if name == "ext" {
+                    Ok(Some(Value::String("value-from-resolver".to_string())))
+                } else {
+                    Err(NativeFunctionResolverError::UnknownFunction)
+                }
+            }),
+        )
+        .expect("must render");
+        assert_eq!(out, "value-from-resolver");
+    }
+
+    #[test]
+    fn native_renderer_reports_external_function_error() {
+        let data = json!({});
+        let err = render_template_native_with_resolver(
+            "{{ext 1}}",
+            &data,
+            NativeRenderOptions::default(),
+            Some(&|name: &str, _args: &[Option<Value>]| {
+                if name == "ext" {
+                    Err(NativeFunctionResolverError::Failed {
+                        reason: "boom".to_string(),
+                    })
+                } else {
+                    Err(NativeFunctionResolverError::UnknownFunction)
+                }
+            }),
+        )
+        .expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling ext: boom"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_renderer_parses_go_char_literal_escapes() {
+        let data = json!({});
+        let out = render_template_native("{{print '\\n'}}", &data).expect("must render");
+        assert_eq!(out, "10");
+        let out = render_template_native("{{print '\\x41'}}", &data).expect("must render");
+        assert_eq!(out, "65");
+        let out = render_template_native("{{print '\\u263A'}}", &data).expect("must render");
+        assert_eq!(out, "9786");
+        let out = render_template_native("{{print '\\U0001F600'}}", &data).expect("must render");
+        assert_eq!(out, "128512");
     }
 
     #[test]

@@ -6,95 +6,63 @@ use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
-fn native_executor_matches_go_std_exec_success_subset() {
+fn native_executor_matches_go_std_cmp_success_subset() {
     if !has_go_toolchain() {
         eprintln!("skip: go toolchain is unavailable");
         return;
     }
 
     let runner = GoExecRunner::new().expect("prepare go executor runner");
-    let data = source_like_data();
+    let data = json!({
+        "arr": [1, 2],
+        "s": "xy"
+    });
 
-    // Cases are copied from Go stdlib text/template/exec_test.go (execTests subset).
+    // Sourced from Go text/template/exec_test.go cmpTests subset.
     let cases = vec![
-        "{{print \"hello, print\"}}",
-        "{{print 1 2 3}}",
-        "{{print 12_34}}",
-        "{{print 0b101}}",
-        "{{print 0B101}}",
-        "{{print 0377}}",
-        "{{print 0o377}}",
-        "{{print 0O377}}",
-        "{{print 0x123}}",
-        "{{print 0X123ABC}}",
-        "{{print +0x1.ep+2}}",
-        "{{print +0X1.EP+2}}",
-        "{{print '\\n'}}",
-        "{{print '\\x41'}}",
-        "{{print '\\u263A'}}",
-        "{{print '\\U0001F600'}}",
-        "{{println 1 2 3}}",
-        "{{printf \"%04x\" 127}}",
-        "{{printf \"%d\" \"7\"}}",
-        "{{html \"<tag attr='x'>&\\\"\"}}",
-        "{{js \"<tag>&'\\\"=\\n\"}}",
-        "{{urlquery \"http://www.example.org/\"}}",
-        "{{index .SI 0}}",
-        "{{index .MSI `one`}}",
-        "{{index .MSI `XXX`}}",
-        "{{slice .SI}}",
-        "{{slice .SI 1}}",
-        "{{slice .SI 1 2}}",
-        "{{slice .S 1 2}}",
-        "{{len .SI}}",
-        "{{len .MSI}}",
-        "{{$x := 2}}{{$x = 3}}{{$x}}",
-        "{{range $x, $y := .SI}}<{{$x}}={{$y}}>{{end}}",
-        "{{range 3}}{{.}}{{end}}",
-        "{{range $i, $v := 3}}{{$i}}={{$v}};{{end}}",
-        "{{range .MSI}}-{{.}}-{{else}}EMPTY{{end}}",
-        "{{if eq 1 3}}{{else if eq 3 3}}3{{end}}",
-        "{{not true}} {{not false}}",
-        "{{and false 0}} {{and 1 0}} {{and 0 true}} {{and 1 1}}",
-        "{{or 0 0}} {{or 1 0}} {{or 0 true}} {{or 1 1}}",
-        "{{and 1 .Unknown}}",
-        "{{or 0 .Unknown}}",
-        "{{if true | not | and 1}}TRUE{{else}}FALSE{{end}}",
-        "{{$i := 0}}{{$x := 0}}{{range $i = .AI}}{{end}}{{$i}}",
-        "{{$k := 0}}{{$v := 0}}{{range $k, $v = .AI}}{{$k}}={{$v}} {{end}}",
-        "{{or 0 1 (index nil 0)}}",
-        "{{and 1 0 (index nil 0)}}",
+        "{{eq true true}}",
+        "{{eq true false}}",
+        "{{eq 1 1}}",
+        "{{eq 1 2}}",
+        "{{eq `xy` `xy`}}",
+        "{{eq `xy` `xyz`}}",
+        "{{ne 1 2}}",
+        "{{lt 1 2}}",
+        "{{le 1 1}}",
+        "{{gt 2 1}}",
+        "{{ge 1 1}}",
+        "{{eq nil nil}}",
+        "{{eq (index `x` 0) 'x'}}",
     ];
 
     for src in cases {
         let rust_out = render_template_native(src, &data).expect("rust render should succeed");
         let go_out = runner
             .render(src, &data)
-            .expect("go render should succeed for sourced subset");
+            .expect("go render should succeed for sourced cmp subset");
         assert_eq!(rust_out, go_out, "rust/go output mismatch for: {src}");
     }
 }
 
 #[test]
-fn native_executor_matches_go_std_exec_failure_subset() {
+fn native_executor_matches_go_std_cmp_failure_subset() {
     if !has_go_toolchain() {
         eprintln!("skip: go toolchain is unavailable");
         return;
     }
 
     let runner = GoExecRunner::new().expect("prepare go executor runner");
-    let data = source_like_data();
+    let data = json!({
+        "arr": [1, 2],
+        "s": "xy"
+    });
 
-    // Cases are copied from Go stdlib text/template/exec_test.go (execTests subset, failing).
+    // Sourced from Go text/template/exec_test.go cmpTests subset.
     let failing_cases = vec![
-        "{{index .SI 10}}",
-        "{{slice .SI -1}}",
-        "{{slice .S 1 2 2}}",
-        "{{index .SI \"1\"}}",
-        "{{len 3}}",
-        "{{range 1.5}}{{.}}{{end}}",
-        "{{or 0 0 (index nil 0)}}",
-        "{{and 1 1 (index nil 0)}}",
+        "{{eq 2 2.0}}",
+        "{{lt true true}}",
+        "{{eq `xy` 1}}",
+        "{{eq .arr .arr}}",
     ];
 
     for src in failing_cases {
@@ -102,30 +70,13 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         let go = runner.render(src, &data);
         assert!(
             rust.is_err(),
-            "rust should fail for sourced negative case: {src}"
+            "rust should fail for sourced cmp negative case: {src}"
         );
         assert!(
             go.is_err(),
-            "go should fail for sourced negative case: {src}"
+            "go should fail for sourced cmp negative case: {src}"
         );
     }
-}
-
-fn source_like_data() -> serde_json::Value {
-    json!({
-        "I": 17,
-        "U16": 16,
-        "X": "x",
-        "S": "xyz",
-        "U": { "V": "v" },
-        "SI": [3, 4, 5],
-        "AI": [3, 4, 5],
-        "MSI": { "one": 1, "two": 2, "three": 3 },
-        "MSIone": { "one": 1 },
-        "MSIEmpty": {},
-        "Empty0": null,
-        "Empty3": [7, 8]
-    })
 }
 
 fn has_go_toolchain() -> bool {

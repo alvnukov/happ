@@ -6,6 +6,7 @@ mod scanner;
 
 pub use executor::{
     render_template_native, render_template_native_with_options, MissingValueMode,
+    render_template_native_with_resolver, NativeFunctionResolver, NativeFunctionResolverError,
     NativeRenderError, NativeRenderOptions,
 };
 pub use functions::{
