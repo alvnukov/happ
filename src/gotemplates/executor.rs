@@ -1156,7 +1156,7 @@ fn eval_expr_value_result(
     state: &mut EvalState,
     resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<Option<Value>, NativeRenderError> {
-    if is_complex_expression(expr) {
+    if is_complex_expression(expr) || is_niladic_function_expression(expr) {
         return eval_pipeline_expr(action, expr, root, dot, state, resolver);
     }
     ensure_variable_is_defined(expr, state)?;
@@ -2907,6 +2907,17 @@ fn is_complex_expression(expr: &str) -> bool {
     false
 }
 
+fn is_niladic_function_expression(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if matches!(trimmed, "true" | "false" | "nil") {
+        return false;
+    }
+    is_identifier_name(trimmed)
+}
+
 fn apply_lexical_trims(tokens: &mut [GoTemplateToken]) {
     for i in 0..tokens.len() {
         let action = match &tokens[i] {
@@ -3075,7 +3086,7 @@ mod tests {
         let out = render_template_native("{{printf \"%g\" 3.5}}", &data).expect("must render");
         assert_eq!(out, "3.5");
         let out = render_template_native("{{printf \"%G\" 1234567.0}}", &data).expect("must render");
-        assert_eq!(out, "1.23457E+06");
+        assert_eq!(out, "1.234567E+06");
         let out = render_template_native("{{printf \"%T\" 0xef}}", &data).expect("must render");
         assert_eq!(out, "int");
         let out = render_template_native("{{printf \"%04x\" -1}}", &data).expect("must render");
