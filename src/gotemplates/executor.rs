@@ -5,7 +5,6 @@ use super::{
 };
 use serde_json::{Number, Value};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingValueMode {
@@ -2152,167 +2151,10 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
             reason: "printf format must be a string".to_string(),
         });
     };
-    let mut out = String::with_capacity(fmt.len() + 8);
-    let mut i = 0usize;
-    let mut argi = 1usize;
-    let bytes = fmt.as_bytes();
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-        if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
-            out.push('%');
-            i += 2;
-            continue;
-        }
-
-        let spec_start = i;
-        i += 1;
-        while i < bytes.len()
-            && matches!(
-                bytes[i] as char,
-                '+' | '-' | '#' | ' ' | '0' | '.' | '1'..='9'
-            )
-        {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            return Err(NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: "printf has incomplete format specifier".to_string(),
-            });
-        }
-        let spec_flags = &fmt[spec_start + 1..i];
-        let verb = bytes[i] as char;
-        i += 1;
-        let (width, zero_pad, precision) = parse_width_zero_precision(spec_flags);
-
-        let Some(arg) = args.get(argi) else {
-            return Err(NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: "printf argument count mismatch".to_string(),
-            });
-        };
-        argi += 1;
-        match verb {
-            'v' | 's' => out.push_str(&format_value_for_printf(arg, verb)),
-            'T' => out.push_str(&format_type_for_printf(arg)),
-            'q' => {
-                let rendered = format_value_for_printf(arg, 's');
-                write!(&mut out, "{rendered:?}").ok();
-            }
-            'd' => {
-                if let Some(n) = value_to_i64(arg) {
-                    let rendered = n.to_string();
-                    push_with_width(&mut out, &rendered, width, zero_pad);
-                } else {
-                    out.push_str(&format_printf_mismatch(verb, arg));
-                }
-            }
-            'x' | 'X' | 'o' | 'b' => {
-                if let Some(n) = value_to_i64(arg) {
-                    let rendered = format_signed_integer_radix(n, verb);
-                    push_with_width(&mut out, &rendered, width, zero_pad);
-                } else {
-                    out.push_str(&format_printf_mismatch(verb, arg));
-                }
-            }
-            'f' | 'e' | 'E' | 'g' | 'G' => {
-                if let Some(n) = value_to_f64(arg) {
-                    let prec = precision.unwrap_or(6);
-                    let rendered = match verb {
-                        'f' => format!("{:.*}", prec, n),
-                        'e' => format_float_exp_go(n, prec, false),
-                        'E' => format_float_exp_go(n, prec, true),
-                        'g' => compat::format_float_general_go(n, prec, false),
-                        'G' => compat::format_float_general_go(n, prec, true),
-                        _ => String::new(),
-                    };
-                    push_with_width(&mut out, &rendered, width, zero_pad);
-                } else {
-                    out.push_str(&format_printf_mismatch(verb, arg));
-                }
-            }
-            't' => {
-                if let Some(b) = value_to_bool(arg) {
-                    write!(&mut out, "{b}").ok();
-                } else {
-                    out.push_str(&format_printf_mismatch(verb, arg));
-                }
-            }
-            _ => {
-                return Err(NativeRenderError::UnsupportedAction {
-                    action: action.to_string(),
-                    reason: format!("printf verb %{verb} is not supported"),
-                });
-            }
-        }
-    }
-    if argi != args.len() {
-        return Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "printf argument count mismatch".to_string(),
-        });
-    }
-    Ok(out)
-}
-
-fn format_printf_mismatch(verb: char, arg: &Option<Value>) -> String {
-    match arg {
-        None | Some(Value::Null) => format!("%!{verb}(<nil>)"),
-        Some(v) => {
-            let type_name = printf_type_name(v);
-            let value = format_value_like_go(v);
-            format!("%!{verb}({type_name}={value})")
-        }
-    }
-}
-
-fn printf_type_name(v: &Value) -> String {
-    match v {
-        Value::Null => "<nil>".to_string(),
-        Value::Bool(_) => "bool".to_string(),
-        Value::String(_) => "string".to_string(),
-        Value::Array(_) => "[]interface {}".to_string(),
-        Value::Object(_) => "map[string]interface {}".to_string(),
-        Value::Number(_) => match number_kind(&Some(v.clone())) {
-            Some(NumberKind::Int(_)) => "int".to_string(),
-            Some(NumberKind::Uint(_)) => "uint".to_string(),
-            Some(NumberKind::Float(_)) => "float64".to_string(),
-            None => "number".to_string(),
-        },
-    }
-}
-
-fn parse_width_zero_precision(flags: &str) -> (Option<usize>, bool, Option<usize>) {
-    compat::parse_width_zero_precision(flags)
-}
-
-fn push_with_width(out: &mut String, rendered: &str, width: Option<usize>, zero_pad: bool) {
-    let Some(width) = width else {
-        out.push_str(rendered);
-        return;
-    };
-    if rendered.len() >= width {
-        out.push_str(rendered);
-        return;
-    }
-    let pad_len = width - rendered.len();
-    let pad_ch = if zero_pad { '0' } else { ' ' };
-    if zero_pad && rendered.starts_with('-') {
-        out.push('-');
-        for _ in 0..pad_len {
-            out.push(pad_ch);
-        }
-        out.push_str(&rendered[1..]);
-        return;
-    }
-    for _ in 0..pad_len {
-        out.push(pad_ch);
-    }
-    out.push_str(rendered);
+    compat::go_printf(fmt, &args[1..]).map_err(|reason| NativeRenderError::UnsupportedAction {
+        action: action.to_string(),
+        reason,
+    })
 }
 
 fn wrong_number_of_args(
@@ -2324,31 +2166,6 @@ fn wrong_number_of_args(
     NativeRenderError::UnsupportedAction {
         action: action.to_string(),
         reason: format!("wrong number of args for {fn_name}: want {want} got {got}"),
-    }
-}
-
-fn format_signed_integer_radix(n: i64, verb: char) -> String {
-    compat::format_signed_integer_radix(n, verb)
-}
-
-fn format_float_exp_go(n: f64, precision: usize, upper: bool) -> String {
-    compat::format_float_exp_go(n, precision, upper)
-}
-
-fn format_value_for_printf(v: &Option<Value>, verb: char) -> String {
-    match (verb, v) {
-        (_, None) | (_, Some(Value::Null)) => "<nil>".to_string(),
-        ('s', Some(Value::String(s))) => s.clone(),
-        ('v', Some(value)) => format_value_like_go(value),
-        (_, Some(Value::String(s))) => s.clone(),
-        (_, Some(value)) => format_value_like_go(value),
-    }
-}
-
-fn format_type_for_printf(v: &Option<Value>) -> String {
-    match v {
-        None | Some(Value::Null) => "<nil>".to_string(),
-        Some(other) => printf_type_name(other),
     }
 }
 
@@ -2528,22 +2345,11 @@ fn compare_number_ordering(
     Ok(ord)
 }
 
-fn value_to_bool(v: &Option<Value>) -> Option<bool> {
-    v.as_ref().and_then(Value::as_bool)
-}
-
 fn value_to_i64(v: &Option<Value>) -> Option<i64> {
     match v.as_ref() {
         Some(Value::Number(n)) => n
             .as_i64()
             .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok())),
-        _ => None,
-    }
-}
-
-fn value_to_f64(v: &Option<Value>) -> Option<f64> {
-    match v.as_ref() {
-        Some(Value::Number(n)) => n.as_f64(),
         _ => None,
     }
 }

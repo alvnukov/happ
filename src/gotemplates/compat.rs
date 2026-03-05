@@ -102,6 +102,161 @@ pub fn format_float_general_go(n: f64, precision: usize, upper: bool) -> String 
     s
 }
 
+fn format_float_general_go_default(n: f64, upper: bool) -> String {
+    if n == 0.0 {
+        return if n.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
+    }
+    let sign = if n.is_sign_negative() { "-" } else { "" };
+    let abs = n.abs();
+    let (digits, exp10) = shortest_decimal_components(abs);
+    if digits == "0" {
+        return format!("{sign}0");
+    }
+    let use_exp = exp10 < -4 || exp10 >= 6;
+    if use_exp {
+        return format!("{sign}{}", to_scientific_from_digits(&digits, exp10, upper));
+    }
+    format!("{sign}{}", to_fixed_from_digits(&digits, exp10))
+}
+
+pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
+    let mut out = String::with_capacity(fmt.len() + 8);
+    let mut i = 0usize;
+    let mut argi = 0usize;
+    let bytes = fmt.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+            out.push('%');
+            i += 2;
+            continue;
+        }
+
+        let spec_start = i;
+        i += 1;
+        while i < bytes.len()
+            && matches!(
+                bytes[i] as char,
+                '+' | '-' | '#' | ' ' | '0' | '.' | '1'..='9'
+            )
+        {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return Err("printf has incomplete format specifier".to_string());
+        }
+        let spec_flags = &fmt[spec_start + 1..i];
+        let verb = bytes[i] as char;
+        i += 1;
+        let (width, zero_pad, precision) = parse_width_zero_precision(spec_flags);
+        let plus_flag = spec_flags.contains('+');
+        let space_flag = !plus_flag && spec_flags.contains(' ');
+        let alt_flag = spec_flags.contains('#');
+
+        let Some(arg) = args.get(argi) else {
+            return Err("printf argument count mismatch".to_string());
+        };
+        argi += 1;
+
+        match verb {
+            'v' | 's' => out.push_str(&format_value_for_printf(arg, verb)),
+            'T' => out.push_str(&format_type_for_printf(arg)),
+            'q' => {
+                if alt_flag {
+                    if let Some(Value::String(s)) = arg.as_ref() {
+                        if can_backquote_string(s) {
+                            out.push('`');
+                            out.push_str(s);
+                            out.push('`');
+                        } else {
+                            out.push_str(&format!("{s:?}"));
+                        }
+                        continue;
+                    }
+                }
+                let rendered = format_value_for_printf(arg, 's');
+                out.push_str(&format!("{rendered:?}"));
+            }
+            'd' => {
+                if let Some(n) = value_to_i64(arg) {
+                    let rendered =
+                        apply_printf_sign_flags(n.to_string(), n >= 0, plus_flag, space_flag);
+                    push_with_width(&mut out, &rendered, width, zero_pad);
+                } else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                }
+            }
+            'x' | 'X' | 'o' | 'b' => {
+                if let Some(n) = value_to_i64(arg) {
+                    let rendered = apply_printf_sign_flags(
+                        format_signed_integer_radix(n, verb),
+                        n >= 0,
+                        plus_flag,
+                        space_flag,
+                    );
+                    push_with_width(&mut out, &rendered, width, zero_pad);
+                } else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                }
+            }
+            'f' | 'e' | 'E' | 'g' | 'G' => {
+                if let Some(n) = value_to_f64(arg) {
+                    let rendered = match verb {
+                        'f' => format!("{:.*}", precision.unwrap_or(6), n),
+                        'e' => format_float_exp_go(n, precision.unwrap_or(6), false),
+                        'E' => format_float_exp_go(n, precision.unwrap_or(6), true),
+                        'g' => {
+                            if let Some(prec) = precision {
+                                format_float_general_go(n, prec, false)
+                            } else {
+                                format_float_general_go_default(n, false)
+                            }
+                        }
+                        'G' => {
+                            if let Some(prec) = precision {
+                                format_float_general_go(n, prec, true)
+                            } else {
+                                format_float_general_go_default(n, true)
+                            }
+                        }
+                        _ => String::new(),
+                    };
+                    let rendered = apply_printf_sign_flags(
+                        rendered,
+                        !n.is_sign_negative(),
+                        plus_flag,
+                        space_flag,
+                    );
+                    push_with_width(&mut out, &rendered, width, zero_pad);
+                } else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                }
+            }
+            't' => {
+                if let Some(b) = value_to_bool(arg) {
+                    out.push_str(&b.to_string());
+                } else {
+                    out.push_str(&format_printf_mismatch(verb, arg));
+                }
+            }
+            _ => return Err(format!("printf verb %{verb} is not supported")),
+        }
+    }
+
+    if argi != args.len() {
+        return Err("printf argument count mismatch".to_string());
+    }
+    Ok(out)
+}
+
 pub fn parse_number_value(expr: &str) -> Option<Value> {
     if !has_valid_go_numeric_underscores(expr) {
         return None;
@@ -218,6 +373,282 @@ fn trim_fraction_zeros(s: &mut String, upper: bool) {
     *s = format!("{mantissa}{exp}");
 }
 
+fn shortest_decimal_components(v: f64) -> (String, i32) {
+    let raw = v.to_string();
+    if let Some((mantissa, exp_raw)) = raw.split_once(['e', 'E']) {
+        let exp = exp_raw.parse::<i32>().unwrap_or(0);
+        let mut digits = String::with_capacity(mantissa.len());
+        let mut int_len = 0usize;
+        for ch in mantissa.chars() {
+            if ch == '.' {
+                continue;
+            }
+            if ch == '-' || ch == '+' {
+                continue;
+            }
+            if ch.is_ascii_digit() {
+                digits.push(ch);
+                if int_len == 0 && !mantissa.contains('.') {
+                    int_len += 1;
+                }
+            }
+        }
+        if let Some(dot) = mantissa.find('.') {
+            int_len = dot.saturating_sub(usize::from(mantissa.starts_with(['-', '+'])));
+        } else if int_len == 0 {
+            int_len = digits.len();
+        }
+        while digits.starts_with('0') && digits.len() > 1 {
+            digits.remove(0);
+        }
+        while digits.ends_with('0') && digits.len() > 1 {
+            digits.pop();
+        }
+        if digits.is_empty() {
+            return ("0".to_string(), 0);
+        }
+        let exp10 = exp + (int_len as i32) - 1;
+        return (digits, exp10);
+    }
+
+    if let Some((int_part, frac_part)) = raw.split_once('.') {
+        let mut digits = String::new();
+        if int_part != "0" {
+            digits.push_str(int_part);
+            digits.push_str(frac_part);
+            while digits.ends_with('0') && digits.len() > 1 {
+                digits.pop();
+            }
+            return (digits, int_part.len() as i32 - 1);
+        }
+
+        let first = frac_part
+            .chars()
+            .position(|ch| ch != '0')
+            .unwrap_or(frac_part.len());
+        if first == frac_part.len() {
+            return ("0".to_string(), 0);
+        }
+        digits.push_str(&frac_part[first..]);
+        while digits.ends_with('0') && digits.len() > 1 {
+            digits.pop();
+        }
+        return (digits, -(first as i32) - 1);
+    }
+
+    let mut digits = raw;
+    while digits.ends_with('0') && digits.len() > 1 {
+        digits.pop();
+    }
+    let exp10 = digits.len() as i32 - 1;
+    (digits, exp10)
+}
+
+fn to_scientific_from_digits(digits: &str, exp10: i32, upper: bool) -> String {
+    let mut out = String::with_capacity(digits.len() + 6);
+    let mut chars = digits.chars();
+    if let Some(first) = chars.next() {
+        out.push(first);
+        let rest: String = chars.collect();
+        if !rest.is_empty() {
+            out.push('.');
+            out.push_str(&rest);
+        }
+    } else {
+        out.push('0');
+    }
+    out.push(if upper { 'E' } else { 'e' });
+    out.push(if exp10 >= 0 { '+' } else { '-' });
+    let abs = exp10.unsigned_abs();
+    if abs < 10 {
+        out.push('0');
+        out.push((b'0' + abs as u8) as char);
+    } else {
+        out.push_str(&abs.to_string());
+    }
+    out
+}
+
+fn to_fixed_from_digits(digits: &str, exp10: i32) -> String {
+    let len = digits.len() as i32;
+    if exp10 >= len - 1 {
+        let mut out = String::with_capacity(exp10 as usize + 1);
+        out.push_str(digits);
+        for _ in 0..(exp10 - (len - 1)) {
+            out.push('0');
+        }
+        return out;
+    }
+    if exp10 >= 0 {
+        let split = (exp10 + 1) as usize;
+        let (left, right) = digits.split_at(split);
+        return format!("{left}.{right}");
+    }
+    let mut out = String::with_capacity(digits.len() + (-exp10) as usize + 2);
+    out.push_str("0.");
+    for _ in 0..(-exp10 - 1) {
+        out.push('0');
+    }
+    out.push_str(digits);
+    out
+}
+
+fn can_backquote_string(s: &str) -> bool {
+    if s.contains('`') || s.contains('\r') {
+        return false;
+    }
+    s.chars().all(|ch| ch == '\t' || !ch.is_control())
+}
+
+fn push_with_width(out: &mut String, rendered: &str, width: Option<usize>, zero_pad: bool) {
+    let Some(width) = width else {
+        out.push_str(rendered);
+        return;
+    };
+    if rendered.len() >= width {
+        out.push_str(rendered);
+        return;
+    }
+    let pad_len = width - rendered.len();
+    let pad_ch = if zero_pad { '0' } else { ' ' };
+    if zero_pad && rendered.starts_with(['-', '+', ' ']) {
+        let mut chars = rendered.chars();
+        let sign = chars.next().unwrap_or_default();
+        out.push(sign);
+        for _ in 0..pad_len {
+            out.push(pad_ch);
+        }
+        out.push_str(chars.as_str());
+        return;
+    }
+    for _ in 0..pad_len {
+        out.push(pad_ch);
+    }
+    out.push_str(rendered);
+}
+
+fn apply_printf_sign_flags(
+    rendered: String,
+    non_negative: bool,
+    plus_flag: bool,
+    space_flag: bool,
+) -> String {
+    if !non_negative || rendered.starts_with(['-', '+', ' ']) {
+        return rendered;
+    }
+    if plus_flag {
+        return format!("+{rendered}");
+    }
+    if space_flag {
+        return format!(" {rendered}");
+    }
+    rendered
+}
+
+fn value_to_bool(v: &Option<Value>) -> Option<bool> {
+    v.as_ref().and_then(Value::as_bool)
+}
+
+fn value_to_i64(v: &Option<Value>) -> Option<i64> {
+    match v.as_ref() {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok())),
+        _ => None,
+    }
+}
+
+fn value_to_f64(v: &Option<Value>) -> Option<f64> {
+    match v.as_ref() {
+        Some(Value::Number(n)) => n.as_f64(),
+        _ => None,
+    }
+}
+
+fn format_value_for_printf(v: &Option<Value>, verb: char) -> String {
+    match (verb, v) {
+        (_, None) | (_, Some(Value::Null)) => "<nil>".to_string(),
+        ('s', Some(Value::String(s))) => s.clone(),
+        ('v', Some(value)) => format_value_like_go(value),
+        (_, Some(Value::String(s))) => s.clone(),
+        (_, Some(value)) => format_value_like_go(value),
+    }
+}
+
+fn format_type_for_printf(v: &Option<Value>) -> String {
+    match v {
+        None | Some(Value::Null) => "<nil>".to_string(),
+        Some(other) => printf_type_name(other),
+    }
+}
+
+fn format_printf_mismatch(verb: char, arg: &Option<Value>) -> String {
+    match arg {
+        None | Some(Value::Null) => format!("%!{verb}(<nil>)"),
+        Some(v) => {
+            let type_name = printf_type_name(v);
+            let value = format_value_like_go(v);
+            format!("%!{verb}({type_name}={value})")
+        }
+    }
+}
+
+fn printf_type_name(v: &Value) -> String {
+    match v {
+        Value::Null => "<nil>".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::String(_) => "string".to_string(),
+        Value::Array(_) => "[]interface {}".to_string(),
+        Value::Object(_) => "map[string]interface {}".to_string(),
+        Value::Number(n) => {
+            if n.as_i64().is_some() {
+                "int".to_string()
+            } else if n.as_u64().is_some() {
+                "uint".to_string()
+            } else {
+                "float64".to_string()
+            }
+        }
+    }
+}
+
+fn format_value_like_go(v: &Value) -> String {
+    match v {
+        Value::Null => "<no value>".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Array(items) => {
+            let mut out = String::from("[");
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&format_value_like_go(item));
+            }
+            out.push(']');
+            out
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            let mut out = String::from("map[");
+            for (idx, k) in keys.iter().enumerate() {
+                if idx > 0 {
+                    out.push(' ');
+                }
+                out.push_str(k);
+                out.push(':');
+                if let Some(v) = map.get(*k) {
+                    out.push_str(&format_value_like_go(v));
+                }
+            }
+            out.push(']');
+            out
+        }
+    }
+}
+
 fn has_valid_go_numeric_underscores(expr: &str) -> bool {
     if !expr.contains('_') {
         return true;
@@ -251,11 +682,8 @@ fn has_valid_go_numeric_underscores(expr: &str) -> bool {
         let prev = bytes[i - 1] as char;
         let next = bytes[i + 1] as char;
 
-        let is_after_prefix = i == 2
-            && matches!(
-                &body[..2],
-                "0b" | "0B" | "0o" | "0O" | "0x" | "0X"
-            );
+        let is_after_prefix =
+            i == 2 && matches!(&body[..2], "0b" | "0B" | "0o" | "0O" | "0x" | "0X");
         if is_after_prefix {
             if !is_digit_for_base(next, base) {
                 return false;
@@ -407,18 +835,9 @@ mod tests {
 
     #[test]
     fn width_zero_precision_parser_matches_go_shape() {
-        assert_eq!(
-            parse_width_zero_precision("04"),
-            (Some(4), true, None)
-        );
-        assert_eq!(
-            parse_width_zero_precision(".2"),
-            (None, false, Some(2))
-        );
-        assert_eq!(
-            parse_width_zero_precision("08.3"),
-            (Some(8), true, Some(3))
-        );
+        assert_eq!(parse_width_zero_precision("04"), (Some(4), true, None));
+        assert_eq!(parse_width_zero_precision(".2"), (None, false, Some(2)));
+        assert_eq!(parse_width_zero_precision("08.3"), (Some(8), true, Some(3)));
     }
 
     #[test]
@@ -435,7 +854,10 @@ mod tests {
 
     #[test]
     fn number_parser_supports_go_literals_and_rejects_invalid_underscore() {
-        assert_eq!(parse_number_value("0b_101"), Some(Value::Number(Number::from(5))));
+        assert_eq!(
+            parse_number_value("0b_101"),
+            Some(Value::Number(Number::from(5)))
+        );
         assert_eq!(
             parse_number_value("+0x_1.e_0p+0_2"),
             Number::from_f64(7.5).map(Value::Number)
