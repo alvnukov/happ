@@ -82,6 +82,26 @@ pub fn format_float_exp_go(n: f64, precision: usize, upper: bool) -> String {
     normalize_scientific_exponent(&raw, upper)
 }
 
+pub fn format_float_general_go(n: f64, precision: usize, upper: bool) -> String {
+    if n == 0.0 {
+        return "0".to_string();
+    }
+    let p = if precision == 0 { 1 } else { precision };
+    let abs = n.abs();
+    let exp10 = abs.log10().floor() as i32;
+    let use_exp = exp10 < -4 || exp10 >= p as i32;
+    if use_exp {
+        let mut s = format_float_exp_go(n, p.saturating_sub(1), upper);
+        trim_fraction_zeros(&mut s, upper);
+        return s;
+    }
+
+    let frac_digits = (p as i32 - (exp10 + 1)).max(0) as usize;
+    let mut s = format!("{:.*}", frac_digits, n);
+    trim_trailing_zeros_fixed(&mut s);
+    s
+}
+
 pub fn parse_number_value(expr: &str) -> Option<Value> {
     if !has_valid_go_numeric_underscores(expr) {
         return None;
@@ -172,6 +192,30 @@ fn normalize_scientific_exponent(raw: &str, upper: bool) -> String {
     let sign = if exp >= 0 { '+' } else { '-' };
     let abs = exp.unsigned_abs();
     format!("{mantissa}{sep}{sign}{abs:02}")
+}
+
+fn trim_trailing_zeros_fixed(s: &mut String) {
+    if !s.contains('.') {
+        return;
+    }
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+}
+
+fn trim_fraction_zeros(s: &mut String, upper: bool) {
+    let sep = if upper { 'E' } else { 'e' };
+    let Some(idx) = s.find(sep) else {
+        trim_trailing_zeros_fixed(s);
+        return;
+    };
+    let mut mantissa = s[..idx].to_string();
+    trim_trailing_zeros_fixed(&mut mantissa);
+    let exp = &s[idx..];
+    *s = format!("{mantissa}{exp}");
 }
 
 fn has_valid_go_numeric_underscores(expr: &str) -> bool {
@@ -381,6 +425,12 @@ mod tests {
     fn scientific_format_has_go_exponent_sign() {
         assert_eq!(format_float_exp_go(1.2, 6, false), "1.200000e+00");
         assert_eq!(format_float_exp_go(1.2, 6, true), "1.200000E+00");
+    }
+
+    #[test]
+    fn general_float_format_matches_basic_go_shapes() {
+        assert_eq!(format_float_general_go(3.5, 6, false), "3.5");
+        assert_eq!(format_float_general_go(1234567.0, 6, true), "1.23457E+06");
     }
 
     #[test]

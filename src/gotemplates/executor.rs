@@ -2218,13 +2218,15 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
                     out.push_str(&format_printf_mismatch(verb, arg));
                 }
             }
-            'f' | 'e' | 'E' => {
+            'f' | 'e' | 'E' | 'g' | 'G' => {
                 if let Some(n) = value_to_f64(arg) {
                     let prec = precision.unwrap_or(6);
                     let rendered = match verb {
                         'f' => format!("{:.*}", prec, n),
                         'e' => format_float_exp_go(n, prec, false),
                         'E' => format_float_exp_go(n, prec, true),
+                        'g' => compat::format_float_general_go(n, prec, false),
+                        'G' => compat::format_float_general_go(n, prec, true),
                         _ => String::new(),
                     };
                     push_with_width(&mut out, &rendered, width, zero_pad);
@@ -3256,6 +3258,10 @@ mod tests {
         assert_eq!(out, "11");
         let out = render_template_native("{{printf \"%b\" 9}}", &data).expect("must render");
         assert_eq!(out, "1001");
+        let out = render_template_native("{{printf \"%g\" 3.5}}", &data).expect("must render");
+        assert_eq!(out, "3.5");
+        let out = render_template_native("{{printf \"%G\" 1234567.0}}", &data).expect("must render");
+        assert_eq!(out, "1.23457E+06");
         let out = render_template_native("{{printf \"%04x\" -1}}", &data).expect("must render");
         assert_eq!(out, "-001");
         let out = render_template_native("{{3 | printf \"%d\"}}", &data).expect("must render");
