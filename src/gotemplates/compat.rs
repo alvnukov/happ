@@ -356,3 +356,48 @@ fn parse_go_char_escape(rest: &str) -> Option<u32> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn width_zero_precision_parser_matches_go_shape() {
+        assert_eq!(
+            parse_width_zero_precision("04"),
+            (Some(4), true, None)
+        );
+        assert_eq!(
+            parse_width_zero_precision(".2"),
+            (None, false, Some(2))
+        );
+        assert_eq!(
+            parse_width_zero_precision("08.3"),
+            (Some(8), true, Some(3))
+        );
+    }
+
+    #[test]
+    fn scientific_format_has_go_exponent_sign() {
+        assert_eq!(format_float_exp_go(1.2, 6, false), "1.200000e+00");
+        assert_eq!(format_float_exp_go(1.2, 6, true), "1.200000E+00");
+    }
+
+    #[test]
+    fn number_parser_supports_go_literals_and_rejects_invalid_underscore() {
+        assert_eq!(parse_number_value("0b_101"), Some(Value::Number(Number::from(5))));
+        assert_eq!(
+            parse_number_value("+0x_1.e_0p+0_2"),
+            Number::from_f64(7.5).map(Value::Number)
+        );
+        assert_eq!(parse_number_value("1__2"), None);
+    }
+
+    #[test]
+    fn char_parser_supports_go_escapes() {
+        assert_eq!(parse_char_constant("'\\n'"), Some(10));
+        assert_eq!(parse_char_constant("'\\x41'"), Some(65));
+        assert_eq!(parse_char_constant("'\\u263A'"), Some(9786));
+        assert_eq!(parse_char_constant("'\\400'"), None);
+    }
+}
