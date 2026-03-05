@@ -267,7 +267,7 @@ fn eval_block(
                             state,
                         )?;
                         out.push_str(&eval.out);
-                        if matches!(eval.term, Terminator::Break | Terminator::Continue) {
+                        if matches!(&eval.term, Terminator::Break | Terminator::Continue) {
                             return Ok(BlockEval {
                                 out,
                                 next_idx: eval.next_idx,
@@ -290,7 +290,7 @@ fn eval_block(
                             state,
                         )?;
                         out.push_str(&eval.out);
-                        if matches!(eval.term, Terminator::Break | Terminator::Continue) {
+                        if matches!(&eval.term, Terminator::Break | Terminator::Continue) {
                             return Ok(BlockEval {
                                 out,
                                 next_idx: eval.next_idx,
@@ -313,7 +313,7 @@ fn eval_block(
                             state,
                         )?;
                         out.push_str(&eval.out);
-                        if matches!(eval.term, Terminator::Break | Terminator::Continue) {
+                        if matches!(&eval.term, Terminator::Break | Terminator::Continue) {
                             return Ok(BlockEval {
                                 out,
                                 next_idx: eval.next_idx,
@@ -1357,6 +1357,10 @@ fn eval_short_circuit_builtin(
     state: &mut EvalState,
     resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<Option<Value>, NativeRenderError> {
+    let total_args = arg_tokens.len() + usize::from(has_pipe_input);
+    if total_args == 0 {
+        return Err(wrong_number_of_args(action, name, "at least 1", 0));
+    }
     let mut last = None;
 
     for token in arg_tokens {
@@ -1652,9 +1656,12 @@ fn eval_builtin_function(
     let value = match name {
         "and" => builtin_and(args),
         "or" => builtin_or(args),
-        "not" => Some(Value::Bool(!is_truthy(
-            &args.first().cloned().unwrap_or(None),
-        ))),
+        "not" => {
+            if args.len() != 1 {
+                return Err(wrong_number_of_args(action, "not", "1", args.len()));
+            }
+            Some(Value::Bool(!is_truthy(&args[0])))
+        }
         "len" => Some(Value::Number(Number::from(
             builtin_len(action, args)? as u64
         ))),
@@ -1667,11 +1674,11 @@ fn eval_builtin_function(
         "printf" => Some(Value::String(builtin_printf(action, args)?)),
         "urlquery" => Some(Value::String(builtin_urlquery(args))),
         "eq" => Some(Value::Bool(builtin_eq(action, args)?)),
-        "ne" => Some(Value::Bool(!builtin_eq(action, args)?)),
-        "lt" => Some(Value::Bool(builtin_cmp(action, args, |o| o.is_lt())?)),
-        "le" => Some(Value::Bool(builtin_cmp(action, args, |o| o.is_le())?)),
-        "gt" => Some(Value::Bool(builtin_cmp(action, args, |o| o.is_gt())?)),
-        "ge" => Some(Value::Bool(builtin_cmp(action, args, |o| o.is_ge())?)),
+        "ne" => Some(Value::Bool(builtin_ne(action, args)?)),
+        "lt" => Some(Value::Bool(builtin_cmp(action, "lt", args, |o| o.is_lt())?)),
+        "le" => Some(Value::Bool(builtin_cmp(action, "le", args, |o| o.is_le())?)),
+        "gt" => Some(Value::Bool(builtin_cmp(action, "gt", args, |o| o.is_gt())?)),
+        "ge" => Some(Value::Bool(builtin_cmp(action, "ge", args, |o| o.is_ge())?)),
         _ => {
             return Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
@@ -1708,10 +1715,7 @@ fn builtin_or(args: &[Option<Value>]) -> Option<Value> {
 
 fn builtin_len(action: &str, args: &[Option<Value>]) -> Result<usize, NativeRenderError> {
     if args.len() != 1 {
-        return Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "len expects exactly one argument".to_string(),
-        });
+        return Err(wrong_number_of_args(action, "len", "1", args.len()));
     }
     match args[0].as_ref() {
         Some(Value::String(s)) => Ok(s.len()),
@@ -1730,11 +1734,8 @@ fn builtin_len(action: &str, args: &[Option<Value>]) -> Result<usize, NativeRend
 }
 
 fn builtin_index(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, NativeRenderError> {
-    if args.len() < 2 {
-        return Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "index expects at least two arguments".to_string(),
-        });
+    if args.is_empty() {
+        return Err(wrong_number_of_args(action, "index", "at least 1", 0));
     }
     let mut cur = args[0].clone();
     if cur.is_none() {
@@ -1742,6 +1743,9 @@ fn builtin_index(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
             action: action.to_string(),
             reason: "error calling index: index of untyped nil".to_string(),
         });
+    }
+    if args.len() == 1 {
+        return Ok(cur);
     }
     for idx in args.iter().skip(1) {
         let next = match cur {
@@ -1802,10 +1806,7 @@ fn builtin_index(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
 
 fn builtin_slice(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, NativeRenderError> {
     if args.is_empty() {
-        return Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "error calling slice: slice of untyped nil".to_string(),
-        });
+        return Err(wrong_number_of_args(action, "slice", "at least 1", 0));
     }
     if args.len() > 4 {
         return Err(NativeRenderError::UnsupportedAction {
@@ -2051,6 +2052,9 @@ fn format_value_for_print(v: &Option<Value>) -> String {
 }
 
 fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, NativeRenderError> {
+    if args.is_empty() {
+        return Err(wrong_number_of_args(action, "printf", "at least 1", 0));
+    }
     let Some(fmt) = args
         .first()
         .and_then(|v| v.as_ref())
@@ -2236,6 +2240,18 @@ fn push_with_width(out: &mut String, rendered: &str, width: Option<usize>, zero_
     out.push_str(rendered);
 }
 
+fn wrong_number_of_args(
+    action: &str,
+    fn_name: &str,
+    want: &str,
+    got: usize,
+) -> NativeRenderError {
+    NativeRenderError::UnsupportedAction {
+        action: action.to_string(),
+        reason: format!("wrong number of args for {fn_name}: want {want} got {got}"),
+    }
+}
+
 fn format_value_for_printf(v: &Option<Value>, verb: char) -> String {
     match (verb, v) {
         (_, None) | (_, Some(Value::Null)) => "<nil>".to_string(),
@@ -2247,8 +2263,14 @@ fn format_value_for_printf(v: &Option<Value>, verb: char) -> String {
 }
 
 fn builtin_eq(action: &str, args: &[Option<Value>]) -> Result<bool, NativeRenderError> {
-    if args.len() < 2 {
-        return Ok(false);
+    if args.is_empty() {
+        return Err(wrong_number_of_args(action, "eq", "at least 1", 0));
+    }
+    if args.len() == 1 {
+        return Err(NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: "error calling eq: missing argument for comparison".to_string(),
+        });
     }
     let head = &args[0];
     for other in args.iter().skip(1) {
@@ -2261,17 +2283,22 @@ fn builtin_eq(action: &str, args: &[Option<Value>]) -> Result<bool, NativeRender
 
 fn builtin_cmp(
     action: &str,
+    fn_name: &str,
     args: &[Option<Value>],
     pred: impl Fn(std::cmp::Ordering) -> bool,
 ) -> Result<bool, NativeRenderError> {
     if args.len() != 2 {
-        return Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "comparison expects exactly two arguments".to_string(),
-        });
+        return Err(wrong_number_of_args(action, fn_name, "2", args.len()));
     }
     let ord = compare_ordering(action, &args[0], &args[1])?;
     Ok(pred(ord))
+}
+
+fn builtin_ne(action: &str, args: &[Option<Value>]) -> Result<bool, NativeRenderError> {
+    if args.len() != 2 {
+        return Err(wrong_number_of_args(action, "ne", "2", args.len()));
+    }
+    Ok(!compare_eq(action, &args[0], &args[1])?)
 }
 
 fn compare_eq(
@@ -3362,6 +3389,25 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn native_renderer_matches_builtin_arity_and_index_identity() {
+        let data = json!({"x": 1});
+        let out = render_template_native("{{index 1}}", &data).expect("must render");
+        assert_eq!(out, "1");
+
+        assert!(render_template_native("{{and}}", &data).is_err());
+        assert!(render_template_native("{{or}}", &data).is_err());
+        assert!(render_template_native("{{not}}", &data).is_err());
+        assert!(render_template_native("{{not 1 2}}", &data).is_err());
+        assert!(render_template_native("{{eq}}", &data).is_err());
+        assert!(render_template_native("{{eq 1}}", &data).is_err());
+        assert!(render_template_native("{{ne 1 2 3}}", &data).is_err());
+        assert!(render_template_native("{{lt 1}}", &data).is_err());
+        assert!(render_template_native("{{len}}", &data).is_err());
+        assert!(render_template_native("{{slice}}", &data).is_err());
+        assert!(render_template_native("{{printf}}", &data).is_err());
     }
 
     #[test]
