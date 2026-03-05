@@ -2125,10 +2125,20 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
             }
             'x' | 'X' => {
                 if let Some(n) = value_to_i64(arg) {
-                    let rendered = if verb == 'x' {
-                        format!("{:x}", n)
+                    let rendered = if n < 0 {
+                        let abs = n.unsigned_abs();
+                        if verb == 'x' {
+                            format!("-{:x}", abs)
+                        } else {
+                            format!("-{:X}", abs)
+                        }
                     } else {
-                        format!("{:X}", n)
+                        let abs = n.unsigned_abs();
+                        if verb == 'x' {
+                            format!("{:x}", abs)
+                        } else {
+                            format!("{:X}", abs)
+                        }
                     };
                     push_with_width(&mut out, &rendered, width, zero_pad);
                 } else {
@@ -2137,7 +2147,8 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
             }
             'f' => {
                 if let Some(n) = value_to_f64(arg) {
-                    write!(&mut out, "{n}").ok();
+                    let rendered = format!("{n:.6}");
+                    push_with_width(&mut out, &rendered, width, zero_pad);
                 } else {
                     out.push_str(&format_printf_mismatch(verb, arg));
                 }
@@ -3348,6 +3359,10 @@ mod tests {
         assert_eq!(out, "1 2");
         let out = render_template_native("{{printf \"%s-%d\" .s 7}}", &data).expect("must render");
         assert_eq!(out, "ok-7");
+        let out = render_template_native("{{printf \"%f\" 1.2}}", &data).expect("must render");
+        assert_eq!(out, "1.200000");
+        let out = render_template_native("{{printf \"%04x\" -1}}", &data).expect("must render");
+        assert_eq!(out, "-001");
         let out = render_template_native("{{3 | printf \"%d\"}}", &data).expect("must render");
         assert_eq!(out, "3");
         let out = render_template_native("{{len .items}}", &data).expect("must render");

@@ -36,6 +36,8 @@ fn native_executor_matches_go_std_exec_success_subset() {
         "{{print '\\U0001F600'}}",
         "{{println 1 2 3}}",
         "{{printf \"%04x\" 127}}",
+        "{{printf \"%f\" 1.2}}",
+        "{{printf \"%04x\" -1}}",
         "{{printf \"%d\" \"7\"}}",
         "{{html \"<tag attr='x'>&\\\"\"}}",
         "{{js \"<tag>&'\\\"=\\n\"}}",
