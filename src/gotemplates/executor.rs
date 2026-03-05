@@ -2198,6 +2198,7 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
         argi += 1;
         match verb {
             'v' | 's' => out.push_str(&format_value_for_printf(arg, verb)),
+            'T' => out.push_str(&format_type_for_printf(arg)),
             'q' => {
                 let rendered = format_value_for_printf(arg, 's');
                 write!(&mut out, "{rendered:?}").ok();
@@ -2341,6 +2342,13 @@ fn format_value_for_printf(v: &Option<Value>, verb: char) -> String {
         ('v', Some(value)) => format_value_like_go(value),
         (_, Some(Value::String(s))) => s.clone(),
         (_, Some(value)) => format_value_like_go(value),
+    }
+}
+
+fn format_type_for_printf(v: &Option<Value>) -> String {
+    match v {
+        None | Some(Value::Null) => "<nil>".to_string(),
+        Some(other) => printf_type_name(other),
     }
 }
 
@@ -3262,6 +3270,8 @@ mod tests {
         assert_eq!(out, "3.5");
         let out = render_template_native("{{printf \"%G\" 1234567.0}}", &data).expect("must render");
         assert_eq!(out, "1.23457E+06");
+        let out = render_template_native("{{printf \"%T\" 0xef}}", &data).expect("must render");
+        assert_eq!(out, "int");
         let out = render_template_native("{{printf \"%04x\" -1}}", &data).expect("must render");
         assert_eq!(out, "-001");
         let out = render_template_native("{{3 | printf \"%d\"}}", &data).expect("must render");

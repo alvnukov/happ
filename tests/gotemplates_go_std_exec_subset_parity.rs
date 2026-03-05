@@ -50,6 +50,7 @@ fn native_executor_matches_go_std_exec_success_subset() {
         "{{printf \"%E\" 1.2}}",
         "{{printf \"%g\" 3.5}}",
         "{{printf \"%G\" 1234567.0}}",
+        "{{printf `%T` 0xef}}",
         "{{printf \"%o\" 9}}",
         "{{printf \"%b\" 9}}",
         "{{printf \"%04x\" -1}}",
