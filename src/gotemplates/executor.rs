@@ -2100,7 +2100,7 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
         let spec_flags = &fmt[spec_start + 1..i];
         let verb = bytes[i] as char;
         i += 1;
-        let (width, zero_pad) = parse_width_and_zero(spec_flags);
+        let (width, zero_pad, precision) = parse_width_zero_precision(spec_flags);
 
         let Some(arg) = args.get(argi) else {
             return Err(NativeRenderError::UnsupportedAction {
@@ -2147,7 +2147,8 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
             }
             'f' => {
                 if let Some(n) = value_to_f64(arg) {
-                    let rendered = format!("{n:.6}");
+                    let prec = precision.unwrap_or(6);
+                    let rendered = format!("{:.*}", prec, n);
                     push_with_width(&mut out, &rendered, width, zero_pad);
                 } else {
                     out.push_str(&format_printf_mismatch(verb, arg));
@@ -2204,18 +2205,30 @@ fn printf_type_name(v: &Value) -> String {
     }
 }
 
-fn parse_width_and_zero(flags: &str) -> (Option<usize>, bool) {
+fn parse_width_zero_precision(flags: &str) -> (Option<usize>, bool, Option<usize>) {
     let mut zero = false;
     let mut width_digits = String::new();
-    let mut seen_digit = false;
+    let mut precision_digits = String::new();
+    let mut in_precision = false;
+    let mut saw_width = false;
+    let mut saw_dot = false;
     for ch in flags.chars() {
-        if ch == '0' && !seen_digit && width_digits.is_empty() {
-            zero = true;
-            continue;
-        }
-        if ch.is_ascii_digit() {
-            seen_digit = true;
-            width_digits.push(ch);
+        match ch {
+            '.' if !in_precision => {
+                in_precision = true;
+                saw_dot = true;
+            }
+            '0' if !in_precision && !saw_width && width_digits.is_empty() => {
+                zero = true;
+            }
+            '0'..='9' if in_precision => {
+                precision_digits.push(ch);
+            }
+            '0'..='9' => {
+                saw_width = true;
+                width_digits.push(ch);
+            }
+            _ => {}
         }
     }
     let width = if width_digits.is_empty() {
@@ -2223,7 +2236,16 @@ fn parse_width_and_zero(flags: &str) -> (Option<usize>, bool) {
     } else {
         width_digits.parse::<usize>().ok()
     };
-    (width, zero)
+    let precision = if saw_dot {
+        if precision_digits.is_empty() {
+            Some(0)
+        } else {
+            precision_digits.parse::<usize>().ok()
+        }
+    } else {
+        None
+    };
+    (width, zero, precision)
 }
 
 fn push_with_width(out: &mut String, rendered: &str, width: Option<usize>, zero_pad: bool) {
@@ -3361,6 +3383,8 @@ mod tests {
         assert_eq!(out, "ok-7");
         let out = render_template_native("{{printf \"%f\" 1.2}}", &data).expect("must render");
         assert_eq!(out, "1.200000");
+        let out = render_template_native("{{printf \"%.2f\" 1.2}}", &data).expect("must render");
+        assert_eq!(out, "1.20");
         let out = render_template_native("{{printf \"%04x\" -1}}", &data).expect("must render");
         assert_eq!(out, "-001");
         let out = render_template_native("{{3 | printf \"%d\"}}", &data).expect("must render");
