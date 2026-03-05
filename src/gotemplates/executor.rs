@@ -1277,6 +1277,18 @@ fn eval_pipeline_command(
     }
 
     let head = tokens[0].as_str();
+    if head == "call" {
+        return eval_call_builtin(
+            action,
+            &tokens[1..],
+            root,
+            dot,
+            has_pipe_input,
+            pipe_input,
+            state,
+            resolver,
+        );
+    }
     if head == "and" || head == "or" {
         return eval_short_circuit_builtin(
             action,
@@ -1370,6 +1382,78 @@ fn eval_short_circuit_builtin(
     }
 
     Ok(last)
+}
+
+fn eval_call_builtin(
+    action: &str,
+    arg_tokens: &[String],
+    root: &Value,
+    dot: &Value,
+    has_pipe_input: bool,
+    pipe_input: Option<Value>,
+    state: &mut EvalState,
+    resolver: Option<&dyn NativeFunctionResolver>,
+) -> Result<Option<Value>, NativeRenderError> {
+    let Some(resolver) = resolver else {
+        return Err(NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: "call requires external function resolver".to_string(),
+        });
+    };
+    let Some(first) = arg_tokens.first() else {
+        return Err(NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: "error calling call: function argument is missing".to_string(),
+        });
+    };
+
+    let fn_name = if is_identifier_name(first) {
+        first.clone()
+    } else {
+        let evaluated = eval_command_token_value(action, first, root, dot, state, Some(resolver))?;
+        match evaluated {
+            Some(Value::String(s)) => s,
+            _ => {
+                return Err(NativeRenderError::UnsupportedAction {
+                    action: action.to_string(),
+                    reason: "error calling call: first argument must resolve to function name"
+                        .to_string(),
+                });
+            }
+        }
+    };
+
+    let mut args =
+        Vec::with_capacity(arg_tokens.len().saturating_sub(1) + usize::from(has_pipe_input));
+    for token in arg_tokens.iter().skip(1) {
+        args.push(eval_command_token_value(
+            action,
+            token,
+            root,
+            dot,
+            state,
+            Some(resolver),
+        )?);
+    }
+    if has_pipe_input {
+        args.push(pipe_input);
+    }
+
+    match resolver.call(&fn_name, &args) {
+        Ok(v) => Ok(v),
+        Err(NativeFunctionResolverError::UnknownFunction) => {
+            Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!("unknown function: {fn_name}"),
+            })
+        }
+        Err(NativeFunctionResolverError::Failed { reason }) => {
+            Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!("error calling {fn_name}: {reason}"),
+            })
+        }
+    }
 }
 
 fn try_eval_external_function(
@@ -1539,6 +1623,7 @@ fn is_builtin_function_name(name: &str) -> bool {
     matches!(
         name,
         "and"
+            | "call"
             | "or"
             | "not"
             | "len"
@@ -3382,6 +3467,36 @@ mod tests {
         )
         .expect("must render");
         assert_eq!(out, "a:2");
+    }
+
+    #[test]
+    fn native_renderer_supports_call_builtin_via_resolver() {
+        let data = json!({"fn":"ext"});
+        let resolver = |name: &str, args: &[Option<Value>]| {
+            if name != "ext" {
+                return Err(NativeFunctionResolverError::UnknownFunction);
+            }
+            Ok(Some(Value::String(format!(
+                "called:{}",
+                format_value_for_print(&args[0])
+            ))))
+        };
+        let out = render_template_native_with_resolver(
+            "{{call ext \"x\"}}",
+            &data,
+            NativeRenderOptions::default(),
+            Some(&resolver),
+        )
+        .expect("must render");
+        assert_eq!(out, "called:x");
+        let out = render_template_native_with_resolver(
+            "{{call .fn \"y\"}}",
+            &data,
+            NativeRenderOptions::default(),
+            Some(&resolver),
+        )
+        .expect("must render");
+        assert_eq!(out, "called:y");
     }
 
     #[test]
