@@ -169,21 +169,19 @@ fn maybe_start_parent_watchdog(parent_pid: Option<u32>) {
     if pid == 0 {
         return;
     }
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(2));
-            let ok = unsafe { libc::kill(pid as i32, 0) } == 0;
-            if ok {
-                continue;
-            }
-            if matches!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::EPERM)
-            ) {
-                continue;
-            }
-            std::process::exit(0);
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(2));
+        let ok = unsafe { libc::kill(pid as i32, 0) } == 0;
+        if ok {
+            continue;
         }
+        if matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        ) {
+            continue;
+        }
+        std::process::exit(0);
     });
 }
 
@@ -245,9 +243,7 @@ fn handle_request(
                             connection,
                             req.id.clone(),
                             -32602,
-                            format!(
-                                "invalid params for happ/renderEntityManifest: {err}"
-                            ),
+                            format!("invalid params for happ/renderEntityManifest: {err}"),
                         );
                     }
                 };
@@ -484,9 +480,10 @@ fn render_manifest_for_entity(
     apply_includes: bool,
     env: &str,
 ) -> Result<String, String> {
-    let values_json = build_manifest_preview_values(group, app, entity, global, apply_includes, env);
-    let values_yaml =
-        json_to_yaml_value(&values_json).map_err(|e| format!("build values yaml for preview: {e}"))?;
+    let values_json =
+        build_manifest_preview_values(group, app, entity, global, apply_includes, env);
+    let values_yaml = json_to_yaml_value(&values_json)
+        .map_err(|e| format!("build values yaml for preview: {e}"))?;
     let temp_dir = tempfile::Builder::new()
         .prefix("happ-lsp-preview-")
         .tempdir()

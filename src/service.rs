@@ -352,11 +352,15 @@ fn read_stdin_available_nonblocking() -> Result<Option<String>, Error> {
         let fd = stdin.as_raw_fd();
         let orig_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if orig_flags < 0 {
-            return Err(Error::Convert("read stdin: failed to get fd flags".to_string()));
+            return Err(Error::Convert(
+                "read stdin: failed to get fd flags".to_string(),
+            ));
         }
         let nonblocking_flags = orig_flags | libc::O_NONBLOCK;
         if unsafe { libc::fcntl(fd, libc::F_SETFL, nonblocking_flags) } < 0 {
-            return Err(Error::Convert("read stdin: failed to set O_NONBLOCK".to_string()));
+            return Err(Error::Convert(
+                "read stdin: failed to set O_NONBLOCK".to_string(),
+            ));
         }
 
         let mut bytes = Vec::<u8>::new();
