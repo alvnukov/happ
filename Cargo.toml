@@ -1,6 +1,6 @@
 [package]
 name = "happ"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "Rust CLI for import/inspect/diff/query workflows around helm-apps"
 homepage = "https://github.com/alvnukov/happ"
@@ -20,7 +20,10 @@ unsafe-libyaml = "0.2"
 base64 = "0.22"
 tempfile = "3"
 include_dir = "0.7"
-zq = { git = "https://github.com/alvnukov/zq", tag = "v1.0.0" }
+lsp-server = "0.7"
+lsp-types = "0.97"
+zq = { git = "https://github.com/alvnukov/zq", tag = "v1.2.1" }
+libc = "0.2"
 
 [dev-dependencies]
 pretty_assertions = "1"

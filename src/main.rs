@@ -5,6 +5,7 @@ mod composeinspect;
 mod convert;
 mod dyfflike;
 mod inspectweb;
+mod lsp;
 mod output;
 mod query;
 mod service;

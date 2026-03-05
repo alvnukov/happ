@@ -2,6 +2,8 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{generate, Shell};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use crate::cli::{Cli, Command};
 
@@ -13,6 +15,8 @@ pub enum Error {
     Output(#[from] crate::output::Error),
     #[error(transparent)]
     ComposeInspect(#[from] crate::composeinspect::Error),
+    #[error(transparent)]
+    Lsp(#[from] crate::lsp::Error),
     #[error("convert: {0}")]
     Convert(String),
     #[error("dyff differences found")]
@@ -30,18 +34,10 @@ pub fn run() -> Result<(), Error> {
 
 pub fn run_with(cli: Cli) -> Result<(), Error> {
     if cli.web && cli.command.is_none() {
-        let stdin_text = if std::io::stdin().is_terminal() {
-            None
+        let stdin_text = if cli.web_stdin {
+            read_stdin_to_eof()?
         } else {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|e| Error::Convert(format!("read stdin: {e}")))?;
-            if buf.trim().is_empty() {
-                None
-            } else {
-                Some(buf)
-            }
+            read_stdin_available_nonblocking()?
         };
         return crate::inspectweb::serve_tools(&cli.web_addr, cli.web_open_browser, stdin_text)
             .map_err(Error::Convert);
@@ -149,6 +145,7 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
             println!("OK");
             Ok(())
         }
+        Command::Lsp(args) => Ok(crate::lsp::run(args)?),
         Command::Completion(args) => {
             let shell = match args.shell.as_str() {
                 "bash" => Shell::Bash,
@@ -327,6 +324,72 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
             println!("{values_yaml}");
             Ok(())
         }
+    }
+}
+
+fn read_stdin_to_eof() -> Result<Option<String>, Error> {
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| Error::Convert(format!("read stdin: {e}")))?;
+    if buf.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(buf))
+    }
+}
+
+fn read_stdin_available_nonblocking() -> Result<Option<String>, Error> {
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        let stdin = std::io::stdin();
+        let fd = stdin.as_raw_fd();
+        let orig_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if orig_flags < 0 {
+            return Err(Error::Convert("read stdin: failed to get fd flags".to_string()));
+        }
+        let nonblocking_flags = orig_flags | libc::O_NONBLOCK;
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, nonblocking_flags) } < 0 {
+            return Err(Error::Convert("read stdin: failed to set O_NONBLOCK".to_string()));
+        }
+
+        let mut bytes = Vec::<u8>::new();
+        {
+            let mut handle = stdin.lock();
+            let mut chunk = [0_u8; 8192];
+            loop {
+                match handle.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(err) => {
+                        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags) };
+                        return Err(Error::Convert(format!("read stdin: {err}")));
+                    }
+                }
+            }
+        }
+
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags) };
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        if text.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(text))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
     }
 }
 
@@ -676,6 +739,7 @@ mod tests {
     fn dyff_fail_on_diff_returns_error() {
         let cli = Cli {
             web: false,
+            web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
             command: Some(Command::Dyff(DyffArgs {
@@ -861,6 +925,7 @@ mod tests {
     fn inspect_command_is_not_stubbed() {
         let cli = Cli {
             web: false,
+            web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
             command: Some(Command::Inspect(InspectArgs {
@@ -893,6 +958,7 @@ mod tests {
         fs::write(&p, "global:\n  env: dev\n").expect("write");
         let cli = Cli {
             web: false,
+            web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
             command: Some(Command::Validate(ValidateArgs {
@@ -913,6 +979,7 @@ mod tests {
         fs::write(&p, "global:\n  env: [dev\n").expect("write");
         let cli = Cli {
             web: false,
+            web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
             command: Some(Command::Validate(ValidateArgs {
@@ -932,6 +999,7 @@ mod tests {
         let out = td.path().join("happ.bash");
         let cli = Cli {
             web: false,
+            web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
             command: Some(Command::Completion(CompletionArgs {
@@ -1045,6 +1113,7 @@ mod tests {
     fn verify_equivalence_rejected_for_manifests_mode() {
         let cli = Cli {
             web: false,
+            web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
             command: Some(Command::Manifests(import_args_with_verify())),
@@ -1060,6 +1129,7 @@ mod tests {
     fn verify_equivalence_rejected_for_compose_mode() {
         let cli = Cli {
             web: false,
+            web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
             command: Some(Command::Compose(import_args_with_verify())),

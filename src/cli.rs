@@ -1,5 +1,9 @@
 use clap::{ArgAction, Parser, Subcommand};
 
+pub const DEFAULT_WEB_ADDR: &str = "127.0.0.1:18088";
+pub const DEFAULT_STUDIO_ADDR: &str = "127.0.0.1:18089";
+pub const DEFAULT_COMPOSE_STUDIO_ADDR: &str = "127.0.0.1:18090";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "happ",
@@ -9,9 +13,17 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false, action = ArgAction::SetTrue, help = "Start web utilities UI")]
     pub web: bool,
     #[arg(
+        long = "web-stdin",
+        global = true,
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        help = "Read stdin and pass it into --web mode (opt-in to avoid blocking on open pipes)"
+    )]
+    pub web_stdin: bool,
+    #[arg(
         long = "web-addr",
         global = true,
-        default_value = "127.0.0.1:8088",
+        default_value = DEFAULT_WEB_ADDR,
         help = "Address for --web mode"
     )]
     pub web_addr: String,
@@ -33,6 +45,7 @@ pub enum Command {
     Manifests(ImportArgs),
     Compose(ImportArgs),
     Validate(ValidateArgs),
+    Lsp(LspArgs),
     Completion(CompletionArgs),
     #[command(
         about = "Run jq-like query syntax on JSON or YAML input",
@@ -84,6 +97,24 @@ pub struct ValidateArgs {
 }
 
 #[derive(clap::Args, Debug, Clone)]
+pub struct LspArgs {
+    #[arg(
+        long,
+        default_value_t = true,
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Use stdio transport for Language Server Protocol"
+    )]
+    pub stdio: bool,
+    #[arg(
+        long = "parent-pid",
+        help = "Parent process PID to monitor; exit LSP when parent is gone"
+    )]
+    pub parent_pid: Option<u32>,
+}
+
+#[derive(clap::Args, Debug, Clone)]
 pub struct CompletionArgs {
     #[arg(
         long,
@@ -106,6 +137,43 @@ mod tests {
             .expect("parse validate");
         match cli.command.expect("command") {
             Command::Validate(args) => assert_eq!(args.values, "/tmp/values.yaml"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_lsp_subcommand() {
+        let cli = Cli::try_parse_from(["happ", "lsp", "--stdio=true"]).expect("parse lsp");
+        match cli.command.expect("command") {
+            Command::Lsp(args) => {
+                assert!(args.stdio);
+                assert_eq!(args.parent_pid, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_lsp_subcommand_with_flag_only() {
+        let cli = Cli::try_parse_from(["happ", "lsp", "--stdio"]).expect("parse lsp");
+        match cli.command.expect("command") {
+            Command::Lsp(args) => {
+                assert!(args.stdio);
+                assert_eq!(args.parent_pid, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_lsp_subcommand_with_parent_pid() {
+        let cli = Cli::try_parse_from(["happ", "lsp", "--parent-pid", "12345"])
+            .expect("parse lsp parent pid");
+        match cli.command.expect("command") {
+            Command::Lsp(args) => {
+                assert!(args.stdio);
+                assert_eq!(args.parent_pid, Some(12345));
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -314,6 +382,7 @@ mod tests {
         let cli = Cli::try_parse_from(["happ", "--web", "--web-addr", "127.0.0.1:9999"])
             .expect("parse web");
         assert!(cli.web);
+        assert!(!cli.web_stdin);
         assert_eq!(cli.web_addr, "127.0.0.1:9999");
         assert!(cli.web_open_browser);
         assert!(cli.command.is_none());
@@ -330,9 +399,26 @@ mod tests {
         ])
         .expect("parse web no open");
         assert!(cli.web);
+        assert!(!cli.web_stdin);
         assert_eq!(cli.web_addr, "127.0.0.1:9999");
         assert!(!cli.web_open_browser);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_top_level_web_mode_with_stdin_opt_in() {
+        let cli = Cli::try_parse_from(["happ", "--web", "--web-stdin"]).expect("parse web stdin");
+        assert!(cli.web);
+        assert!(cli.web_stdin);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn default_ports_for_web_and_studio_are_stable_and_distinct() {
+        let cli = Cli::try_parse_from(["happ"]).expect("parse defaults");
+        assert_eq!(cli.web_addr, DEFAULT_WEB_ADDR);
+        assert_ne!(DEFAULT_WEB_ADDR, DEFAULT_STUDIO_ADDR);
+        assert_ne!(DEFAULT_STUDIO_ADDR, DEFAULT_COMPOSE_STUDIO_ADDR);
     }
 
     #[test]
@@ -433,7 +519,7 @@ pub struct InspectArgs {
     pub include_crds: bool,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub web: bool,
-    #[arg(long, default_value = "127.0.0.1:8088")]
+    #[arg(long, default_value = DEFAULT_STUDIO_ADDR)]
     pub addr: String,
 }
 
@@ -447,7 +533,7 @@ pub struct ComposeInspectArgs {
     pub output: Option<String>,
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     pub web: bool,
-    #[arg(long, default_value = "127.0.0.1:8089")]
+    #[arg(long, default_value = DEFAULT_COMPOSE_STUDIO_ADDR)]
     pub addr: String,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub open_browser: bool,

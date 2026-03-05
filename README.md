@@ -173,6 +173,21 @@ use happ
 happ --web --web-open-browser=false
 ```
 
+## LSP mode (experimental)
+
+`happ` provides an experimental Language Server entrypoint:
+
+```bash
+happ lsp --stdio=true
+```
+
+Current status:
+
+- LSP handshake and lifecycle (`initialize` / `shutdown` / `exit`) are implemented.
+- Incremental document state and publish diagnostics are implemented for helm-apps include checks.
+- Custom method `happ/resolveEntity` is available (server-side include/env resolution payload for IDE features).
+- Full helm-apps language feature parity is still in progress (`experimental.helmAppsFullLanguageFeatures=false`).
+
 ## Parity Matrix (CLI contracts)
 
 Core CLI behavior is pinned by integration parity tests.

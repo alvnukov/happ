@@ -118,19 +118,24 @@ jobs:
         include:
           - runner: ubuntu-latest
             asset_name: happ_linux_amd64
-            binary_path: target/release/happ
+            binary_path: target/x86_64-unknown-linux-musl/release/happ
+            rust_target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             asset_name: happ_linux_arm64
-            binary_path: target/release/happ
+            binary_path: target/aarch64-unknown-linux-musl/release/happ
+            rust_target: aarch64-unknown-linux-musl
           - runner: macos-15-intel
             asset_name: happ_darwin_amd64
             binary_path: target/release/happ
+            rust_target: ""
           - runner: macos-14
             asset_name: happ_darwin_arm64
             binary_path: target/release/happ
+            rust_target: ""
           - runner: windows-latest
             asset_name: happ_windows_amd64.exe
             binary_path: target/release/happ.exe
+            rust_target: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -140,14 +145,30 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup musl toolchain (Linux static build)
+        if: ${{ matrix.rust_target != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add "${{ matrix.rust_target }}"
+
       - name: Build happ binary
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --locked
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            cargo build --release --locked --target "${{ matrix.rust_target }}"
+          else
+            cargo build --release --locked
+          fi
           mkdir -p dist
           cp "${{ matrix.binary_path }}" "dist/${{ matrix.asset_name }}"
           test -s "dist/${{ matrix.asset_name }}"
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            file "dist/${{ matrix.asset_name }}" | grep -Eqi "statically linked|static-pie linked"
+          fi
 
       - name: Upload platform artifact
         uses: actions/upload-artifact@v4
@@ -164,9 +185,11 @@ jobs:
           - runner: ubuntu-latest
             deb_arch: amd64
             rpm_arch: x86_64
+            rust_target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             deb_arch: arm64
             rpm_arch: aarch64
+            rust_target: aarch64-unknown-linux-musl
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -179,12 +202,18 @@ jobs:
       - name: Install packaging tools
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add "${{ matrix.rust_target }}"
           cargo install --locked cargo-deb cargo-generate-rpm
 
-      - name: Build happ binary (release)
+      - name: Build happ binary (static Linux)
         run: |
           set -euo pipefail
-          cargo build --release --locked
+          cargo build --release --locked --target "${{ matrix.rust_target }}"
+          mkdir -p target/release
+          cp "target/${{ matrix.rust_target }}/release/happ" "target/release/happ"
+          file target/release/happ | grep -Eqi "statically linked|static-pie linked"
 
       - name: Build .deb and .rpm packages
         shell: bash
