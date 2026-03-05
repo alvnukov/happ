@@ -1522,8 +1522,24 @@ fn eval_command_token_value(
     if let Some(inner) = strip_outer_parens(token) {
         return eval_pipeline_expr(action, inner, root, dot, state, resolver);
     }
+    if looks_like_numeric_literal(token) && parse_number_value(token).is_none() {
+        return Err(NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: format!("illegal number syntax: {token}"),
+        });
+    }
     ensure_variable_is_defined(token, state)?;
     Ok(eval_simple_expr_value(token, root, dot, state))
+}
+
+fn looks_like_numeric_literal(expr: &str) -> bool {
+    let body = expr
+        .strip_prefix('+')
+        .or_else(|| expr.strip_prefix('-'))
+        .unwrap_or(expr);
+    body.as_bytes()
+        .first()
+        .is_some_and(|ch| ch.is_ascii_digit())
 }
 
 fn ensure_variable_is_defined(expr: &str, state: &EvalState) -> Result<(), NativeRenderError> {
@@ -2956,6 +2972,9 @@ fn split_first_segment(path: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_number_value(expr: &str) -> Option<Value> {
+    if !has_valid_go_numeric_underscores(expr) {
+        return None;
+    }
     let compact = expr.replace('_', "");
     if compact.is_empty() {
         return None;
@@ -3011,6 +3030,68 @@ fn parse_number_value(expr: &str) -> Option<Value> {
         return Number::from_f64(v).map(Value::Number);
     }
     None
+}
+
+fn has_valid_go_numeric_underscores(expr: &str) -> bool {
+    if !expr.contains('_') {
+        return true;
+    }
+    let body = expr
+        .strip_prefix('+')
+        .or_else(|| expr.strip_prefix('-'))
+        .unwrap_or(expr);
+    if body.is_empty() || body.starts_with('_') || body.ends_with('_') {
+        return false;
+    }
+
+    let base = if body.starts_with("0b") || body.starts_with("0B") {
+        2u32
+    } else if body.starts_with("0o") || body.starts_with("0O") {
+        8u32
+    } else if body.starts_with("0x") || body.starts_with("0X") {
+        16u32
+    } else {
+        10u32
+    };
+
+    let bytes = body.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] != b'_' {
+            continue;
+        }
+        if i == 0 || i + 1 >= bytes.len() {
+            return false;
+        }
+        let prev = bytes[i - 1] as char;
+        let next = bytes[i + 1] as char;
+
+        let is_after_prefix = i == 2
+            && matches!(
+                &body[..2],
+                "0b" | "0B" | "0o" | "0O" | "0x" | "0X"
+            );
+        if is_after_prefix {
+            if !is_digit_for_base(next, base) {
+                return false;
+            }
+            continue;
+        }
+
+        if !(is_digit_for_base(prev, base) && is_digit_for_base(next, base)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_digit_for_base(ch: char, base: u32) -> bool {
+    match base {
+        2 => matches!(ch, '0' | '1'),
+        8 => matches!(ch, '0'..='7'),
+        10 => ch.is_ascii_digit(),
+        16 => ch.is_ascii_hexdigit(),
+        _ => false,
+    }
 }
 
 fn parse_go_integer_literal(body: &str) -> Option<u128> {
@@ -3644,6 +3725,15 @@ mod tests {
         assert_eq!(out, "9786");
         let out = render_template_native("{{print '\\U0001F600'}}", &data).expect("must render");
         assert_eq!(out, "128512");
+    }
+
+    #[test]
+    fn native_renderer_validates_go_number_underscore_syntax() {
+        let data = json!({});
+        let out = render_template_native("{{print 0x_10}}", &data).expect("must render");
+        assert_eq!(out, "16");
+        assert!(render_template_native("{{print 1__2}}", &data).is_err());
+        assert!(render_template_native("{{print 12_}}", &data).is_err());
     }
 
     #[test]
