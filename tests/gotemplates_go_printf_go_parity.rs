@@ -84,6 +84,26 @@ fn compat_go_printf_matches_go_fmt_subset_from_source_tests() {
             args: vec![Arg::Str("abc")],
         },
         Case {
+            source_line: 218,
+            fmt: "%10q",
+            args: vec![Arg::Str("⌘")],
+        },
+        Case {
+            source_line: 220,
+            fmt: "%-10q",
+            args: vec![Arg::Str("⌘")],
+        },
+        Case {
+            source_line: 222,
+            fmt: "%010q",
+            args: vec![Arg::Str("⌘")],
+        },
+        Case {
+            source_line: 208,
+            fmt: "%+q",
+            args: vec![Arg::Str("日本語")],
+        },
+        Case {
             source_line: 193,
             fmt: "%#q",
             args: vec![Arg::Str("")],
@@ -132,6 +152,21 @@ fn compat_go_printf_matches_go_fmt_subset_from_source_tests() {
             source_line: 340,
             fmt: "%d",
             args: vec![Arg::Int(-12345)],
+        },
+        Case {
+            source_line: 635,
+            fmt: "%20.5s",
+            args: vec![Arg::Str("qwertyuiop")],
+        },
+        Case {
+            source_line: 636,
+            fmt: "%.5s",
+            args: vec![Arg::Str("qwertyuiop")],
+        },
+        Case {
+            source_line: 637,
+            fmt: "%-20.5s",
+            args: vec![Arg::Str("qwertyuiop")],
         },
         Case {
             source_line: 603,

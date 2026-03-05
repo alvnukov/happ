@@ -157,6 +157,7 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
         let verb = bytes[i] as char;
         i += 1;
         let (width, zero_pad, precision) = parse_width_zero_precision(spec_flags);
+        let left_align = spec_flags.contains('-');
         let plus_flag = spec_flags.contains('+');
         let space_flag = !plus_flag && spec_flags.contains(' ');
         let alt_flag = spec_flags.contains('#');
@@ -167,29 +168,57 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
         argi += 1;
 
         match verb {
-            'v' | 's' => out.push_str(&format_value_for_printf(arg, verb)),
-            'T' => out.push_str(&format_type_for_printf(arg)),
-            'q' => {
-                if alt_flag {
-                    if let Some(Value::String(s)) = arg.as_ref() {
-                        if can_backquote_string(s) {
-                            out.push('`');
-                            out.push_str(s);
-                            out.push('`');
-                        } else {
-                            out.push_str(&format!("{s:?}"));
-                        }
-                        continue;
+            'v' | 's' => {
+                let mut rendered = format_value_for_printf(arg, verb);
+                if verb == 's' {
+                    if let Some(prec) = precision {
+                        rendered = truncate_runes(&rendered, prec);
                     }
                 }
-                let rendered = format_value_for_printf(arg, 's');
-                out.push_str(&format!("{rendered:?}"));
+                push_with_width(&mut out, &rendered, width, zero_pad, left_align);
+            }
+            'T' => {
+                let rendered = format_type_for_printf(arg);
+                push_with_width(&mut out, &rendered, width, zero_pad, left_align);
+            }
+            'q' => {
+                let rendered = if alt_flag {
+                    if let Some(Value::String(s)) = arg.as_ref() {
+                        if can_backquote_string(s) {
+                            let mut raw = String::with_capacity(s.len() + 2);
+                            raw.push('`');
+                            raw.push_str(s);
+                            raw.push('`');
+                            raw
+                        } else {
+                            format!("{s:?}")
+                        }
+                    } else {
+                        let text = format_value_for_printf(arg, 's');
+                        format!("{text:?}")
+                    }
+                } else if plus_flag {
+                    if let Some(Value::String(s)) = arg.as_ref() {
+                        quote_string_ascii_go(s)
+                    } else {
+                        let text = format_value_for_printf(arg, 's');
+                        quote_string_ascii_go(&text)
+                    }
+                } else {
+                    let text = format_value_for_printf(arg, 's');
+                    format!("{text:?}")
+                };
+                if alt_flag {
+                    push_with_width(&mut out, &rendered, width, zero_pad, left_align);
+                    continue;
+                }
+                push_with_width(&mut out, &rendered, width, zero_pad, left_align);
             }
             'd' => {
                 if let Some(n) = value_to_i64(arg) {
                     let rendered =
                         apply_printf_sign_flags(n.to_string(), n >= 0, plus_flag, space_flag);
-                    push_with_width(&mut out, &rendered, width, zero_pad);
+                    push_with_width(&mut out, &rendered, width, zero_pad, left_align);
                 } else {
                     out.push_str(&format_printf_mismatch(verb, arg));
                 }
@@ -202,7 +231,7 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
                         plus_flag,
                         space_flag,
                     );
-                    push_with_width(&mut out, &rendered, width, zero_pad);
+                    push_with_width(&mut out, &rendered, width, zero_pad, left_align);
                 } else {
                     out.push_str(&format_printf_mismatch(verb, arg));
                 }
@@ -235,14 +264,15 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
                         plus_flag,
                         space_flag,
                     );
-                    push_with_width(&mut out, &rendered, width, zero_pad);
+                    push_with_width(&mut out, &rendered, width, zero_pad, left_align);
                 } else {
                     out.push_str(&format_printf_mismatch(verb, arg));
                 }
             }
             't' => {
                 if let Some(b) = value_to_bool(arg) {
-                    out.push_str(&b.to_string());
+                    let rendered = b.to_string();
+                    push_with_width(&mut out, &rendered, width, zero_pad, left_align);
                 } else {
                     out.push_str(&format_printf_mismatch(verb, arg));
                 }
@@ -500,17 +530,31 @@ fn can_backquote_string(s: &str) -> bool {
     s.chars().all(|ch| ch == '\t' || !ch.is_control())
 }
 
-fn push_with_width(out: &mut String, rendered: &str, width: Option<usize>, zero_pad: bool) {
+fn push_with_width(
+    out: &mut String,
+    rendered: &str,
+    width: Option<usize>,
+    zero_pad: bool,
+    left_align: bool,
+) {
     let Some(width) = width else {
         out.push_str(rendered);
         return;
     };
-    if rendered.len() >= width {
+    let rendered_width = rendered.chars().count();
+    if rendered_width >= width {
         out.push_str(rendered);
         return;
     }
-    let pad_len = width - rendered.len();
-    let pad_ch = if zero_pad { '0' } else { ' ' };
+    let pad_len = width - rendered_width;
+    let pad_ch = if zero_pad && !left_align { '0' } else { ' ' };
+    if left_align {
+        out.push_str(rendered);
+        for _ in 0..pad_len {
+            out.push(' ');
+        }
+        return;
+    }
     if zero_pad && rendered.starts_with(['-', '+', ' ']) {
         let mut chars = rendered.chars();
         let sign = chars.next().unwrap_or_default();
@@ -525,6 +569,51 @@ fn push_with_width(out: &mut String, rendered: &str, width: Option<usize>, zero_
         out.push(pad_ch);
     }
     out.push_str(rendered);
+}
+
+fn truncate_runes(s: &str, max_runes: usize) -> String {
+    if max_runes == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (idx, ch) in s.chars().enumerate() {
+        if idx >= max_runes {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn quote_string_ascii_go(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\u{0007}' => out.push_str("\\a"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{000B}' => out.push_str("\\v"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            ch if ch.is_ascii_graphic() || ch == ' ' => out.push(ch),
+            ch => {
+                let code = ch as u32;
+                if code <= 0xFFFF {
+                    out.push_str("\\u");
+                    out.push_str(&format!("{code:04x}"));
+                } else {
+                    out.push_str("\\U");
+                    out.push_str(&format!("{code:08x}"));
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn apply_printf_sign_flags(
@@ -871,5 +960,34 @@ mod tests {
         assert_eq!(parse_char_constant("'\\x41'"), Some(65));
         assert_eq!(parse_char_constant("'\\u263A'"), Some(9786));
         assert_eq!(parse_char_constant("'\\400'"), None);
+    }
+
+    #[test]
+    fn go_printf_plus_q_uses_ascii_escapes() {
+        let args = vec![Some(Value::String("日本語".to_string()))];
+        let out = go_printf("%+q", &args).expect("must render");
+        assert_eq!(out, "\"\\u65e5\\u672c\\u8a9e\"");
+    }
+
+    #[test]
+    fn go_printf_supports_width_and_left_align_for_q() {
+        let args = vec![Some(Value::String("⌘".to_string()))];
+        let out = go_printf("%10q", &args).expect("must render");
+        assert_eq!(out, "       \"⌘\"");
+        let out = go_printf("%-10q", &args).expect("must render");
+        assert_eq!(out, "\"⌘\"       ");
+        let out = go_printf("%010q", &args).expect("must render");
+        assert_eq!(out, "0000000\"⌘\"");
+    }
+
+    #[test]
+    fn go_printf_applies_rune_precision_for_s() {
+        let args = vec![Some(Value::String("абв".to_string()))];
+        let out = go_printf("%.2s", &args).expect("must render");
+        assert_eq!(out, "аб");
+        let out = go_printf("%5.2s", &args).expect("must render");
+        assert_eq!(out, "   аб");
+        let out = go_printf("%-5.2s", &args).expect("must render");
+        assert_eq!(out, "аб   ");
     }
 }
