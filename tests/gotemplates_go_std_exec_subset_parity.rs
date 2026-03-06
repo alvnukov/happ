@@ -175,6 +175,8 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{.MSI.missing 2}}",
         "{{$m := .MSI}}{{$m.one 2}}",
         "{{$m := .MSI}}{{$m.missing 2}}",
+        "{{$m := .MSI}}{{1 | $m.one}}",
+        "{{$x := 1}}{{$x.y 2}}",
         "{{and}}",
         "{{or}}",
         "{{not}}",

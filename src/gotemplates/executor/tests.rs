@@ -557,6 +557,10 @@ fn native_renderer_reports_field_invocation_argument_errors_like_go() {
             "{{.a.b 2}}",
             "b is not a method but has arguments",
         ),
+        (
+            "{{$m := .m}}{{1 | $m.a}}",
+            "a is not a method but has arguments",
+        ),
     ] {
         let err = render_template_native(src, &data).expect_err("must fail");
         match err {
@@ -610,6 +614,15 @@ fn native_renderer_field_invocation_on_slices_keeps_field_type_errors() {
     match err {
         NativeRenderError::UnsupportedAction { reason, .. } => {
             assert!(reason.contains("can't evaluate field x in type []int"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let data = json!({});
+    let err = render_template_native("{{$x := 1}}{{$x.y 2}}", &data).expect_err("must fail");
+    match err {
+        NativeRenderError::UnsupportedAction { reason, .. } => {
+            assert!(reason.contains("can't evaluate field y in type int"));
         }
         other => panic!("unexpected error: {other:?}"),
     }
