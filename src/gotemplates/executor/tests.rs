@@ -533,7 +533,7 @@ fn native_renderer_preserves_non_executable_pipeline_stage_errors_like_go_parse(
 
 #[test]
 fn native_renderer_reports_field_invocation_argument_errors_like_go() {
-    let data = json!({"x": 7, "m": {"a": 1}});
+    let data = json!({"x": 7, "m": {"a": 1}, "a": {}});
     for (src, want) in [
         ("{{.x 2}}", "x is not a method but has arguments"),
         (
@@ -541,6 +541,10 @@ fn native_renderer_reports_field_invocation_argument_errors_like_go() {
             "a is not a method but has arguments",
         ),
         ("{{1 | .x}}", "x is not a method but has arguments"),
+        (
+            "{{.a.b 2}}",
+            "b is not a method but has arguments",
+        ),
     ] {
         let err = render_template_native(src, &data).expect_err("must fail");
         match err {
@@ -559,6 +563,44 @@ fn native_renderer_allows_field_with_args_when_dot_is_nil_like_go() {
     assert_eq!(out, "<no value>");
     let out = render_template_native("{{1 | .x}}", &data).expect("must render");
     assert_eq!(out, "<no value>");
+
+    let data = json!({});
+    let out = render_template_native("{{.x 2}}", &data).expect("must render");
+    assert_eq!(out, "<no value>");
+    let out = render_template_native("{{.a.b 2}}", &data).expect("must render");
+    assert_eq!(out, "<no value>");
+}
+
+#[test]
+fn native_renderer_field_invocation_on_slices_keeps_field_type_errors() {
+    let data = json!({"arr": [1, 2, 3]});
+    let err = render_template_native("{{.arr.x 2}}", &data).expect_err("must fail");
+    match err {
+        NativeRenderError::UnsupportedAction { reason, .. } => {
+            assert!(reason.contains("can't evaluate field x in type []interface {}"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "arr".to_string(),
+        crate::gotemplates::encode_go_typed_slice_value(
+            "int",
+            Some(vec![
+                Value::Number(Number::from(1)),
+                Value::Number(Number::from(2)),
+            ]),
+        ),
+    );
+    let data = Value::Object(root);
+    let err = render_template_native("{{.arr.x 2}}", &data).expect_err("must fail");
+    match err {
+        NativeRenderError::UnsupportedAction { reason, .. } => {
+            assert!(reason.contains("can't evaluate field x in type []int"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]

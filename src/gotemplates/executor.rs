@@ -1343,14 +1343,37 @@ fn eval_pipeline_command(
                 reason: format!("can't give argument to non-function {target}"),
             });
         }
-        if let Some(field_name) = command_field_like_final_segment(head) {
-            let value = eval_command_token_value(action, head, root, dot, state, resolver)?;
-            if value.is_none() {
+        if let Some(field_path) = command_field_like_path(head) {
+            let receiver = eval_command_token_value(
+                action,
+                &field_path.receiver_expr,
+                root,
+                dot,
+                state,
+                resolver,
+            )?;
+            let Some(receiver) = receiver else {
+                return Ok(None);
+            };
+            if receiver == Value::Null {
                 return Ok(None);
             }
+            if is_map_like_for_field_call(&receiver) {
+                return Err(NativeRenderError::UnsupportedAction {
+                    action: action.to_string(),
+                    reason: format!(
+                        "{} is not a method but has arguments",
+                        field_path.field_name
+                    ),
+                });
+            }
+            let _ = eval_command_token_value(action, head, root, dot, state, resolver)?;
             return Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: format!("{field_name} is not a method but has arguments"),
+                reason: format!(
+                    "{} is not a method but has arguments",
+                    field_path.field_name
+                ),
             });
         }
     }
@@ -1416,18 +1439,23 @@ fn non_function_command_target(token: &str) -> Option<String> {
     None
 }
 
-fn command_field_like_final_segment(token: &str) -> Option<String> {
+struct FieldLikeCommandPath {
+    receiver_expr: String,
+    field_name: String,
+}
+
+fn command_field_like_path(token: &str) -> Option<FieldLikeCommandPath> {
     let trimmed = token.trim();
     if trimmed.is_empty() || strip_outer_parens(trimmed).is_some() {
         return None;
     }
 
-    let path = if let Some(rest) = trimmed.strip_prefix("$.") {
-        rest
+    let (base, path) = if let Some(rest) = trimmed.strip_prefix("$.") {
+        (FieldPathBase::Root, rest)
     } else if let Some(rest) = trimmed.strip_prefix('.') {
-        rest
-    } else if let Some((_, rest)) = split_variable_reference(trimmed) {
-        rest
+        (FieldPathBase::Dot, rest)
+    } else if let Some((name, rest)) = split_variable_reference(trimmed) {
+        (FieldPathBase::Var(name.to_string()), rest)
     } else {
         return None;
     };
@@ -1436,18 +1464,65 @@ fn command_field_like_final_segment(token: &str) -> Option<String> {
         return None;
     }
 
-    let mut last: Option<&str> = None;
+    let mut segments = Vec::new();
     for segment in path.split('.') {
         if segment.is_empty() || !segment.chars().all(is_field_path_segment_char) {
             return None;
         }
-        last = Some(segment);
+        segments.push(segment.to_string());
     }
-    last.map(ToString::to_string)
+
+    if segments.is_empty() {
+        return None;
+    }
+
+    let field_name = segments.last()?.clone();
+    let receiver_expr = build_field_receiver_expr(base, &segments)?;
+    Some(FieldLikeCommandPath {
+        receiver_expr,
+        field_name,
+    })
+}
+
+#[derive(Debug, Clone)]
+enum FieldPathBase {
+    Dot,
+    Root,
+    Var(String),
+}
+
+fn build_field_receiver_expr(base: FieldPathBase, segments: &[String]) -> Option<String> {
+    if segments.is_empty() {
+        return None;
+    }
+    if segments.len() == 1 {
+        return Some(match base {
+            FieldPathBase::Dot => ".".to_string(),
+            FieldPathBase::Root => "$".to_string(),
+            FieldPathBase::Var(name) => name,
+        });
+    }
+    let prefix = match base {
+        FieldPathBase::Dot => ".".to_string(),
+        FieldPathBase::Root => "$.".to_string(),
+        FieldPathBase::Var(name) => format!("{name}."),
+    };
+    let tail = segments[..segments.len() - 1].join(".");
+    Some(format!("{prefix}{tail}"))
 }
 
 fn is_field_path_segment_char(ch: char) -> bool {
     is_identifier_continue_char(ch) || ch == '-'
+}
+
+fn is_map_like_for_field_call(v: &Value) -> bool {
+    if go_bytes_len(v).is_some()
+        || go_string_bytes_len(v).is_some()
+        || decode_go_typed_slice_value(v).is_some()
+    {
+        return false;
+    }
+    decode_go_typed_map_value(v).is_some() || matches!(v, Value::Object(_))
 }
 
 fn eval_short_circuit_builtin(

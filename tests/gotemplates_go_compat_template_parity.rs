@@ -149,6 +149,24 @@ fn go_compat_template_api_matches_go_text_template_subset() {
             data: json!({"x": 7}),
         },
         Case {
+            src: r#"{{define "main"}}{{.x 2}}{{end}}"#,
+            name: "main",
+            option: None,
+            data: json!({}),
+        },
+        Case {
+            src: r#"{{define "main"}}{{.a.b 2}}{{end}}"#,
+            name: "main",
+            option: None,
+            data: json!({"a": {}}),
+        },
+        Case {
+            src: r#"{{define "main"}}{{.a.b 2}}{{end}}"#,
+            name: "main",
+            option: None,
+            data: json!({}),
+        },
+        Case {
             src: r#"{{define "main"}}{{$m := .m}}{{$m.a 2}}{{end}}"#,
             name: "main",
             option: None,
