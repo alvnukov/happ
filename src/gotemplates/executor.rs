@@ -15,6 +15,7 @@ mod compare;
 mod call;
 mod commandkind;
 mod exprkind;
+mod externalfn;
 mod govaluefmt;
 mod path;
 mod pipeline_decl;
@@ -32,6 +33,7 @@ use commandkind::{
 use exprkind::{
     decode_string_literal, is_complex_expression, is_niladic_function_expression, is_quoted_string,
 };
+use externalfn::{try_eval_dynamic_external_function, try_eval_external_function};
 use govaluefmt::format_value_like_go;
 use path::{
     is_identifier_continue_char, is_identifier_start_char, resolve_simple_path,
@@ -1379,104 +1381,6 @@ fn eval_short_circuit_builtin(
     }
 
     Ok(last)
-}
-
-fn try_eval_external_function(
-    action: &str,
-    name: &str,
-    arg_tokens: &[String],
-    root: &Value,
-    dot: &Value,
-    has_pipe_input: bool,
-    pipe_input: Option<Value>,
-    state: &mut EvalState,
-    resolver: Option<&dyn NativeFunctionResolver>,
-) -> Result<Option<Option<Value>>, NativeRenderError> {
-    let Some(resolver) = resolver else {
-        return Ok(None);
-    };
-    if !is_identifier_name(name) {
-        return Ok(None);
-    }
-
-    let mut args = Vec::with_capacity(arg_tokens.len() + usize::from(has_pipe_input));
-    for token in arg_tokens {
-        args.push(eval_command_token_value(
-            action,
-            token,
-            root,
-            dot,
-            state,
-            Some(resolver),
-        )?);
-    }
-    if has_pipe_input {
-        args.push(pipe_input);
-    }
-
-    match resolver.call(name, &args) {
-        Ok(v) => Ok(Some(v)),
-        Err(NativeFunctionResolverError::UnknownFunction) => Ok(None),
-        Err(NativeFunctionResolverError::Failed { reason }) => {
-            Err(NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: format!("error calling {name}: {reason}"),
-            })
-        }
-    }
-}
-
-fn try_eval_dynamic_external_function(
-    action: &str,
-    tokens: &[String],
-    root: &Value,
-    dot: &Value,
-    has_pipe_input: bool,
-    pipe_input: Option<Value>,
-    state: &mut EvalState,
-    resolver: Option<&dyn NativeFunctionResolver>,
-) -> Result<Option<Option<Value>>, NativeRenderError> {
-    let Some(resolver) = resolver else {
-        return Ok(None);
-    };
-    if tokens.is_empty() || is_identifier_name(&tokens[0]) {
-        return Ok(None);
-    }
-
-    let Some(Value::String(fn_name)) =
-        eval_command_token_value(action, &tokens[0], root, dot, state, Some(resolver))?
-    else {
-        return Ok(None);
-    };
-    if !is_identifier_name(&fn_name) {
-        return Ok(None);
-    }
-
-    let mut args = Vec::with_capacity(tokens.len().saturating_sub(1) + usize::from(has_pipe_input));
-    for token in tokens.iter().skip(1) {
-        args.push(eval_command_token_value(
-            action,
-            token,
-            root,
-            dot,
-            state,
-            Some(resolver),
-        )?);
-    }
-    if has_pipe_input {
-        args.push(pipe_input);
-    }
-
-    match resolver.call(&fn_name, &args) {
-        Ok(v) => Ok(Some(v)),
-        Err(NativeFunctionResolverError::UnknownFunction) => Ok(None),
-        Err(NativeFunctionResolverError::Failed { reason }) => {
-            Err(NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: format!("error calling {fn_name}: {reason}"),
-            })
-        }
-    }
 }
 
 pub(super) fn is_identifier_name(name: &str) -> bool {
