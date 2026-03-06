@@ -432,6 +432,19 @@ fn native_renderer_reports_cannot_evaluate_field_on_slice_like_go() {
 }
 
 #[test]
+fn native_renderer_slice_preserves_nil_for_typed_go_bytes() {
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "b".to_string(),
+        crate::gotemplates::encode_go_nil_bytes_value(),
+    );
+    let root = Value::Object(root);
+
+    let out = render_template_native(r#"{{printf "%#v" (slice .b)}}"#, &root).expect("must render");
+    assert_eq!(out, "[]byte(nil)");
+}
+
+#[test]
 fn native_renderer_eq_reports_non_comparable_like_go_text_template() {
     let mut m = serde_json::Map::new();
     m.insert(

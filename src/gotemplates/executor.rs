@@ -2,9 +2,9 @@ use super::{
     compat, parse_template_tokens_strict_with_options,
     typedvalue::{
         decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
-        decode_go_typed_slice_value, encode_go_bytes_value, encode_go_string_bytes_value,
-        encode_go_typed_slice_value, go_bytes_get, go_bytes_len, go_string_bytes_get,
-        go_string_bytes_len, go_zero_value_for_type,
+        decode_go_typed_slice_value, encode_go_bytes_value, encode_go_nil_bytes_value,
+        encode_go_string_bytes_value, encode_go_typed_slice_value, go_bytes_get, go_bytes_is_nil,
+        go_bytes_len, go_string_bytes_get, go_string_bytes_len, go_zero_value_for_type,
     },
     GoTemplateScanError, GoTemplateToken, ParseCompatOptions, HELM_INCLUDE_RECURSION_MAX_REFS,
 };
@@ -1974,6 +1974,7 @@ fn builtin_slice(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
         })?;
 
     if let Some(bytes) = decode_go_bytes_value(item) {
+        let was_nil_bytes = go_bytes_is_nil(item);
         let cap = bytes.len();
         let len = bytes.len();
         let mut idx = [0usize, len, cap];
@@ -1990,6 +1991,9 @@ fn builtin_slice(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
             });
         }
         if args.len() < 4 {
+            if was_nil_bytes && idx[0] == 0 && idx[1] == 0 {
+                return Ok(Some(encode_go_nil_bytes_value()));
+            }
             return Ok(Some(encode_go_bytes_value(&bytes[idx[0]..idx[1]])));
         }
         if idx[1] > idx[2] {
@@ -2000,6 +2004,9 @@ fn builtin_slice(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
                     idx[1], idx[2]
                 ),
             });
+        }
+        if was_nil_bytes && idx[0] == 0 && idx[1] == 0 {
+            return Ok(Some(encode_go_nil_bytes_value()));
         }
         return Ok(Some(encode_go_bytes_value(&bytes[idx[0]..idx[1]])));
     }

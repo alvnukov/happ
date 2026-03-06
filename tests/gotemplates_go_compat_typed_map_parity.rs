@@ -135,6 +135,11 @@ fn go_compat_typed_map_semantics_match_go_subset() {
             option: Some("missingkey=default"),
         },
         Case {
+            src: r#"{{define "main"}}{{printf "%#v" (slice .m.missing)}}{{end}}"#,
+            kind: "map_string_bytes_non_nil",
+            option: Some("missingkey=zero"),
+        },
+        Case {
             src: r#"{{define "main"}}{{printf "%#v|%T|%v" .m.missing .m.missing .m.missing}}{{end}}"#,
             kind: "map_string_slice_int_non_nil",
             option: Some("missingkey=zero"),
