@@ -509,6 +509,18 @@ fn native_renderer_reports_non_function_commands_like_go() {
 }
 
 #[test]
+fn native_renderer_reports_unknown_identifier_in_pipeline_as_undefined_function() {
+    let data = json!({});
+    let err = render_template_native("{{1 | unknownFn}}", &data).expect_err("must fail");
+    match err {
+        NativeRenderError::UnsupportedAction { reason, .. } => {
+            assert!(reason.contains("\"unknownFn\" is not a defined function"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn native_renderer_preserves_non_executable_pipeline_stage_errors_like_go_parse() {
     let data = json!({});
     for src in ["{{1 | nil}}", "{{1 | \"x\"}}", "{{1 | .}}", "{{1 | true}}"] {
@@ -516,13 +528,13 @@ fn native_renderer_preserves_non_executable_pipeline_stage_errors_like_go_parse(
         match err {
             NativeRenderError::Parse(parse) => {
                 assert!(
-                    parse.message.contains("non executable command in pipeline stage"),
+                    parse.message.contains("non executable command in pipeline stage 2"),
                     "src={src} parse={parse:?}"
                 );
             }
             NativeRenderError::UnsupportedAction { reason, .. } => {
                 assert!(
-                    reason.contains("non executable command in pipeline stage"),
+                    reason.contains("non executable command in pipeline stage 2"),
                     "src={src} reason={reason}"
                 );
             }

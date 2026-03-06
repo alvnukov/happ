@@ -143,3 +143,34 @@ fn parser_rejects_multi_decl_outside_range() {
     .expect_err("must fail");
     assert_eq!(err.code, "too_many_declarations");
 }
+
+#[test]
+fn parser_reports_non_executable_pipeline_stage_number_like_go() {
+    let err = parse_action_compat_with_options(
+        "{{ 1 | nil }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: true,
+            known_functions: &[],
+            check_variables: false,
+            visible_variables: &[],
+        },
+    )
+    .expect_err("must fail");
+    assert_eq!(err.code, "non_executable_command_in_pipeline");
+    assert!(err.message.contains("non executable command in pipeline stage 2"));
+
+    let err = parse_action_compat_with_options(
+        "{{ 1 | print | nil }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: true,
+            known_functions: &[],
+            check_variables: false,
+            visible_variables: &[],
+        },
+    )
+    .expect_err("must fail");
+    assert_eq!(err.code, "non_executable_command_in_pipeline");
+    assert!(err.message.contains("non executable command in pipeline stage 3"));
+}

@@ -409,7 +409,10 @@ impl<'a> Parser<'a> {
                 {
                     return Err(GoTemplateScanError {
                         code: "non_executable_command_in_pipeline",
-                        message: "non executable command in pipeline stage",
+                        message: format!(
+                            "non executable command in pipeline stage {}",
+                            stage
+                        ),
                         offset: self.current_offset_for_stage(stage),
                     });
                 }

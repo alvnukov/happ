@@ -1225,7 +1225,7 @@ fn eval_pipeline_expr(
     }
     let mut pipe: Option<Value> = None;
     for (idx, command) in commands.iter().enumerate() {
-        pipe = eval_pipeline_command(action, command, root, dot, idx > 0, pipe, state, resolver)?;
+        pipe = eval_pipeline_command(action, command, root, dot, idx + 1, pipe, state, resolver)?;
     }
     if let Some(d) = decl {
         let Some(name) = d.names.first() else {
@@ -1248,11 +1248,12 @@ fn eval_pipeline_command(
     command: &str,
     root: &Value,
     dot: &Value,
-    has_pipe_input: bool,
+    pipeline_stage: usize,
     pipe_input: Option<Value>,
     state: &mut EvalState,
     resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<Option<Value>, NativeRenderError> {
+    let has_pipe_input = pipeline_stage > 1;
     let tokens = split_command_tokens(command);
     if tokens.is_empty() {
         return Err(NativeRenderError::UnsupportedAction {
@@ -1332,7 +1333,7 @@ fn eval_pipeline_command(
     if has_pipe_input && is_non_executable_pipeline_head(head) {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: "non executable command in pipeline stage".to_string(),
+            reason: format!("non executable command in pipeline stage {pipeline_stage}"),
         });
     }
 
@@ -1379,9 +1380,15 @@ fn eval_pipeline_command(
     }
 
     if has_pipe_input {
+        if is_identifier_name(head) {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!("\"{head}\" is not a defined function"),
+            });
+        }
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: "non executable command in pipeline stage".to_string(),
+            reason: format!("non executable command in pipeline stage {pipeline_stage}"),
         });
     }
 
