@@ -449,6 +449,8 @@ fn native_renderer_field_on_nil_interface_returns_no_value_like_go() {
     let data = Value::Null;
     let out = render_template_native("{{.foo}}", &data).expect("must render");
     assert_eq!(out, "<no value>");
+    let out = render_template_native("{{(.).foo}}", &data).expect("must render");
+    assert_eq!(out, "<no value>");
 }
 
 #[test]

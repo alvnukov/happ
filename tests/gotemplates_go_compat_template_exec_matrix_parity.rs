@@ -129,6 +129,7 @@ fn go_compat_template_exec_matrix_matches_go_text_template_subset() {
             json!({}),
         ),
         Case::new(r#"{{define "main"}}{{.foo}}{{end}}"#, json!(null)),
+        Case::new(r#"{{define "main"}}{{(.).foo}}{{end}}"#, json!(null)),
         Case::new(
             r#"{{define "\x61"}}A{{end}}{{define "main"}}{{template "\x61" .}}{{end}}"#,
             json!({}),
