@@ -1,7 +1,7 @@
 use serde_json::{Number, Value};
 
 use crate::gotemplates::typedvalue::{
-    decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
+    decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value, go_bytes_is_nil,
 };
 
 pub(super) fn format_value_for_printf(v: &Option<Value>, verb: char, sharp: bool) -> String {
@@ -105,6 +105,9 @@ pub(super) fn format_value_like_go(v: &Value) -> String {
 
 fn format_value_go_syntax(v: &Value) -> String {
     if let Some(bytes) = value_as_byte_slice(v) {
+        if go_bytes_is_nil(v) {
+            return "[]byte(nil)".to_string();
+        }
         let mut out = String::from("[]byte{");
         for (idx, b) in bytes.iter().enumerate() {
             if idx > 0 {

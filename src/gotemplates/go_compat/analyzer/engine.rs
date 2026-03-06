@@ -30,14 +30,7 @@ impl Analyzer {
         mode: Mode,
         known_functions: &[&str],
     ) -> Result<TemplateSetAnalysis, ParseError> {
-        let trees = parse(
-            name,
-            text,
-            left_delim,
-            right_delim,
-            mode,
-            known_functions,
-        )?;
+        let trees = parse(name, text, left_delim, right_delim, mode, known_functions)?;
         Ok(self.analyze_parsed(trees))
     }
 
@@ -98,7 +91,12 @@ mod tests {
             .expect("parse must succeed");
 
         assert_eq!(result.analysis.tree_count, 2);
-        assert_eq!(result.analysis.count(crate::gotemplates::go_compat::parse::NodeType::Template), 2);
+        assert_eq!(
+            result
+                .analysis
+                .count(crate::gotemplates::go_compat::parse::NodeType::Template),
+            2
+        );
         assert_eq!(result.unresolved.len(), 1);
         assert_eq!(result.unresolved[0].called_template, "missing");
     }

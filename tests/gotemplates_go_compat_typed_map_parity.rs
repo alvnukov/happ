@@ -114,6 +114,26 @@ fn go_compat_typed_map_semantics_match_go_subset() {
             kind: "map_string_any_nil",
             option: None,
         },
+        Case {
+            src: r#"{{define "main"}}{{printf "%#v|%T|%v" .m.missing .m.missing .m.missing}}{{end}}"#,
+            kind: "map_string_bytes_non_nil",
+            option: Some("missingkey=zero"),
+        },
+        Case {
+            src: r#"{{define "main"}}{{len .m.missing}}{{end}}"#,
+            kind: "map_string_bytes_non_nil",
+            option: Some("missingkey=zero"),
+        },
+        Case {
+            src: r#"{{define "main"}}{{printf "%#v|%T|%v" (index .m "missing") (index .m "missing") (index .m "missing")}}{{end}}"#,
+            kind: "map_string_bytes_non_nil",
+            option: None,
+        },
+        Case {
+            src: r#"{{define "main"}}{{.m.missing}}{{end}}"#,
+            kind: "map_string_bytes_non_nil",
+            option: Some("missingkey=default"),
+        },
     ];
 
     let go_results = runner
@@ -228,6 +248,19 @@ fn build_rust_data(kind: &str) -> Value {
             root.insert(
                 "m".to_string(),
                 happ::gotemplates::encode_go_typed_map_value("interface {}", None),
+            );
+            Value::Object(root)
+        }
+        "map_string_bytes_non_nil" => {
+            let mut entries = serde_json::Map::new();
+            entries.insert(
+                "x".to_string(),
+                happ::gotemplates::encode_go_bytes_value(&[1, 2]),
+            );
+            let mut root = serde_json::Map::new();
+            root.insert(
+                "m".to_string(),
+                happ::gotemplates::encode_go_typed_map_value("[]byte", Some(entries)),
             );
             Value::Object(root)
         }
@@ -422,6 +455,9 @@ func buildData(kind string) (any, error) {
         return map[string]any{"m": m}, nil
     case "map_string_any_nil":
         var m map[string]any
+        return map[string]any{"m": m}, nil
+    case "map_string_bytes_non_nil":
+        m := map[string][]byte{"x": []byte{1, 2}}
         return map[string]any{"m": m}, nil
     default:
         return nil, fmt.Errorf("unknown kind: %s", kind)

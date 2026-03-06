@@ -26,9 +26,10 @@ pub use scanner::{
 };
 pub use typedvalue::{
     decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
-    encode_go_bytes_value, encode_go_string_bytes_value, encode_go_typed_map_value,
-    go_type_is_interface, go_zero_value_for_type, GoTypedMapRef, GO_TYPE_BYTES, GO_TYPE_KEY,
-    GO_TYPE_MAP_PREFIX, GO_TYPE_STRING_BYTES, GO_VALUE_KEY,
+    encode_go_bytes_value, encode_go_nil_bytes_value, encode_go_string_bytes_value,
+    encode_go_typed_map_value, go_bytes_is_nil, go_type_is_interface, go_zero_value_for_type,
+    GoTypedMapRef, GO_TYPE_BYTES, GO_TYPE_KEY, GO_TYPE_MAP_PREFIX, GO_TYPE_STRING_BYTES,
+    GO_VALUE_KEY,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

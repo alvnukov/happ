@@ -60,9 +60,7 @@ impl TemplateOptions {
         let missing_value_mode = match self.missing_key {
             MissingKeyOption::Error => MissingValueMode::Error,
             MissingKeyOption::Zero => MissingValueMode::GoZero,
-            MissingKeyOption::Default | MissingKeyOption::Invalid => {
-                MissingValueMode::GoDefault
-            }
+            MissingKeyOption::Default | MissingKeyOption::Invalid => MissingValueMode::GoDefault,
         };
         NativeRenderOptions { missing_value_mode }
     }

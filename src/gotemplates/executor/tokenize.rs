@@ -264,9 +264,12 @@ mod tests {
     }
 
     #[test]
-    fn split_pipeline_commands_respects_quotes_and_comments() {
+    fn split_pipeline_commands_respects_quotes_and_treats_comments_as_text() {
         let cmds = split_pipeline_commands(r#"print "a|b" | printf "%s" /* x|y */ | quote"#);
-        assert_eq!(cmds, vec!["print \"a|b\"", "printf \"%s\"", "quote"]);
+        assert_eq!(
+            cmds,
+            vec!["print \"a|b\"", "printf \"%s\" /* x|y */", "quote"]
+        );
     }
 
     #[test]

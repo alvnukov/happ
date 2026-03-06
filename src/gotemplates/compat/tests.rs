@@ -4,6 +4,10 @@ fn typed_bytes(bytes: &[u8]) -> Value {
     crate::gotemplates::encode_go_bytes_value(bytes)
 }
 
+fn typed_nil_bytes() -> Value {
+    crate::gotemplates::encode_go_nil_bytes_value()
+}
+
 fn typed_string_bytes(bytes: &[u8]) -> Value {
     crate::gotemplates::encode_go_string_bytes_value(bytes)
 }
@@ -328,6 +332,13 @@ fn go_printf_formats_sharp_v_go_syntax_subset() {
         go_printf("%#v", &bytes).expect("must render"),
         "[]byte{0x1, 0xb, 0x6f}"
     );
+    let nil_bytes = vec![Some(typed_nil_bytes())];
+    assert_eq!(go_printf("%v", &nil_bytes).expect("must render"), "[]");
+    assert_eq!(
+        go_printf("%#v", &nil_bytes).expect("must render"),
+        "[]byte(nil)"
+    );
+    assert_eq!(go_printf("%T", &nil_bytes).expect("must render"), "[]uint8");
 
     let strs = vec![Some(Value::Array(vec![
         Value::String("a".to_string()),

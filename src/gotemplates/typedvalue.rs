@@ -30,21 +30,53 @@ pub fn encode_go_bytes_value(bytes: &[u8]) -> Value {
     Value::Object(map)
 }
 
+pub fn encode_go_nil_bytes_value() -> Value {
+    let mut map = Map::new();
+    map.insert(
+        GO_TYPE_KEY.to_string(),
+        Value::String(GO_TYPE_BYTES.to_string()),
+    );
+    map.insert(GO_VALUE_KEY.to_string(), Value::Null);
+    Value::Object(map)
+}
+
 pub fn decode_go_bytes_value(value: &Value) -> Option<Vec<u8>> {
-    number_array_to_bytes(typed_number_array(value, GO_TYPE_BYTES)?)
+    let payload = typed_value_payload(value, GO_TYPE_BYTES)?;
+    match payload {
+        Value::Null => Some(Vec::new()),
+        Value::Array(items) => number_array_to_bytes(items),
+        _ => None,
+    }
+}
+
+pub fn go_bytes_is_nil(value: &Value) -> bool {
+    typed_value_payload(value, GO_TYPE_BYTES).is_some_and(Value::is_null)
 }
 
 pub fn go_bytes_len(value: &Value) -> Option<usize> {
-    let items = typed_number_array(value, GO_TYPE_BYTES)?;
-    for item in items {
-        number_value_to_byte(item)?;
+    let payload = typed_value_payload(value, GO_TYPE_BYTES)?;
+    match payload {
+        Value::Null => Some(0),
+        Value::Array(items) => {
+            for item in items {
+                number_value_to_byte(item)?;
+            }
+            Some(items.len())
+        }
+        _ => None,
     }
-    Some(items.len())
 }
 
 pub fn go_bytes_get(value: &Value, index: usize) -> Option<u8> {
-    let item = typed_number_array(value, GO_TYPE_BYTES)?.get(index)?;
-    number_value_to_byte(item)
+    let payload = typed_value_payload(value, GO_TYPE_BYTES)?;
+    match payload {
+        Value::Null => None,
+        Value::Array(items) => {
+            let item = items.get(index)?;
+            number_value_to_byte(item)
+        }
+        _ => None,
+    }
 }
 
 pub fn encode_go_string_bytes_value(bytes: &[u8]) -> Value {
@@ -129,7 +161,7 @@ pub fn go_zero_value_for_type(type_name: &str) -> Value {
         return encode_go_typed_map_value(elem_type, None);
     }
     if kind == "[]byte" || kind == "[]uint8" {
-        return encode_go_bytes_value(&[]);
+        return encode_go_nil_bytes_value();
     }
     if kind.starts_with("[]") {
         return Value::Array(Vec::new());
@@ -147,7 +179,7 @@ pub fn go_zero_value_for_type(type_name: &str) -> Value {
     }
 }
 
-fn typed_number_array<'a>(value: &'a Value, expected_type: &str) -> Option<&'a [Value]> {
+fn typed_value_payload<'a>(value: &'a Value, expected_type: &str) -> Option<&'a Value> {
     let Value::Object(map) = value else {
         return None;
     };
@@ -155,7 +187,13 @@ fn typed_number_array<'a>(value: &'a Value, expected_type: &str) -> Option<&'a [
     if kind != expected_type {
         return None;
     }
-    map.get(GO_VALUE_KEY)?.as_array().map(Vec::as_slice)
+    map.get(GO_VALUE_KEY)
+}
+
+fn typed_number_array<'a>(value: &'a Value, expected_type: &str) -> Option<&'a [Value]> {
+    typed_value_payload(value, expected_type)?
+        .as_array()
+        .map(Vec::as_slice)
 }
 
 fn number_array_to_bytes(items: &[Value]) -> Option<Vec<u8>> {
@@ -217,6 +255,15 @@ mod tests {
     }
 
     #[test]
+    fn go_bytes_nil_slice_helpers_follow_go_shape() {
+        let v = encode_go_nil_bytes_value();
+        assert!(go_bytes_is_nil(&v));
+        assert_eq!(go_bytes_len(&v), Some(0));
+        assert_eq!(go_bytes_get(&v, 0), None);
+        assert_eq!(decode_go_bytes_value(&v), Some(Vec::new()));
+    }
+
+    #[test]
     fn go_string_bytes_roundtrip() {
         let v = encode_go_string_bytes_value(&[0x61, 0x97]);
         assert_eq!(decode_go_string_bytes_value(&v), Some(vec![0x61, 0x97]));
@@ -268,6 +315,8 @@ mod tests {
             Value::Null
         ));
         assert!(matches!(go_zero_value_for_type("interface{}"), Value::Null));
+        let zero_bytes = go_zero_value_for_type("[]byte");
+        assert!(go_bytes_is_nil(&zero_bytes));
         let typed_map = go_zero_value_for_type("map[string]int");
         let decoded = decode_go_typed_map_value(&typed_map).expect("typed map must decode");
         assert_eq!(decoded.elem_type, "int");
