@@ -169,6 +169,16 @@ fn go_compat_typed_map_semantics_match_go_subset() {
             kind: "map_string_slice_int_non_nil",
             option: Some("missingkey=error"),
         },
+        Case {
+            src: r#"{{define "main"}}{{printf "%#v" (slice .m.missing)}}{{end}}"#,
+            kind: "map_string_slice_int_non_nil",
+            option: Some("missingkey=zero"),
+        },
+        Case {
+            src: r#"{{define "main"}}{{printf "%#v" (slice .m.x 0 0)}}{{end}}"#,
+            kind: "map_string_slice_int_non_nil",
+            option: None,
+        },
     ];
 
     let go_results = runner
