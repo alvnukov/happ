@@ -1619,10 +1619,10 @@ fn ensure_variable_is_defined(expr: &str, state: &EvalState) -> Result<(), Nativ
     Ok(())
 }
 
-fn undefined_variable_error(_name: &str) -> NativeRenderError {
+fn undefined_variable_error(name: &str) -> NativeRenderError {
     NativeRenderError::Parse(GoTemplateScanError {
         code: "undefined_variable",
-        message: "undefined variable",
+        message: format!("undefined variable \"{name}\""),
         offset: 0,
     })
 }

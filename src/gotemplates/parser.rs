@@ -549,7 +549,7 @@ impl<'a> Parser<'a> {
                         if self.options.check_variables && !self.variable_is_visible(v.name) {
                             return Err(GoTemplateScanError {
                                 code: "undefined_variable",
-                                message: "undefined variable",
+                                message: format!("undefined variable \"{}\"", v.name),
                                 offset: self.abs(v.start),
                             });
                         }

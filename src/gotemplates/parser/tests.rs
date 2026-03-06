@@ -188,6 +188,23 @@ fn parser_rejects_multi_decl_outside_range() {
 }
 
 #[test]
+fn parser_reports_undefined_variable_name_like_go() {
+    let err = parse_action_compat_with_options(
+        "{{ $x }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: true,
+            known_functions: &[],
+            check_variables: true,
+            visible_variables: &[],
+        },
+    )
+    .expect_err("must fail");
+    assert_eq!(err.code, "undefined_variable");
+    assert!(err.message.contains("undefined variable \"$x\""));
+}
+
+#[test]
 fn parser_reports_non_executable_pipeline_stage_number_like_go() {
     let err = parse_action_compat_with_options(
         "{{ 1 | nil }}",

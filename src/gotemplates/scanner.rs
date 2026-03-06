@@ -342,7 +342,7 @@ fn validate_variable_references(
         }
         return Err(GoTemplateScanError {
             code: "undefined_variable",
-            message: "undefined variable",
+            message: format!("undefined variable \"{}\"", v.name),
             offset: v.offset,
         });
     }

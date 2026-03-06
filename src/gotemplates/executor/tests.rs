@@ -1119,7 +1119,10 @@ fn native_renderer_reports_undefined_variable_from_outer_scope_in_define() {
     )
     .expect_err("must fail");
     match err {
-        NativeRenderError::Parse(parse) => assert_eq!(parse.code, "undefined_variable"),
+        NativeRenderError::Parse(parse) => {
+            assert_eq!(parse.code, "undefined_variable");
+            assert!(parse.message.contains("undefined variable \"$x\""));
+        }
         other => panic!("unexpected error: {other:?}"),
     }
 }
