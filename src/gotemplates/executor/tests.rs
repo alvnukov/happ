@@ -445,6 +445,30 @@ fn native_renderer_slice_preserves_nil_for_typed_go_bytes() {
 }
 
 #[test]
+fn native_renderer_rejects_nil_as_command_like_go() {
+    let data = json!({});
+    for src in [
+        "{{nil}}",
+        "{{if nil}}T{{end}}",
+        "{{with nil}}T{{end}}",
+        "{{range nil}}T{{end}}",
+        "{{(nil)}}",
+        "{{print (nil)}}",
+    ] {
+        let err = render_template_native(src, &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(
+                    reason.contains("nil is not a command"),
+                    "src={src} reason={reason}"
+                );
+            }
+            other => panic!("unexpected error for {src}: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn native_renderer_eq_reports_non_comparable_like_go_text_template() {
     let mut m = serde_json::Map::new();
     m.insert(

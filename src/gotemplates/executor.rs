@@ -1337,6 +1337,12 @@ fn eval_pipeline_command(
     }
 
     if tokens.len() == 1 {
+        if tokens[0].trim() == "nil" {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: "nil is not a command".to_string(),
+            });
+        }
         return eval_command_token_value(action, &tokens[0], root, dot, state, resolver);
     }
 
