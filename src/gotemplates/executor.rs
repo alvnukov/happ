@@ -14,19 +14,29 @@ use std::collections::BTreeMap;
 mod compare;
 mod call;
 mod commandkind;
+mod exprkind;
+mod govaluefmt;
 mod path;
+mod pipeline_decl;
+mod actionparse;
 mod textfmt;
 mod tokenize;
 mod trim;
+use actionparse::parse_action_kind;
 use call::eval_call_builtin;
 use compare::{builtin_cmp, builtin_eq, builtin_ne};
 use commandkind::{
     command_field_like_path, is_non_executable_pipeline_head, non_function_command_target,
 };
+use exprkind::{
+    decode_string_literal, is_complex_expression, is_niladic_function_expression, is_quoted_string,
+};
+use govaluefmt::format_value_like_go;
 use path::{
     is_identifier_continue_char, is_identifier_start_char, resolve_simple_path,
     split_variable_reference,
 };
+use pipeline_decl::{extract_pipeline_declaration, PipelineDeclMode, PipelineDeclaration};
 use textfmt::{builtin_html, builtin_js, builtin_print, builtin_urlquery, format_value_for_print};
 use tokenize::{split_command_tokens, split_pipeline_commands, strip_outer_parens};
 use trim::apply_lexical_trims;
@@ -992,103 +1002,6 @@ fn eval_block_invocation(
     }
 }
 
-fn parse_action_kind(action: &str) -> Result<ActionKind, NativeRenderError> {
-    let Some(inner) = action_inner(action) else {
-        return Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "invalid action delimiters".to_string(),
-        });
-    };
-    if inner.is_empty() || inner.starts_with("/*") {
-        return Ok(ActionKind::Noop);
-    }
-
-    if inner == "end" {
-        return Ok(ActionKind::End);
-    }
-    if inner == "else" {
-        return Ok(ActionKind::Else(ElseClause::Plain));
-    }
-    if let Some(expr) = inner.strip_prefix("else if ") {
-        return Ok(ActionKind::Else(ElseClause::If(expr.trim().to_string())));
-    }
-    if let Some(expr) = inner.strip_prefix("else with ") {
-        return Ok(ActionKind::Else(ElseClause::With(expr.trim().to_string())));
-    }
-    if let Some(expr) = inner.strip_prefix("if ") {
-        return Ok(ActionKind::If(expr.trim().to_string()));
-    }
-    if let Some(expr) = inner.strip_prefix("with ") {
-        return Ok(ActionKind::With(expr.trim().to_string()));
-    }
-    if let Some(expr) = inner.strip_prefix("range ") {
-        return Ok(ActionKind::Range(expr.trim().to_string()));
-    }
-    if let Some(rest) = inner.strip_prefix("define ") {
-        let name = parse_quoted_name(rest).ok_or_else(|| NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "define name must be a quoted string".to_string(),
-        })?;
-        return Ok(ActionKind::Define { name });
-    }
-    if let Some(rest) = inner.strip_prefix("block ") {
-        let (name, arg) = parse_block_invocation_clause(rest).ok_or_else(|| {
-            NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: "block clause must be: block \"name\" arg".to_string(),
-            }
-        })?;
-        return Ok(ActionKind::Block { name, arg });
-    }
-    if let Some(rest) = inner.strip_prefix("template ") {
-        let (name, arg) = parse_template_invocation_clause(rest).ok_or_else(|| {
-            NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: "template clause must be: template \"name\" [arg]".to_string(),
-            }
-        })?;
-        return Ok(ActionKind::Template { name, arg });
-    }
-    if inner == "break" {
-        return Ok(ActionKind::Break);
-    }
-    if inner == "continue" {
-        return Ok(ActionKind::Continue);
-    }
-    Ok(ActionKind::Output(inner.to_string()))
-}
-
-fn parse_quoted_name(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(decoded) = decode_string_literal(trimmed) {
-        return Some(decoded);
-    }
-    None
-}
-
-fn parse_template_invocation_clause(raw: &str) -> Option<(String, Option<String>)> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let (name, tail) = compat::parse_go_quoted_prefix(trimmed)?;
-    let tail = tail.trim();
-    let arg = if tail.is_empty() {
-        None
-    } else {
-        Some(tail.to_string())
-    };
-    Some((name, arg))
-}
-
-fn parse_block_invocation_clause(raw: &str) -> Option<(String, String)> {
-    let (name, arg) = parse_template_invocation_clause(raw)?;
-    Some((name, arg?.trim().to_string()))
-}
-
 fn eval_expr_truthy(
     expr: &str,
     root: &Value,
@@ -1564,7 +1477,7 @@ fn try_eval_dynamic_external_function(
     }
 }
 
-fn is_identifier_name(name: &str) -> bool {
+pub(super) fn is_identifier_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -1625,84 +1538,6 @@ fn undefined_variable_error(name: &str) -> NativeRenderError {
         message: format!("undefined variable \"{name}\""),
         offset: 0,
     })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PipelineDeclMode {
-    Declare,
-    Assign,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PipelineDeclaration {
-    names: Vec<String>,
-    mode: PipelineDeclMode,
-}
-
-fn extract_pipeline_declaration(expr: &str) -> (Option<PipelineDeclaration>, String) {
-    let commands = split_pipeline_commands(expr);
-    if commands.is_empty() {
-        return (None, expr.trim().to_string());
-    }
-    let first_tokens = split_command_tokens(&commands[0]);
-    let Some((decl, rest_tokens_start)) = parse_pipeline_decl_tokens(&first_tokens) else {
-        return (None, expr.trim().to_string());
-    };
-
-    let mut rebuilt = Vec::new();
-    if rest_tokens_start < first_tokens.len() {
-        rebuilt.push(first_tokens[rest_tokens_start..].join(" "));
-    }
-    for cmd in commands.iter().skip(1) {
-        rebuilt.push(cmd.clone());
-    }
-    (Some(decl), rebuilt.join(" | "))
-}
-
-fn parse_pipeline_decl_tokens(tokens: &[String]) -> Option<(PipelineDeclaration, usize)> {
-    if tokens.len() >= 3 && is_variable_token(&tokens[0]) && is_decl_op_token(&tokens[1]) {
-        return Some((
-            PipelineDeclaration {
-                names: vec![tokens[0].clone()],
-                mode: decl_mode_from_token(&tokens[1])?,
-            },
-            2,
-        ));
-    }
-    if tokens.len() >= 5
-        && is_variable_token(&tokens[0])
-        && tokens[1] == ","
-        && is_variable_token(&tokens[2])
-        && is_decl_op_token(&tokens[3])
-    {
-        return Some((
-            PipelineDeclaration {
-                names: vec![tokens[0].clone(), tokens[2].clone()],
-                mode: decl_mode_from_token(&tokens[3])?,
-            },
-            4,
-        ));
-    }
-    None
-}
-
-fn is_variable_token(token: &str) -> bool {
-    if !token.starts_with('$') || token == "$" {
-        return false;
-    }
-    token[1..].chars().all(is_identifier_continue_char)
-}
-
-fn is_decl_op_token(token: &str) -> bool {
-    matches!(token, ":=" | "=")
-}
-
-fn decl_mode_from_token(token: &str) -> Option<PipelineDeclMode> {
-    match token {
-        ":=" => Some(PipelineDeclMode::Declare),
-        "=" => Some(PipelineDeclMode::Assign),
-        _ => None,
-    }
 }
 
 fn is_builtin_function_name(name: &str) -> bool {
@@ -2478,155 +2313,12 @@ fn apply_range_iteration_bindings(
     }
 }
 
-fn action_inner(action: &str) -> Option<&str> {
-    if !(action.starts_with("{{") && action.ends_with("}}")) || action.len() < 4 {
-        return None;
-    }
-    let inner = &action[2..action.len() - 2];
-    let bytes = inner.as_bytes();
-    let mut start = 0usize;
-    let mut end = inner.len();
-
-    if bytes.len() >= 2 && bytes[0] == b'-' && bytes[1].is_ascii_whitespace() {
-        start = 1;
-    }
-    while start < end && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    while start < end && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    if end > start && bytes[end - 1] == b'-' {
-        end -= 1;
-        while start < end && bytes[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        }
-    }
-    Some(&inner[start..end])
-}
-
 fn parse_number_value(expr: &str) -> Option<Value> {
     compat::parse_number_value(expr)
 }
 
 fn parse_char_constant(expr: &str) -> Option<i64> {
     compat::parse_char_constant(expr)
-}
-
-fn format_value_like_go(v: &Value) -> String {
-    if let Some(bytes) = decode_go_bytes_value(v) {
-        let mut out = String::from("[");
-        for (idx, b) in bytes.iter().enumerate() {
-            if idx > 0 {
-                out.push(' ');
-            }
-            out.push_str(&b.to_string());
-        }
-        out.push(']');
-        return out;
-    }
-    if let Some(bytes) = decode_go_string_bytes_value(v) {
-        return String::from_utf8_lossy(&bytes).into_owned();
-    }
-    if let Some(typed_slice) = decode_go_typed_slice_value(v) {
-        let mut out = String::from("[");
-        if let Some(items) = typed_slice.items {
-            for (idx, item) in items.iter().enumerate() {
-                if idx > 0 {
-                    out.push(' ');
-                }
-                out.push_str(&format_value_like_go(item));
-            }
-        }
-        out.push(']');
-        return out;
-    }
-    if let Some(typed_map) = decode_go_typed_map_value(v) {
-        return format_map_entries_like_go(typed_map.entries);
-    }
-    match v {
-        Value::Null => "<no value>".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
-        Value::Array(items) => {
-            let mut out = String::from("[");
-            for (idx, item) in items.iter().enumerate() {
-                if idx > 0 {
-                    out.push(' ');
-                }
-                out.push_str(&format_value_like_go(item));
-            }
-            out.push(']');
-            out
-        }
-        Value::Object(map) => format_map_entries_like_go(Some(map)),
-    }
-}
-
-fn format_map_entries_like_go(entries: Option<&serde_json::Map<String, Value>>) -> String {
-    let mut out = String::from("map[");
-    if let Some(map) = entries {
-        let mut keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
-        keys.sort_unstable();
-        for (idx, k) in keys.iter().enumerate() {
-            if idx > 0 {
-                out.push(' ');
-            }
-            out.push_str(k);
-            out.push(':');
-            if let Some(v) = map.get(*k) {
-                out.push_str(&format_value_like_go(v));
-            }
-        }
-    }
-    out.push(']');
-    out
-}
-
-fn decode_string_literal(inner: &str) -> Option<String> {
-    compat::decode_go_string_literal(inner)
-}
-
-fn is_quoted_string(inner: &str) -> bool {
-    inner.len() >= 2
-        && ((inner.starts_with('"') && inner.ends_with('"'))
-            || (inner.starts_with('`') && inner.ends_with('`')))
-}
-
-fn is_complex_expression(expr: &str) -> bool {
-    if expr.is_empty() {
-        return false;
-    }
-    if is_quoted_string(expr) {
-        return false;
-    }
-    if expr.contains('|')
-        || expr.contains('(')
-        || expr.contains(')')
-        || expr.contains(":=")
-        || expr.contains(',')
-    {
-        return true;
-    }
-    if expr.contains('=') && !expr.starts_with('=') {
-        return true;
-    }
-    if expr.contains(char::is_whitespace) {
-        return true;
-    }
-    false
-}
-
-fn is_niladic_function_expression(expr: &str) -> bool {
-    let trimmed = expr.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if matches!(trimmed, "true" | "false" | "nil") {
-        return false;
-    }
-    is_identifier_name(trimmed)
 }
 
 #[cfg(test)]

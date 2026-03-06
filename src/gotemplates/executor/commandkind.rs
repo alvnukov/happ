@@ -69,22 +69,36 @@ pub(super) fn command_field_like_path(token: &str) -> Option<FieldLikeCommandPat
         return None;
     }
 
-    let mut segments = Vec::new();
-    for segment in path.split('.') {
-        if segment.is_empty() || !segment.chars().all(is_field_path_segment_char) {
+    let mut last_dot = None;
+    let mut prev_was_dot = false;
+    for (idx, ch) in path.char_indices() {
+        if ch == '.' {
+            if idx == 0 || idx + 1 == path.len() || prev_was_dot {
+                return None;
+            }
+            last_dot = Some(idx);
+            prev_was_dot = true;
+            continue;
+        }
+        prev_was_dot = false;
+        if !is_field_path_segment_char(ch) {
             return None;
         }
-        segments.push(segment.to_string());
     }
-    if segments.is_empty() {
+
+    let (receiver_tail, field_name) = if let Some(dot_idx) = last_dot {
+        (&path[..dot_idx], &path[dot_idx + 1..])
+    } else {
+        ("", path)
+    };
+    if field_name.is_empty() {
         return None;
     }
 
-    let field_name = segments.last()?.clone();
-    let receiver_expr = build_field_receiver_expr(base, &segments)?;
+    let receiver_expr = build_field_receiver_expr(base, receiver_tail);
     Some(FieldLikeCommandPath {
         receiver_expr,
-        field_name,
+        field_name: field_name.to_string(),
     })
 }
 
@@ -95,24 +109,19 @@ enum FieldPathBase {
     Var(String),
 }
 
-fn build_field_receiver_expr(base: FieldPathBase, segments: &[String]) -> Option<String> {
-    if segments.is_empty() {
-        return None;
-    }
-    if segments.len() == 1 {
-        return Some(match base {
+fn build_field_receiver_expr(base: FieldPathBase, receiver_tail: &str) -> String {
+    if receiver_tail.is_empty() {
+        return match base {
             FieldPathBase::Dot => ".".to_string(),
             FieldPathBase::Root => "$".to_string(),
             FieldPathBase::Var(name) => name,
-        });
+        };
     }
-    let prefix = match base {
-        FieldPathBase::Dot => ".".to_string(),
-        FieldPathBase::Root => "$.".to_string(),
-        FieldPathBase::Var(name) => format!("{name}."),
-    };
-    let tail = segments[..segments.len() - 1].join(".");
-    Some(format!("{prefix}{tail}"))
+    match base {
+        FieldPathBase::Dot => format!(".{receiver_tail}"),
+        FieldPathBase::Root => format!("$.{receiver_tail}"),
+        FieldPathBase::Var(name) => format!("{name}.{receiver_tail}"),
+    }
 }
 
 fn is_field_path_segment_char(ch: char) -> bool {
@@ -166,5 +175,12 @@ mod tests {
         let p = command_field_like_path("$v.a").expect("path");
         assert_eq!(p.receiver_expr, "$v");
         assert_eq!(p.field_name, "a");
+    }
+
+    #[test]
+    fn rejects_invalid_field_like_paths() {
+        for token in [".a..b", ".a.", "$.a..b", "$v.a..b", "$v.", ".a./b"] {
+            assert!(command_field_like_path(token).is_none(), "token={token}");
+        }
     }
 }
