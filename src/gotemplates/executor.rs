@@ -25,6 +25,7 @@ mod textfmt;
 mod tokenize;
 mod truth;
 mod trim;
+mod varcheck;
 use actionparse::parse_action_kind;
 use call::eval_call_builtin;
 use compare::{builtin_cmp, builtin_eq, builtin_ne};
@@ -46,6 +47,10 @@ use textfmt::{builtin_html, builtin_js, builtin_print, builtin_urlquery, format_
 use tokenize::{split_command_tokens, split_pipeline_commands, strip_outer_parens};
 use truth::{builtin_and, builtin_or, is_truthy};
 use trim::apply_lexical_trims;
+use varcheck::{
+    ensure_variable_is_defined, looks_like_char_literal, looks_like_numeric_literal,
+    undefined_variable_error,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingValueMode {
@@ -1394,31 +1399,6 @@ fn eval_command_token_value(
     }
     ensure_variable_is_defined(token, state)?;
     eval_simple_expr_value(token, root, dot, state)
-}
-
-fn looks_like_numeric_literal(expr: &str) -> bool {
-    compat::looks_like_numeric_literal(expr)
-}
-
-fn looks_like_char_literal(expr: &str) -> bool {
-    compat::looks_like_char_literal(expr)
-}
-
-fn ensure_variable_is_defined(expr: &str, state: &EvalState) -> Result<(), NativeRenderError> {
-    if let Some((name, _)) = split_variable_reference(expr) {
-        if name != "$" && state.lookup_var(name).is_none() {
-            return Err(undefined_variable_error(name));
-        }
-    }
-    Ok(())
-}
-
-fn undefined_variable_error(name: &str) -> NativeRenderError {
-    NativeRenderError::Parse(GoTemplateScanError {
-        code: "undefined_variable",
-        message: format!("undefined variable \"{name}\""),
-        offset: 0,
-    })
 }
 
 fn is_builtin_function_name(name: &str) -> bool {
