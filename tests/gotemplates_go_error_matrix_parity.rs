@@ -64,6 +64,7 @@ fn gotemplates_error_matrix_matches_go_parse_package() {
         (r#"{{(unknownFn)}}"#, Some("undefined_function")),
         (r#"{{call ext}}"#, Some("undefined_function")),
         (r#"{{call (ext)}}"#, Some("undefined_function")),
+        (r#"{{1 | call ext}}"#, Some("undefined_function")),
         (r#"{{printf "%d" ( ) }}"#, Some("missing_value_for_context")),
         (r#"{{range $k,}}{{end}}"#, Some("missing_value_for_context")),
         (
