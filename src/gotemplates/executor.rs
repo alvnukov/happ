@@ -12,11 +12,15 @@ use serde_json::{Number, Value};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 mod compare;
+mod commandkind;
 mod path;
 mod textfmt;
 mod tokenize;
 mod trim;
 use compare::{builtin_cmp, builtin_eq, builtin_ne};
+use commandkind::{
+    command_field_like_path, is_non_executable_pipeline_head, non_function_command_target,
+};
 use path::{
     is_identifier_continue_char, is_identifier_start_char, resolve_simple_path,
     split_variable_reference,
@@ -1406,120 +1410,6 @@ fn eval_pipeline_command(
         action: action.to_string(),
         reason: format!("\"{head}\" is not a defined function"),
     })
-}
-
-fn is_non_executable_pipeline_head(token: &str) -> bool {
-    let trimmed = token.trim();
-    if trimmed.is_empty() || strip_outer_parens(trimmed).is_some() {
-        return false;
-    }
-    if matches!(trimmed, "." | "nil" | "true" | "false") {
-        return true;
-    }
-    if is_quoted_string(trimmed) || looks_like_numeric_literal(trimmed) {
-        return true;
-    }
-    looks_like_char_literal(trimmed)
-}
-
-fn non_function_command_target(token: &str) -> Option<String> {
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(inner) = strip_outer_parens(trimmed) {
-        return Some(inner.trim().to_string());
-    }
-    if matches!(trimmed, "." | "nil" | "true" | "false") {
-        return Some(trimmed.to_string());
-    }
-    if is_quoted_string(trimmed) || looks_like_numeric_literal(trimmed) || looks_like_char_literal(trimmed) {
-        return Some(trimmed.to_string());
-    }
-    if trimmed.starts_with('$') {
-        if let Some((_, rest)) = split_variable_reference(trimmed) {
-            if rest.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-struct FieldLikeCommandPath {
-    receiver_expr: String,
-    field_name: String,
-}
-
-fn command_field_like_path(token: &str) -> Option<FieldLikeCommandPath> {
-    let trimmed = token.trim();
-    if trimmed.is_empty() || strip_outer_parens(trimmed).is_some() {
-        return None;
-    }
-
-    let (base, path) = if let Some(rest) = trimmed.strip_prefix("$.") {
-        (FieldPathBase::Root, rest)
-    } else if let Some(rest) = trimmed.strip_prefix('.') {
-        (FieldPathBase::Dot, rest)
-    } else if let Some((name, rest)) = split_variable_reference(trimmed) {
-        (FieldPathBase::Var(name.to_string()), rest)
-    } else {
-        return None;
-    };
-
-    if path.is_empty() {
-        return None;
-    }
-
-    let mut segments = Vec::new();
-    for segment in path.split('.') {
-        if segment.is_empty() || !segment.chars().all(is_field_path_segment_char) {
-            return None;
-        }
-        segments.push(segment.to_string());
-    }
-
-    if segments.is_empty() {
-        return None;
-    }
-
-    let field_name = segments.last()?.clone();
-    let receiver_expr = build_field_receiver_expr(base, &segments)?;
-    Some(FieldLikeCommandPath {
-        receiver_expr,
-        field_name,
-    })
-}
-
-#[derive(Debug, Clone)]
-enum FieldPathBase {
-    Dot,
-    Root,
-    Var(String),
-}
-
-fn build_field_receiver_expr(base: FieldPathBase, segments: &[String]) -> Option<String> {
-    if segments.is_empty() {
-        return None;
-    }
-    if segments.len() == 1 {
-        return Some(match base {
-            FieldPathBase::Dot => ".".to_string(),
-            FieldPathBase::Root => "$".to_string(),
-            FieldPathBase::Var(name) => name,
-        });
-    }
-    let prefix = match base {
-        FieldPathBase::Dot => ".".to_string(),
-        FieldPathBase::Root => "$.".to_string(),
-        FieldPathBase::Var(name) => format!("{name}."),
-    };
-    let tail = segments[..segments.len() - 1].join(".");
-    Some(format!("{prefix}{tail}"))
-}
-
-fn is_field_path_segment_char(ch: char) -> bool {
-    is_identifier_continue_char(ch) || ch == '-'
 }
 
 fn is_map_like_for_field_call(v: &Value) -> bool {
