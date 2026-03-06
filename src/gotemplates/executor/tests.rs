@@ -750,10 +750,26 @@ fn native_renderer_supports_variable_declare_and_assign() {
 }
 
 #[test]
+fn native_renderer_supports_variable_declarations_without_spaces() {
+    let data = json!({"v":"rootv"});
+    let out = render_template_native("{{$x:=.v}}{{$x=\"b\"}}{{$x}}", &data).expect("must render");
+    assert_eq!(out, "b");
+}
+
+#[test]
 fn native_renderer_supports_range_variable_declarations() {
     let data = json!({"items":["a","b"]});
     let out = render_template_native("{{range $i, $v := .items}}{{$i}}={{$v}};{{end}}", &data)
         .expect("must render");
+    assert_eq!(out, "0=a;1=b;");
+}
+
+#[test]
+fn native_renderer_supports_range_variable_declarations_without_spaces() {
+    let data = json!({"items":["a","b"]});
+    let out =
+        render_template_native("{{range $i,$v:=.items}}{{$i}}={{$v}};{{end}}", &data)
+            .expect("must render");
     assert_eq!(out, "0=a;1=b;");
 }
 

@@ -188,6 +188,35 @@ fn parser_rejects_multi_decl_outside_range() {
 }
 
 #[test]
+fn parser_accepts_declarations_without_spaces_around_operators() {
+    let action = parse_action_compat_with_options(
+        "{{ $x:=1 }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: true,
+            known_functions: &[],
+            check_variables: true,
+            visible_variables: &[],
+        },
+    )
+    .expect("must parse");
+    assert_eq!(action, ControlAction::None);
+
+    let action = parse_action_compat_with_options(
+        "{{ range $i,$v:=.items }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: true,
+            known_functions: &[],
+            check_variables: false,
+            visible_variables: &[],
+        },
+    )
+    .expect("must parse");
+    assert_eq!(action, ControlAction::Open(ControlKind::Range));
+}
+
+#[test]
 fn parser_reports_undefined_variable_name_like_go() {
     let err = parse_action_compat_with_options(
         "{{ $x }}",
