@@ -16,6 +16,10 @@ fn typed_map(elem_type: &str, entries: Option<serde_json::Map<String, Value>>) -
     crate::gotemplates::encode_go_typed_map_value(elem_type, entries)
 }
 
+fn typed_slice(elem_type: &str, items: Option<Vec<Value>>) -> Value {
+    crate::gotemplates::encode_go_typed_slice_value(elem_type, items)
+}
+
 #[test]
 fn width_zero_precision_parser_matches_go_shape() {
     assert_eq!(parse_width_zero_precision("04"), (Some(4), true, None));
@@ -339,6 +343,34 @@ fn go_printf_formats_sharp_v_go_syntax_subset() {
         "[]byte(nil)"
     );
     assert_eq!(go_printf("%T", &nil_bytes).expect("must render"), "[]uint8");
+    let typed_slice_int = vec![Some(typed_slice(
+        "int",
+        Some(vec![
+            Value::Number(Number::from(1)),
+            Value::Number(Number::from(2)),
+        ]),
+    ))];
+    assert_eq!(
+        go_printf("%#v", &typed_slice_int).expect("must render"),
+        "[]int{1, 2}"
+    );
+    assert_eq!(
+        go_printf("%T", &typed_slice_int).expect("must render"),
+        "[]int"
+    );
+    let nil_typed_slice_int = vec![Some(typed_slice("int", None))];
+    assert_eq!(
+        go_printf("%v", &nil_typed_slice_int).expect("must render"),
+        "[]"
+    );
+    assert_eq!(
+        go_printf("%#v", &nil_typed_slice_int).expect("must render"),
+        "[]int(nil)"
+    );
+    assert_eq!(
+        go_printf("%T", &nil_typed_slice_int).expect("must render"),
+        "[]int"
+    );
 
     let strs = vec![Some(Value::Array(vec![
         Value::String("a".to_string()),

@@ -1,7 +1,8 @@
 use serde_json::{Number, Value};
 
 use crate::gotemplates::typedvalue::{
-    decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value, go_bytes_is_nil,
+    decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
+    decode_go_typed_slice_value, go_bytes_is_nil,
 };
 
 pub(super) fn format_value_for_printf(v: &Option<Value>, verb: char, sharp: bool) -> String {
@@ -41,6 +42,9 @@ pub(super) fn printf_type_name(v: &Value) -> String {
     if value_as_string_bytes(v).is_some() {
         return "string".to_string();
     }
+    if let Some(typed_slice) = decode_go_typed_slice_value(v) {
+        return format!("[]{}", typed_slice.elem_type);
+    }
     if let Some(typed_map) = decode_go_typed_map_value(v) {
         return format!("map[string]{}", typed_map.elem_type);
     }
@@ -79,6 +83,19 @@ pub(super) fn format_value_like_go(v: &Value) -> String {
     }
     if let Some(bytes) = value_as_string_bytes(v) {
         return String::from_utf8_lossy(&bytes).into_owned();
+    }
+    if let Some(typed_slice) = decode_go_typed_slice_value(v) {
+        let mut out = String::from("[");
+        if let Some(items) = typed_slice.items {
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&format_value_like_go(item));
+            }
+        }
+        out.push(']');
+        return out;
     }
     if let Some(typed_map) = decode_go_typed_map_value(v) {
         return format_map_entries_like_go(typed_map.entries);
@@ -123,6 +140,21 @@ fn format_value_go_syntax(v: &Value) -> String {
             return format!("{s:?}");
         }
         return quote_bytes_go_string_literal(&bytes);
+    }
+    if let Some(typed_slice) = decode_go_typed_slice_value(v) {
+        let elem_ty = typed_slice.elem_type;
+        let Some(items) = typed_slice.items else {
+            return format!("[]{elem_ty}(nil)");
+        };
+        let mut out = format!("[]{elem_ty}{{");
+        for (idx, item) in items.iter().enumerate() {
+            if idx > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format_value_go_syntax_item(item, elem_ty));
+        }
+        out.push('}');
+        return out;
     }
     if let Some(typed_map) = decode_go_typed_map_value(v) {
         let val_ty = typed_map.elem_type;

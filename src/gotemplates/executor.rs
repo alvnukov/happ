@@ -2,8 +2,9 @@ use super::{
     compat, parse_template_tokens_strict_with_options,
     typedvalue::{
         decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
-        encode_go_bytes_value, encode_go_string_bytes_value, go_bytes_get, go_bytes_len,
-        go_string_bytes_get, go_string_bytes_len, go_zero_value_for_type,
+        decode_go_typed_slice_value, encode_go_bytes_value, encode_go_string_bytes_value,
+        encode_go_typed_slice_value, go_bytes_get, go_bytes_len, go_string_bytes_get,
+        go_string_bytes_len, go_zero_value_for_type,
     },
     GoTemplateScanError, GoTemplateToken, ParseCompatOptions, HELM_INCLUDE_RECURSION_MAX_REFS,
 };
@@ -1103,6 +1104,9 @@ fn is_truthy(v: &Option<Value>) -> bool {
     if let Some(typed_map) = decode_go_typed_map_value(value) {
         return typed_map.entries.is_some_and(|entries| !entries.is_empty());
     }
+    if let Some(typed_slice) = decode_go_typed_slice_value(value) {
+        return typed_slice.items.is_some_and(|items| !items.is_empty());
+    }
     match value {
         Value::Null => false,
         Value::Bool(b) => *b,
@@ -1801,6 +1805,9 @@ fn builtin_len(action: &str, args: &[Option<Value>]) -> Result<usize, NativeRend
     if let Some(typed_map) = decode_go_typed_map_value(value) {
         return Ok(typed_map.entries.map_or(0, |entries| entries.len()));
     }
+    if let Some(typed_slice) = decode_go_typed_slice_value(value) {
+        return Ok(typed_slice.items.map_or(0, <[Value]>::len));
+    }
     match value {
         Value::Null => Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
@@ -1859,6 +1866,19 @@ fn builtin_index(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
                     }
                 };
                 cur = Some(next);
+                continue;
+            }
+            if let Some(typed_slice) = decode_go_typed_slice_value(value) {
+                let len = typed_slice.items.map_or(0, <[Value]>::len);
+                let pos = parse_slice_like_index(action, "index", idx, len)?;
+                let item = typed_slice
+                    .items
+                    .and_then(|items| items.get(pos))
+                    .ok_or_else(|| NativeRenderError::UnsupportedAction {
+                        action: action.to_string(),
+                        reason: "error calling index: malformed typed slice value".to_string(),
+                    })?;
+                cur = Some(item.clone());
                 continue;
             }
             if let Some(len) = go_bytes_len(value) {
@@ -2007,6 +2027,48 @@ fn builtin_slice(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
         }
         let sliced = bytes[idx[0]..idx[1]].to_vec();
         return Ok(Some(value_from_go_string_bytes(sliced)));
+    }
+    if let Some(typed_slice) = decode_go_typed_slice_value(item) {
+        let cap = typed_slice.items.map_or(0, <[Value]>::len);
+        let len = cap;
+        let mut idx = [0usize, len, cap];
+        for (i, index_arg) in args.iter().skip(1).enumerate() {
+            idx[i] = parse_slice_like_index(action, "slice", index_arg, cap)?;
+        }
+        if idx[0] > idx[1] {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!(
+                    "error calling slice: invalid slice index: {} > {}",
+                    idx[0], idx[1]
+                ),
+            });
+        }
+        if args.len() > 3 && idx[1] > idx[2] {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!(
+                    "error calling slice: invalid slice index: {} > {}",
+                    idx[1], idx[2]
+                ),
+            });
+        }
+        if typed_slice.items.is_none() {
+            return Ok(Some(encode_go_typed_slice_value(
+                typed_slice.elem_type,
+                None,
+            )));
+        }
+        let Some(items) = typed_slice.items else {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: "error calling slice: malformed typed slice value".to_string(),
+            });
+        };
+        return Ok(Some(encode_go_typed_slice_value(
+            typed_slice.elem_type,
+            Some(items[idx[0]..idx[1]].to_vec()),
+        )));
     }
 
     match item {
@@ -2197,6 +2259,7 @@ fn is_map_object_option(v: &Option<Value>) -> bool {
         matches!(value, Value::Object(_))
             && go_bytes_len(value).is_none()
             && go_string_bytes_len(value).is_none()
+            && decode_go_typed_slice_value(value).is_none()
     })
 }
 
@@ -2210,10 +2273,14 @@ fn non_comparable_kind_option(v: &Option<Value>) -> Option<NonComparableKind> {
     match v.as_ref() {
         Some(Value::Array(_)) => Some(NonComparableKind::Slice),
         Some(value) if go_bytes_len(value).is_some() => Some(NonComparableKind::Slice),
+        Some(value) if decode_go_typed_slice_value(value).is_some() => {
+            Some(NonComparableKind::Slice)
+        }
         Some(value)
             if matches!(value, Value::Object(_))
                 && go_bytes_len(value).is_none()
-                && go_string_bytes_len(value).is_none() =>
+                && go_string_bytes_len(value).is_none()
+                && decode_go_typed_slice_value(value).is_none() =>
         {
             Some(NonComparableKind::Map)
         }
@@ -2252,6 +2319,9 @@ fn value_type_name_for_template(v: &Value) -> String {
     }
     if go_string_bytes_len(v).is_some() {
         return "string".to_string();
+    }
+    if let Some(typed_slice) = decode_go_typed_slice_value(v) {
+        return format!("[]{}", typed_slice.elem_type);
     }
     if let Some(typed_map) = decode_go_typed_map_value(v) {
         return format!("map[string]{}", typed_map.elem_type);
@@ -2318,6 +2388,17 @@ fn range_items(
             }
         }
         return Ok(out);
+    }
+    if let Some(typed_slice) = decode_go_typed_slice_value(&value) {
+        let Some(items) = typed_slice.items else {
+            return Ok(Vec::new());
+        };
+        return Ok(items
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(idx, v)| (Some(Value::Number(Number::from(idx as u64))), v))
+            .collect());
     }
     match value {
         Value::Null => Ok(Vec::new()),
@@ -2433,6 +2514,19 @@ fn format_value_like_go(v: &Value) -> String {
     }
     if let Some(bytes) = decode_go_string_bytes_value(v) {
         return String::from_utf8_lossy(&bytes).into_owned();
+    }
+    if let Some(typed_slice) = decode_go_typed_slice_value(v) {
+        let mut out = String::from("[");
+        if let Some(items) = typed_slice.items {
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&format_value_like_go(item));
+            }
+        }
+        out.push(']');
+        return out;
     }
     if let Some(typed_map) = decode_go_typed_map_value(v) {
         return format_map_entries_like_go(typed_map.entries);

@@ -5,11 +5,18 @@ pub const GO_VALUE_KEY: &str = "__happ_go_value";
 pub const GO_TYPE_BYTES: &str = "[]byte";
 pub const GO_TYPE_STRING_BYTES: &str = "string-bytes";
 pub const GO_TYPE_MAP_PREFIX: &str = "map[string]";
+pub const GO_TYPE_SLICE_PREFIX: &str = "[]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GoTypedMapRef<'a> {
     pub elem_type: &'a str,
     pub entries: Option<&'a Map<String, Value>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoTypedSliceRef<'a> {
+    pub elem_type: &'a str,
+    pub items: Option<&'a [Value]>,
 }
 
 pub fn encode_go_bytes_value(bytes: &[u8]) -> Value {
@@ -148,6 +155,43 @@ pub fn decode_go_typed_map_value(value: &Value) -> Option<GoTypedMapRef<'_>> {
     Some(GoTypedMapRef { elem_type, entries })
 }
 
+pub fn encode_go_typed_slice_value(elem_type: &str, items: Option<Vec<Value>>) -> Value {
+    let mut map = Map::new();
+    map.insert(
+        GO_TYPE_KEY.to_string(),
+        Value::String(format!("{GO_TYPE_SLICE_PREFIX}{elem_type}")),
+    );
+    map.insert(
+        GO_VALUE_KEY.to_string(),
+        match items {
+            Some(items) => Value::Array(items),
+            None => Value::Null,
+        },
+    );
+    Value::Object(map)
+}
+
+pub fn decode_go_typed_slice_value(value: &Value) -> Option<GoTypedSliceRef<'_>> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+    let kind = map.get(GO_TYPE_KEY)?.as_str()?;
+    if kind == GO_TYPE_BYTES || kind == GO_TYPE_STRING_BYTES {
+        return None;
+    }
+    let elem_type = kind.strip_prefix(GO_TYPE_SLICE_PREFIX)?;
+    if elem_type.is_empty() {
+        return None;
+    }
+    let payload = map.get(GO_VALUE_KEY)?;
+    let items = match payload {
+        Value::Array(items) => Some(items.as_slice()),
+        Value::Null => None,
+        _ => return None,
+    };
+    Some(GoTypedSliceRef { elem_type, items })
+}
+
 pub fn go_type_is_interface(type_name: &str) -> bool {
     matches!(type_name.trim(), "interface {}" | "interface{}" | "any")
 }
@@ -164,7 +208,7 @@ pub fn go_zero_value_for_type(type_name: &str) -> Value {
         return encode_go_nil_bytes_value();
     }
     if kind.starts_with("[]") {
-        return Value::Array(Vec::new());
+        return encode_go_typed_slice_value(&kind[2..], None);
     }
     match kind {
         "bool" => Value::Bool(false),
@@ -295,6 +339,25 @@ mod tests {
     }
 
     #[test]
+    fn go_typed_slice_roundtrip_supports_nil_and_non_nil() {
+        let non_nil = encode_go_typed_slice_value(
+            "int",
+            Some(vec![
+                Value::Number(Number::from(1)),
+                Value::Number(Number::from(2)),
+            ]),
+        );
+        let decoded = decode_go_typed_slice_value(&non_nil).expect("typed slice must decode");
+        assert_eq!(decoded.elem_type, "int");
+        assert_eq!(decoded.items.map(|items| items.len()), Some(2));
+
+        let nil_slice = encode_go_typed_slice_value("int", None);
+        let decoded = decode_go_typed_slice_value(&nil_slice).expect("typed slice must decode");
+        assert_eq!(decoded.elem_type, "int");
+        assert!(decoded.items.is_none());
+    }
+
+    #[test]
     fn go_zero_value_for_type_supports_map_and_primitives() {
         assert_eq!(
             go_zero_value_for_type("int"),
@@ -317,6 +380,10 @@ mod tests {
         assert!(matches!(go_zero_value_for_type("interface{}"), Value::Null));
         let zero_bytes = go_zero_value_for_type("[]byte");
         assert!(go_bytes_is_nil(&zero_bytes));
+        let zero_slice = go_zero_value_for_type("[]int");
+        let decoded_slice = decode_go_typed_slice_value(&zero_slice).expect("slice must decode");
+        assert_eq!(decoded_slice.elem_type, "int");
+        assert!(decoded_slice.items.is_none());
         let typed_map = go_zero_value_for_type("map[string]int");
         let decoded = decode_go_typed_map_value(&typed_map).expect("typed map must decode");
         assert_eq!(decoded.elem_type, "int");
