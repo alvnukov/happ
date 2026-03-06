@@ -420,6 +420,18 @@ fn native_renderer_builtin_errors_follow_go_text_template_style() {
 }
 
 #[test]
+fn native_renderer_reports_cannot_evaluate_field_on_slice_like_go() {
+    let data = json!({"arr":[1,2]});
+    let err = render_template_native("{{.arr.x}}", &data).expect_err("must fail");
+    match err {
+        NativeRenderError::UnsupportedAction { reason, .. } => {
+            assert!(reason.contains("can't evaluate field x in type []interface {}"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn native_renderer_eq_reports_non_comparable_like_go_text_template() {
     let mut m = serde_json::Map::new();
     m.insert(

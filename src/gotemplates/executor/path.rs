@@ -1,6 +1,7 @@
 use super::{MissingValueMode, NativeRenderError};
 use crate::gotemplates::typedvalue::{
-    decode_go_typed_map_value, go_type_is_interface, go_zero_value_for_type,
+    decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_len, go_string_bytes_len,
+    go_type_is_interface, go_zero_value_for_type,
 };
 use serde_json::Value;
 
@@ -62,6 +63,18 @@ pub(super) fn resolve_simple_path(
                 return Ok(None);
             }
         } else {
+            if decode_go_typed_slice_value(&cur).is_some()
+                || go_bytes_len(&cur).is_some()
+                || go_string_bytes_len(&cur).is_some()
+            {
+                return Err(NativeRenderError::UnsupportedAction {
+                    action: format!("{{{{{expr}}}}}"),
+                    reason: format!(
+                        "can't evaluate field {seg} in type {}",
+                        value_type_name_for_path(&cur)
+                    ),
+                });
+            }
             match &cur {
                 Value::Object(map) => {
                     if let Some(next) = map.get(seg) {
@@ -82,7 +95,15 @@ pub(super) fn resolve_simple_path(
                         reason: format!("nil pointer evaluating interface {{}}.{seg}"),
                     });
                 }
-                _ => return Ok(None),
+                _ => {
+                    return Err(NativeRenderError::UnsupportedAction {
+                        action: format!("{{{{{expr}}}}}"),
+                        reason: format!(
+                            "can't evaluate field {seg} in type {}",
+                            value_type_name_for_path(&cur)
+                        ),
+                    });
+                }
             }
         };
         path = rest;
@@ -140,4 +161,35 @@ fn split_first_segment(path: &str) -> Option<(&str, &str)> {
 
 fn is_path_segment_char(ch: char) -> bool {
     is_identifier_continue_char(ch) || ch == '-'
+}
+
+fn value_type_name_for_path(v: &Value) -> String {
+    if go_bytes_len(v).is_some() {
+        return "[]uint8".to_string();
+    }
+    if go_string_bytes_len(v).is_some() {
+        return "string".to_string();
+    }
+    if let Some(typed_slice) = decode_go_typed_slice_value(v) {
+        return format!("[]{}", typed_slice.elem_type);
+    }
+    if let Some(typed_map) = decode_go_typed_map_value(v) {
+        return format!("map[string]{}", typed_map.elem_type);
+    }
+    match v {
+        Value::Null => "<nil>".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::String(_) => "string".to_string(),
+        Value::Array(_) => "[]interface {}".to_string(),
+        Value::Object(_) => "map[string]interface {}".to_string(),
+        Value::Number(n) => {
+            if n.as_i64().is_some() {
+                "int".to_string()
+            } else if n.as_u64().is_some() {
+                "uint".to_string()
+            } else {
+                "float64".to_string()
+            }
+        }
+    }
 }
