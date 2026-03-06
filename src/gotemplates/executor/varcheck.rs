@@ -1,4 +1,5 @@
-use super::{split_variable_reference, EvalState, GoTemplateScanError, NativeRenderError};
+use super::path::split_variable_reference;
+use super::{EvalState, GoTemplateScanError, NativeRenderError};
 use crate::gotemplates::compat;
 
 pub(super) fn looks_like_numeric_literal(expr: &str) -> bool {

@@ -3,13 +3,12 @@ use super::{
     typedvalue::{
         decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
         decode_go_typed_slice_value, encode_go_bytes_value, encode_go_nil_bytes_value,
-        encode_go_string_bytes_value, encode_go_typed_slice_value, go_bytes_get, go_bytes_is_nil,
-        go_bytes_len, go_string_bytes_get, go_string_bytes_len, go_zero_value_for_type,
+        encode_go_typed_slice_value, go_bytes_get, go_bytes_is_nil, go_bytes_len,
+        go_string_bytes_get, go_string_bytes_len, go_zero_value_for_type,
     },
     GoTemplateScanError, GoTemplateToken, ParseCompatOptions, HELM_INCLUDE_RECURSION_MAX_REFS,
 };
 use serde_json::{Number, Value};
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 mod compare;
 mod call;
@@ -24,6 +23,7 @@ mod rangeeval;
 mod textfmt;
 mod tokenize;
 mod truth;
+mod typeutil;
 mod trim;
 mod varcheck;
 use actionparse::parse_action_kind;
@@ -39,13 +39,18 @@ use externalfn::{try_eval_dynamic_external_function, try_eval_external_function}
 use govaluefmt::format_value_like_go;
 use path::{
     is_identifier_continue_char, is_identifier_start_char, resolve_simple_path,
-    split_variable_reference,
 };
 use pipeline_decl::{extract_pipeline_declaration, PipelineDeclMode, PipelineDeclaration};
 use rangeeval::{apply_range_iteration_bindings, range_items};
 use textfmt::{builtin_html, builtin_js, builtin_print, builtin_urlquery, format_value_for_print};
 use tokenize::{split_command_tokens, split_pipeline_commands, strip_outer_parens};
 use truth::{builtin_and, builtin_or, is_truthy};
+use typeutil::{
+    format_non_comparable_type_reason, format_non_comparable_types_reason, is_go_bytes_slice_option,
+    is_map_object_option, map_key_arg, non_comparable_kind_option, option_string_like_bytes,
+    option_type_name_for_template, parse_slice_like_index, value_from_go_string_bytes,
+    value_type_name_for_template, MapKeyArg,
+};
 use trim::apply_lexical_trims;
 use varcheck::{
     ensure_variable_is_defined, looks_like_char_literal, looks_like_numeric_literal,
@@ -1846,186 +1851,6 @@ fn wrong_number_of_args(action: &str, fn_name: &str, want: &str, got: usize) -> 
     NativeRenderError::UnsupportedAction {
         action: action.to_string(),
         reason: format!("wrong number of args for {fn_name}: want {want} got {got}"),
-    }
-}
-
-fn value_to_i64(v: &Option<Value>) -> Option<i64> {
-    match v.as_ref() {
-        Some(Value::Number(n)) => {
-            if let Some(i) = n.as_i64() {
-                Some(i)
-            } else {
-                n.as_u64().map(|u| u as i64)
-            }
-        }
-        _ => None,
-    }
-}
-
-fn parse_slice_like_index(
-    action: &str,
-    call_name: &str,
-    idx_arg: &Option<Value>,
-    cap: usize,
-) -> Result<usize, NativeRenderError> {
-    let raw = match idx_arg.as_ref() {
-        None | Some(Value::Null) => {
-            return Err(NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: format!("error calling {call_name}: cannot index slice/array with nil"),
-            });
-        }
-        Some(v) => value_to_i64(idx_arg).ok_or_else(|| NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: format!(
-                "error calling {call_name}: cannot index slice/array with type {}",
-                value_type_name_for_template(v)
-            ),
-        })?,
-    };
-    let out_of_range = if call_name == "index" {
-        raw < 0 || raw as usize >= cap
-    } else {
-        raw < 0 || raw as usize > cap
-    };
-    if out_of_range {
-        return Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: format!("error calling {call_name}: index out of range: {raw}"),
-        });
-    }
-    Ok(raw as usize)
-}
-
-fn value_from_go_string_bytes(bytes: Vec<u8>) -> Value {
-    match String::from_utf8(bytes) {
-        Ok(s) => Value::String(s),
-        Err(err) => encode_go_string_bytes_value(&err.into_bytes()),
-    }
-}
-
-enum MapKeyArg {
-    Key(String),
-    StringLikeNonUtf8,
-    WrongType,
-}
-
-fn map_key_arg(v: &Option<Value>) -> MapKeyArg {
-    match v.as_ref() {
-        Some(Value::String(s)) => MapKeyArg::Key(s.clone()),
-        Some(other) if go_string_bytes_len(other).is_some() => {
-            let Some(bytes) = decode_go_string_bytes_value(other) else {
-                return MapKeyArg::StringLikeNonUtf8;
-            };
-            match String::from_utf8(bytes) {
-                Ok(s) => MapKeyArg::Key(s),
-                Err(_) => MapKeyArg::StringLikeNonUtf8,
-            }
-        }
-        _ => MapKeyArg::WrongType,
-    }
-}
-
-fn option_string_like_bytes(v: &Option<Value>) -> Option<Cow<'_, [u8]>> {
-    match v.as_ref() {
-        Some(Value::String(s)) => Some(Cow::Borrowed(s.as_bytes())),
-        Some(other) => decode_go_string_bytes_value(other).map(Cow::Owned),
-        None => None,
-    }
-}
-
-fn is_go_bytes_slice_option(v: &Option<Value>) -> bool {
-    v.as_ref()
-        .is_some_and(|value| go_bytes_len(value).is_some())
-}
-
-fn is_map_object_option(v: &Option<Value>) -> bool {
-    v.as_ref().is_some_and(|value| {
-        matches!(value, Value::Object(_))
-            && go_bytes_len(value).is_none()
-            && go_string_bytes_len(value).is_none()
-            && decode_go_typed_slice_value(value).is_none()
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NonComparableKind {
-    Slice,
-    Map,
-}
-
-fn non_comparable_kind_option(v: &Option<Value>) -> Option<NonComparableKind> {
-    match v.as_ref() {
-        Some(Value::Array(_)) => Some(NonComparableKind::Slice),
-        Some(value) if go_bytes_len(value).is_some() => Some(NonComparableKind::Slice),
-        Some(value) if decode_go_typed_slice_value(value).is_some() => {
-            Some(NonComparableKind::Slice)
-        }
-        Some(value)
-            if matches!(value, Value::Object(_))
-                && go_bytes_len(value).is_none()
-                && go_string_bytes_len(value).is_none()
-                && decode_go_typed_slice_value(value).is_none() =>
-        {
-            Some(NonComparableKind::Map)
-        }
-        _ => None,
-    }
-}
-
-fn format_non_comparable_type_reason(v: &Option<Value>) -> String {
-    format!(
-        "error calling eq: non-comparable type {}: {}",
-        format_value_for_print(v),
-        option_type_name_for_template(v)
-    )
-}
-
-fn format_non_comparable_types_reason(a: &Option<Value>, b: &Option<Value>) -> String {
-    format!(
-        "error calling eq: non-comparable types {}: {}, {}: {}",
-        format_value_for_print(a),
-        option_type_name_for_template(a),
-        option_type_name_for_template(b),
-        format_value_for_print(b)
-    )
-}
-
-fn option_type_name_for_template(v: &Option<Value>) -> String {
-    match v.as_ref() {
-        Some(value) => value_type_name_for_template(value),
-        None => "<nil>".to_string(),
-    }
-}
-
-fn value_type_name_for_template(v: &Value) -> String {
-    if go_bytes_len(v).is_some() {
-        return "[]uint8".to_string();
-    }
-    if go_string_bytes_len(v).is_some() {
-        return "string".to_string();
-    }
-    if let Some(typed_slice) = decode_go_typed_slice_value(v) {
-        return format!("[]{}", typed_slice.elem_type);
-    }
-    if let Some(typed_map) = decode_go_typed_map_value(v) {
-        return format!("map[string]{}", typed_map.elem_type);
-    }
-    match v {
-        Value::Null => "<nil>".to_string(),
-        Value::Bool(_) => "bool".to_string(),
-        Value::String(_) => "string".to_string(),
-        Value::Array(_) => "[]interface {}".to_string(),
-        Value::Object(_) => "map[string]interface {}".to_string(),
-        Value::Number(n) => {
-            if n.as_i64().is_some() {
-                "int".to_string()
-            } else if n.as_u64().is_some() {
-                "uint".to_string()
-            } else {
-                "float64".to_string()
-            }
-        }
     }
 }
 
