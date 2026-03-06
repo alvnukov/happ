@@ -154,6 +154,8 @@ fn go_compat_template_exec_matrix_matches_go_text_template_subset() {
         Case::new(r#"{{define "main"}}{{call ext}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{1 | call ext}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{call nil}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{call (nil)}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{call (printf)}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{call "x"}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{call ("x")}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{call 1}}{{end}}"#, json!({})),

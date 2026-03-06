@@ -203,6 +203,8 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{printf}}",
         "{{call}}",
         "{{call nil}}",
+        "{{call (nil)}}",
+        "{{call (printf)}}",
         "{{call \"x\"}}",
         "{{call (\"x\")}}",
         "{{call 1}}",

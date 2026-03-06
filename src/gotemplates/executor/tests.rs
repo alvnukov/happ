@@ -938,6 +938,8 @@ fn native_renderer_call_builtin_reports_go_like_non_function_errors() {
         ("{{call}}", "wrong number of args for call: want at least 1 got 0"),
         ("{{call ext}}", "\"ext\" is not a defined function"),
         ("{{call nil}}", "error calling call: call of nil"),
+        ("{{call (nil)}}", "nil is not a command"),
+        ("{{call (printf)}}", "wrong number of args for printf"),
         (
             "{{call .fn}}",
             "error calling call: non-function .fn of type string",
