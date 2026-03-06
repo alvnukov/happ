@@ -164,6 +164,7 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{1 | (nil)}}",
         "{{1 | \"x\"}}",
         "{{1 | (\"x\")}}",
+        "{{1 | (printf)}}",
         "{{nil 1}}",
         "{{1 2}}",
         "{{(1) 2}}",

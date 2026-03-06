@@ -497,6 +497,10 @@ fn native_renderer_reports_non_function_commands_like_go() {
             "{{1 | (\"x\")}}",
             "can't give argument to non-function \"x\"",
         ),
+        (
+            "{{1 | (printf)}}",
+            "can't give argument to non-function printf",
+        ),
     ] {
         let err = render_template_native(src, &data).expect_err("must fail");
         match err {
