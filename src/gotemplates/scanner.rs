@@ -762,6 +762,7 @@ mod tests {
         .expect_err("must fail");
         assert_eq!(err.code, "undefined_variable");
         assert_eq!(err.offset, 5);
+        assert!(err.message.contains("undefined variable \"$x\""));
     }
 
     #[test]
@@ -859,6 +860,7 @@ mod tests {
         )
         .expect_err("must fail");
         assert_eq!(err.code, "undefined_variable");
+        assert!(err.message.contains("undefined variable \"$x\""));
     }
 
     #[test]
@@ -875,6 +877,7 @@ mod tests {
         )
         .expect_err("must fail");
         assert_eq!(err.code, "undefined_variable");
+        assert!(err.message.contains("undefined variable \"$x\""));
     }
 
     #[test]
