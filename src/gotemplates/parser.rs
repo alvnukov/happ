@@ -686,7 +686,7 @@ impl<'a> Parser<'a> {
         }
         Err(GoTemplateScanError {
             code: "undefined_function",
-            message: "function is not defined",
+            message: format!("function \"{name}\" not defined"),
             offset: self.abs(start),
         })
     }

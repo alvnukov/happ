@@ -65,6 +65,7 @@ fn parser_can_check_function_existence() {
     )
     .expect_err("must fail");
     assert_eq!(err.code, "undefined_function");
+    assert!(err.message.contains("function \"totallyUnknown\" not defined"));
 }
 
 #[test]
