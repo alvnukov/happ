@@ -69,6 +69,51 @@ fn go_compat_typed_map_semantics_match_go_subset() {
             kind: "map_string_int_nil",
             option: None,
         },
+        Case {
+            src: r#"{{define "main"}}{{.m.missing.y}}{{end}}"#,
+            kind: "map_string_any_non_nil",
+            option: Some("missingkey=zero"),
+        },
+        Case {
+            src: r#"{{define "main"}}{{index .m "missing"}}|{{printf "%T" (index .m "missing")}}{{end}}"#,
+            kind: "map_string_any_non_nil",
+            option: None,
+        },
+        Case {
+            src: r#"{{define "main"}}{{.m.missing.y}}{{end}}"#,
+            kind: "map_string_any_non_nil",
+            option: Some("missingkey=default"),
+        },
+        Case {
+            src: r#"{{define "main"}}{{.m.missing.y}}{{end}}"#,
+            kind: "map_string_any_non_nil",
+            option: Some("missingkey=error"),
+        },
+        Case {
+            src: r#"{{define "main"}}{{.m.missing}}{{end}}"#,
+            kind: "map_string_any_nil",
+            option: Some("missingkey=zero"),
+        },
+        Case {
+            src: r#"{{define "main"}}{{.m.missing.y}}{{end}}"#,
+            kind: "map_string_any_nil",
+            option: Some("missingkey=zero"),
+        },
+        Case {
+            src: r#"{{define "main"}}{{.m.missing.y}}{{end}}"#,
+            kind: "map_string_any_nil",
+            option: Some("missingkey=default"),
+        },
+        Case {
+            src: r#"{{define "main"}}{{.m.missing.y}}{{end}}"#,
+            kind: "map_string_any_nil",
+            option: Some("missingkey=error"),
+        },
+        Case {
+            src: r#"{{define "main"}}{{index .m "missing"}}|{{printf "%T" (index .m "missing")}}{{end}}"#,
+            kind: "map_string_any_nil",
+            option: None,
+        },
     ];
 
     let go_results = runner
@@ -163,6 +208,26 @@ fn build_rust_data(kind: &str) -> Value {
             root.insert(
                 "m".to_string(),
                 happ::gotemplates::encode_go_typed_map_value("int", None),
+            );
+            Value::Object(root)
+        }
+        "map_string_any_non_nil" => {
+            let mut nested = serde_json::Map::new();
+            nested.insert("y".to_string(), Value::Number(Number::from(2)));
+            let mut entries = serde_json::Map::new();
+            entries.insert("x".to_string(), Value::Object(nested));
+            let mut root = serde_json::Map::new();
+            root.insert(
+                "m".to_string(),
+                happ::gotemplates::encode_go_typed_map_value("interface {}", Some(entries)),
+            );
+            Value::Object(root)
+        }
+        "map_string_any_nil" => {
+            let mut root = serde_json::Map::new();
+            root.insert(
+                "m".to_string(),
+                happ::gotemplates::encode_go_typed_map_value("interface {}", None),
             );
             Value::Object(root)
         }
@@ -351,6 +416,12 @@ func buildData(kind string) (any, error) {
         return map[string]any{"m": m}, nil
     case "map_string_int_nil":
         var m map[string]int
+        return map[string]any{"m": m}, nil
+    case "map_string_any_non_nil":
+        m := map[string]any{"x": map[string]int{"y": 2}}
+        return map[string]any{"m": m}, nil
+    case "map_string_any_nil":
+        var m map[string]any
         return map[string]any{"m": m}, nil
     default:
         return nil, fmt.Errorf("unknown kind: %s", kind)
