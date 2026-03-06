@@ -107,6 +107,42 @@ fn go_compat_template_api_matches_go_text_template_subset() {
             data: json!({}),
         },
         Case {
+            src: r#"{{define "main"}}{{call}}{{end}}"#,
+            name: "main",
+            option: None,
+            data: json!({}),
+        },
+        Case {
+            src: r#"{{define "main"}}{{call nil}}{{end}}"#,
+            name: "main",
+            option: None,
+            data: json!({}),
+        },
+        Case {
+            src: r#"{{define "main"}}{{call "x"}}{{end}}"#,
+            name: "main",
+            option: None,
+            data: json!({}),
+        },
+        Case {
+            src: r#"{{define "main"}}{{call 1}}{{end}}"#,
+            name: "main",
+            option: None,
+            data: json!({}),
+        },
+        Case {
+            src: r#"{{define "main"}}{{call .fn}}{{end}}"#,
+            name: "main",
+            option: None,
+            data: json!({"fn":"ext"}),
+        },
+        Case {
+            src: r#"{{define "main"}}{{call .missing}}{{end}}"#,
+            name: "main",
+            option: None,
+            data: json!({}),
+        },
+        Case {
             src: r#"{{define "main"}}{{1 | nil}}{{end}}"#,
             name: "main",
             option: None,

@@ -150,6 +150,12 @@ fn go_compat_template_exec_matrix_matches_go_text_template_subset() {
             json!({"v":"boom"}),
         )
         .funcs(&["failif"]),
+        Case::new(r#"{{define "main"}}{{call}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{call nil}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{call "x"}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{call 1}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{call .fn}}{{end}}"#, json!({"fn":"ext"})),
+        Case::new(r#"{{define "main"}}{{call .missing}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main""#, json!({})),
         Case::new(r#"{{define "main"}}{{nope 1}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}x{{end}}"#, json!({})).name("missing"),

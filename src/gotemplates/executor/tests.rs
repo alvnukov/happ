@@ -915,6 +915,48 @@ fn native_renderer_supports_call_builtin_via_resolver() {
     )
     .expect("must render");
     assert_eq!(out, "called:z");
+
+    let err = render_template_native_with_resolver(
+        "{{call nope \"x\"}}",
+        &data,
+        NativeRenderOptions::default(),
+        Some(&resolver),
+    )
+    .expect_err("must fail");
+    match err {
+        NativeRenderError::UnsupportedAction { reason, .. } => {
+            assert!(reason.contains("\"nope\" is not a defined function"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn native_renderer_call_builtin_reports_go_like_non_function_errors() {
+    let data = json!({"fn":"ext"});
+    for (src, want) in [
+        ("{{call}}", "wrong number of args for call: want at least 1 got 0"),
+        ("{{call ext}}", "\"ext\" is not a defined function"),
+        ("{{call nil}}", "error calling call: call of nil"),
+        (
+            "{{call .fn}}",
+            "error calling call: non-function .fn of type string",
+        ),
+        ("{{call .missing}}", "error calling call: call of nil"),
+        (
+            "{{call \"x\"}}",
+            "error calling call: non-function \"x\" of type string",
+        ),
+        ("{{call 1}}", "error calling call: non-function 1 of type int"),
+    ] {
+        let err = render_template_native(src, &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains(want), "src={src} reason={reason}");
+            }
+            other => panic!("unexpected error for {src}: {other:?}"),
+        }
+    }
 }
 
 #[test]
