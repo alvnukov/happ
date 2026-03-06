@@ -23,6 +23,7 @@ mod actionparse;
 mod rangeeval;
 mod textfmt;
 mod tokenize;
+mod truth;
 mod trim;
 use actionparse::parse_action_kind;
 use call::eval_call_builtin;
@@ -43,6 +44,7 @@ use pipeline_decl::{extract_pipeline_declaration, PipelineDeclMode, PipelineDecl
 use rangeeval::{apply_range_iteration_bindings, range_items};
 use textfmt::{builtin_html, builtin_js, builtin_print, builtin_urlquery, format_value_for_print};
 use tokenize::{split_command_tokens, split_pipeline_commands, strip_outer_parens};
+use truth::{builtin_and, builtin_or, is_truthy};
 use trim::apply_lexical_trims;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1017,33 +1019,6 @@ fn eval_expr_truthy(
     Ok(is_truthy(&val))
 }
 
-fn is_truthy(v: &Option<Value>) -> bool {
-    let Some(value) = v.as_ref() else {
-        return false;
-    };
-    if let Some(len) = go_bytes_len(value).or_else(|| go_string_bytes_len(value)) {
-        return len > 0;
-    }
-    if let Some(typed_map) = decode_go_typed_map_value(value) {
-        return typed_map.entries.is_some_and(|entries| !entries.is_empty());
-    }
-    if let Some(typed_slice) = decode_go_typed_slice_value(value) {
-        return typed_slice.items.is_some_and(|items| !items.is_empty());
-    }
-    match value {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => {
-            n.as_i64().is_some_and(|i| i != 0)
-                || n.as_u64().is_some_and(|u| u != 0)
-                || n.as_f64().is_some_and(|f| f != 0.0)
-        }
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
-}
-
 fn eval_expr_value(
     expr: &str,
     root: &Value,
@@ -1510,30 +1485,6 @@ fn eval_builtin_function(
         }
     };
     Ok(value)
-}
-
-fn builtin_and(args: &[Option<Value>]) -> Option<Value> {
-    if args.is_empty() {
-        return None;
-    }
-    for arg in args {
-        if !is_truthy(arg) {
-            return arg.clone();
-        }
-    }
-    args.last().cloned().unwrap_or(None)
-}
-
-fn builtin_or(args: &[Option<Value>]) -> Option<Value> {
-    if args.is_empty() {
-        return None;
-    }
-    for arg in args {
-        if is_truthy(arg) {
-            return arg.clone();
-        }
-    }
-    args.last().cloned().unwrap_or(None)
 }
 
 fn builtin_len(action: &str, args: &[Option<Value>]) -> Result<usize, NativeRenderError> {
