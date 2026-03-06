@@ -11,27 +11,46 @@ const LEFT_COMMENT: &str = "/*";
 const RIGHT_COMMENT: &str = "*/";
 
 pub fn contains_template_markup(s: &str) -> bool {
-    s.contains(LEFT_DELIM) && s.contains(RIGHT_DELIM)
+    contains_template_markup_with_delims(s, LEFT_DELIM, RIGHT_DELIM)
 }
 
 pub fn collect_action_spans(src: &str) -> Vec<GoTemplateActionSpan> {
-    let (spans, _) = scan_template_actions(src);
+    let (spans, _) = scan_template_actions_with_delims(src, LEFT_DELIM, RIGHT_DELIM);
     spans
 }
 
 pub fn scan_template_actions(src: &str) -> (Vec<GoTemplateActionSpan>, Vec<GoTemplateScanError>) {
+    scan_template_actions_with_delims(src, LEFT_DELIM, RIGHT_DELIM)
+}
+
+pub fn scan_template_actions_with_delims(
+    src: &str,
+    left_delim: &str,
+    right_delim: &str,
+) -> (Vec<GoTemplateActionSpan>, Vec<GoTemplateScanError>) {
+    if left_delim.is_empty() || right_delim.is_empty() {
+        return (
+            Vec::new(),
+            vec![GoTemplateScanError {
+                code: "invalid_delimiters",
+                message: "template delimiters must be non-empty",
+                offset: 0,
+            }],
+        );
+    }
+
     let mut spans = Vec::new();
     let mut errors = Vec::new();
     let mut cursor = 0usize;
 
     while cursor < src.len() {
-        let Some(open_rel) = src[cursor..].find(LEFT_DELIM) else {
+        let Some(open_rel) = src[cursor..].find(left_delim) else {
             break;
         };
         let open = cursor + open_rel;
-        let action_start = open + LEFT_DELIM.len();
+        let action_start = open + left_delim.len();
 
-        match scan_action_end(src, action_start) {
+        match scan_action_end_with_delims(src, action_start, left_delim, right_delim) {
             Ok(end) => {
                 spans.push(GoTemplateActionSpan { start: open, end });
                 cursor = end;
@@ -60,10 +79,27 @@ pub fn parse_template_tokens_strict_with_options(
     src: &str,
     options: ParseCompatOptions<'_>,
 ) -> Result<Vec<GoTemplateToken>, GoTemplateScanError> {
-    let (spans, errors) = scan_template_actions(src);
+    parse_template_tokens_strict_with_options_and_delims(src, LEFT_DELIM, RIGHT_DELIM, options)
+}
+
+pub fn parse_template_tokens_strict_with_options_and_delims(
+    src: &str,
+    left_delim: &str,
+    right_delim: &str,
+    options: ParseCompatOptions<'_>,
+) -> Result<Vec<GoTemplateToken>, GoTemplateScanError> {
+    if left_delim.is_empty() || right_delim.is_empty() {
+        return Err(GoTemplateScanError {
+            code: "invalid_delimiters",
+            message: "template delimiters must be non-empty",
+            offset: 0,
+        });
+    }
+    let (spans, errors) = scan_template_actions_with_delims(src, left_delim, right_delim);
     if let Some(err) = errors.first().copied() {
         return Err(err);
     }
+    let action_offset_delta = left_delim.len() as isize - LEFT_DELIM.len() as isize;
     let mut stack: Vec<SimpleFrame> = Vec::new();
     let mut range_depth = 0usize;
     let mut var_scopes: Vec<Vec<String>> = vec![vec!["$".to_string()]];
@@ -76,11 +112,20 @@ pub fn parse_template_tokens_strict_with_options(
         mark_define_body_from_literal(&mut stack, literal);
 
         let action = &src[span.start..span.end];
+        let normalized_action = normalize_action_delimiters(action, left_delim, right_delim)
+            .ok_or(GoTemplateScanError {
+                code: "invalid_delimiters",
+                message: "template action uses invalid delimiters",
+                offset: span.start,
+            })?;
         let visible_variables = collect_visible_variables(&var_scopes);
         let mut parse_options = options;
         parse_options.visible_variables = &visible_variables;
-        let report = parse_action_report_with_options(action, span.start, parse_options)?;
-        mark_define_body_from_action(&mut stack, &report, action);
+        let mut report =
+            parse_action_report_with_options(&normalized_action, span.start, parse_options)
+                .map_err(|err| shift_scan_error_offset(err, action_offset_delta))?;
+        shift_action_report_offsets(&mut report, action_offset_delta);
+        mark_define_body_from_action(&mut stack, &report, &normalized_action);
         validate_variable_references(&var_scopes, &report, options.check_variables)?;
         apply_control_action(
             &mut stack,
@@ -95,7 +140,7 @@ pub fn parse_template_tokens_strict_with_options(
         apply_declared_variables(&mut var_scopes, &report, options.check_variables);
 
         out.push(GoTemplateToken::Literal(literal.to_string()));
-        out.push(GoTemplateToken::Action(action.to_string()));
+        out.push(GoTemplateToken::Action(normalized_action));
         cursor = span.end;
     }
 
@@ -374,7 +419,12 @@ fn is_comment_action(action: &str) -> bool {
     inner.starts_with("/*")
 }
 
-fn scan_action_end(src: &str, action_start: usize) -> Result<usize, GoTemplateScanError> {
+fn scan_action_end_with_delims(
+    src: &str,
+    action_start: usize,
+    left_delim: &str,
+    right_delim: &str,
+) -> Result<usize, GoTemplateScanError> {
     #[derive(Clone, Copy)]
     enum State {
         Normal,
@@ -384,12 +434,13 @@ fn scan_action_end(src: &str, action_start: usize) -> Result<usize, GoTemplateSc
     }
 
     let bytes = src.as_bytes();
+    let right = right_delim.as_bytes();
     let mut i = action_start;
     if has_left_trim_marker(bytes, i) {
         i += 2;
     }
     if starts_with(bytes, i, LEFT_COMMENT.as_bytes()) {
-        return scan_comment_action_end(bytes, i);
+        return scan_comment_action_end_with_delims(bytes, i, right);
     }
 
     let mut paren_depth: i32 = 0;
@@ -399,7 +450,7 @@ fn scan_action_end(src: &str, action_start: usize) -> Result<usize, GoTemplateSc
         match state {
             State::Normal => {
                 if paren_depth == 0 {
-                    if let Some(end) = at_right_delim_end(bytes, i) {
+                    if let Some(end) = at_right_delim_end_with_delims(bytes, i, right) {
                         return Ok(end);
                     }
                 }
@@ -498,19 +549,20 @@ fn scan_action_end(src: &str, action_start: usize) -> Result<usize, GoTemplateSc
     Err(GoTemplateScanError {
         code,
         message,
-        offset: action_start.saturating_sub(LEFT_DELIM.len()),
+        offset: action_start.saturating_sub(left_delim.len()),
     })
 }
 
-fn scan_comment_action_end(
+fn scan_comment_action_end_with_delims(
     bytes: &[u8],
     comment_start: usize,
+    right_delim: &[u8],
 ) -> Result<usize, GoTemplateScanError> {
     let mut i = comment_start + LEFT_COMMENT.len();
     while i < bytes.len() {
         if starts_with(bytes, i, RIGHT_COMMENT.as_bytes()) {
             let after_comment = i + RIGHT_COMMENT.len();
-            if let Some(end) = at_right_delim_end(bytes, after_comment) {
+            if let Some(end) = at_right_delim_end_with_delims(bytes, after_comment, right_delim) {
                 return Ok(end);
             }
             return Err(GoTemplateScanError {
@@ -534,18 +586,27 @@ fn starts_with(haystack: &[u8], offset: usize, needle: &[u8]) -> bool {
         .is_some_and(|chunk| chunk == needle)
 }
 
-fn starts_with_right_trim_delim(bytes: &[u8], offset: usize) -> bool {
-    bytes.get(offset..offset + 4).is_some_and(|chunk| {
-        chunk[0].is_ascii_whitespace() && chunk[1] == b'-' && &chunk[2..4] == b"}}"
+fn starts_with_right_trim_delim_with_delims(
+    bytes: &[u8],
+    offset: usize,
+    right_delim: &[u8],
+) -> bool {
+    let need = 2 + right_delim.len();
+    bytes.get(offset..offset + need).is_some_and(|chunk| {
+        chunk[0].is_ascii_whitespace() && chunk[1] == b'-' && &chunk[2..] == right_delim
     })
 }
 
-fn at_right_delim_end(bytes: &[u8], offset: usize) -> Option<usize> {
-    if starts_with_right_trim_delim(bytes, offset) {
-        return Some(offset + 4);
+fn at_right_delim_end_with_delims(
+    bytes: &[u8],
+    offset: usize,
+    right_delim: &[u8],
+) -> Option<usize> {
+    if starts_with_right_trim_delim_with_delims(bytes, offset, right_delim) {
+        return Some(offset + 2 + right_delim.len());
     }
-    if starts_with(bytes, offset, RIGHT_DELIM.as_bytes()) {
-        return Some(offset + RIGHT_DELIM.len());
+    if starts_with(bytes, offset, right_delim) {
+        return Some(offset + right_delim.len());
     }
     None
 }
@@ -554,6 +615,57 @@ fn has_left_trim_marker(bytes: &[u8], offset: usize) -> bool {
     bytes
         .get(offset..offset + 2)
         .is_some_and(|chunk| chunk[0] == b'-' && chunk[1].is_ascii_whitespace())
+}
+
+fn contains_template_markup_with_delims(s: &str, left_delim: &str, right_delim: &str) -> bool {
+    !left_delim.is_empty()
+        && !right_delim.is_empty()
+        && s.contains(left_delim)
+        && s.contains(right_delim)
+}
+
+fn normalize_action_delimiters(
+    action: &str,
+    left_delim: &str,
+    right_delim: &str,
+) -> Option<String> {
+    if !action.starts_with(left_delim) || !action.ends_with(right_delim) {
+        return None;
+    }
+    if action.len() < left_delim.len() + right_delim.len() {
+        return None;
+    }
+    let inner = &action[left_delim.len()..action.len() - right_delim.len()];
+    let mut out = String::with_capacity(LEFT_DELIM.len() + inner.len() + RIGHT_DELIM.len());
+    out.push_str(LEFT_DELIM);
+    out.push_str(inner);
+    out.push_str(RIGHT_DELIM);
+    Some(out)
+}
+
+fn shift_action_report_offsets(report: &mut ActionParseReport, delta: isize) {
+    for item in &mut report.declared_vars {
+        item.offset = shift_offset(item.offset, delta);
+    }
+    for item in &mut report.assigned_vars {
+        item.offset = shift_offset(item.offset, delta);
+    }
+    for item in &mut report.referenced_vars {
+        item.offset = shift_offset(item.offset, delta);
+    }
+}
+
+fn shift_scan_error_offset(mut err: GoTemplateScanError, delta: isize) -> GoTemplateScanError {
+    err.offset = shift_offset(err.offset, delta);
+    err
+}
+
+fn shift_offset(offset: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        offset.saturating_add(delta as usize)
+    } else {
+        offset.saturating_sub((-delta) as usize)
+    }
 }
 
 #[cfg(test)]
@@ -613,6 +725,43 @@ mod tests {
                 GoTemplateToken::Literal(" -world".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn parse_template_tokens_with_custom_delims_normalizes_to_default_actions() {
+        let tokens = parse_template_tokens_strict_with_options_and_delims(
+            "A<< .Values.a >>B",
+            "<<",
+            ">>",
+            ParseCompatOptions::default(),
+        )
+        .expect("must parse");
+        assert_eq!(
+            tokens,
+            vec![
+                GoTemplateToken::Literal("A".to_string()),
+                GoTemplateToken::Action("{{ .Values.a }}".to_string()),
+                GoTemplateToken::Literal("B".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_delims_keep_original_error_offsets() {
+        let err = parse_template_tokens_strict_with_options_and_delims(
+            "AA[[[$x]]]",
+            "[[[",
+            "]]]",
+            ParseCompatOptions {
+                skip_func_check: true,
+                known_functions: &[],
+                check_variables: true,
+                visible_variables: &[],
+            },
+        )
+        .expect_err("must fail");
+        assert_eq!(err.code, "undefined_variable");
+        assert_eq!(err.offset, 5);
     }
 
     #[test]

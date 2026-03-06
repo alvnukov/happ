@@ -97,3 +97,6 @@
 - name: missing_parenthesized_pipeline_value
   src: '{{ ( ) }}'
   expected_code: missing_value_for_context
+- name: unicode_variable_and_path_ok
+  src: '{{$имя := .данные.ключ}}{{$имя}}'
+  expected_code: null

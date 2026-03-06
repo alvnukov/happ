@@ -1,14 +1,28 @@
 use super::{
-    compat,
-    parse_template_tokens_strict_with_options, GoTemplateScanError, GoTemplateToken,
-    ParseCompatOptions, HELM_INCLUDE_RECURSION_MAX_REFS,
+    compat, parse_template_tokens_strict_with_options,
+    typedvalue::{
+        decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
+        encode_go_bytes_value, encode_go_string_bytes_value, go_bytes_get, go_bytes_len,
+        go_string_bytes_get, go_string_bytes_len, go_zero_value_for_type,
+    },
+    utf8scan::push_utf8_char_from_bytes,
+    GoTemplateScanError, GoTemplateToken, ParseCompatOptions, HELM_INCLUDE_RECURSION_MAX_REFS,
 };
 use serde_json::{Number, Value};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+mod compare;
+mod path;
+use compare::{builtin_cmp, builtin_eq, builtin_ne};
+use path::{
+    is_identifier_continue_char, is_identifier_start_char, resolve_simple_path,
+    split_variable_reference,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingValueMode {
     GoDefault,
+    GoZero,
     Error,
 }
 
@@ -124,7 +138,7 @@ pub fn render_template_native_with_resolver(
     apply_lexical_trims(&mut tokens);
     let (main_tokens, templates) = split_template_set(&tokens)?;
     let dot = root.clone();
-    let mut state = EvalState::new();
+    let mut state = EvalState::new(options.missing_value_mode);
     let eval = eval_block(
         &main_tokens,
         0,
@@ -159,12 +173,14 @@ struct BlockEval {
 #[derive(Debug, Clone)]
 struct EvalState {
     scopes: Vec<BTreeMap<String, Option<Value>>>,
+    missing_value_mode: MissingValueMode,
 }
 
 impl EvalState {
-    fn new() -> Self {
+    fn new(missing_value_mode: MissingValueMode) -> Self {
         Self {
             scopes: vec![BTreeMap::new()],
+            missing_value_mode,
         }
     }
 
@@ -329,17 +345,8 @@ fn eval_block(
                         let end_idx = find_matching_end(tokens, idx + 1)?;
                         let fallback = &tokens[idx + 1..end_idx.saturating_sub(1)];
                         out.push_str(&eval_block_invocation(
-                            &name,
-                            &arg,
-                            fallback,
-                            templates,
-                            root,
-                            dot,
-                            options,
-                            resolver,
-                            call_depth,
-                            state,
-                            action,
+                            &name, &arg, fallback, templates, root, dot, options, resolver,
+                            call_depth, state, action,
                         )?);
                         idx = end_idx;
                     }
@@ -405,16 +412,7 @@ fn eval_if(
         let cond = eval_expr_truthy(expr, root, dot, state, resolver)?;
         if cond {
             let then_eval = eval_block(
-                tokens,
-                start_idx,
-                templates,
-                root,
-                dot,
-                true,
-                options,
-                resolver,
-                call_depth,
-                state,
+                tokens, start_idx, templates, root, dot, true, options, resolver, call_depth, state,
             )?;
             let next_idx = match then_eval.term {
                 Terminator::End => then_eval.next_idx,
@@ -492,13 +490,13 @@ fn eval_if(
                     offset: 0,
                 }))
             }
-            Terminator::Break | Terminator::Continue => Err(NativeRenderError::Parse(
-                GoTemplateScanError {
+            Terminator::Break | Terminator::Continue => {
+                Err(NativeRenderError::Parse(GoTemplateScanError {
                     code: "unexpected_token",
                     message: "unexpected break/continue outside range",
                     offset: 0,
-                },
-            )),
+                }))
+            }
             Terminator::Eof => Err(NativeRenderError::Parse(GoTemplateScanError {
                 code: "unexpected_eof",
                 message: "unexpected EOF",
@@ -616,13 +614,13 @@ fn eval_with(
                     offset: 0,
                 }))
             }
-            Terminator::Break | Terminator::Continue => Err(NativeRenderError::Parse(
-                GoTemplateScanError {
+            Terminator::Break | Terminator::Continue => {
+                Err(NativeRenderError::Parse(GoTemplateScanError {
                     code: "unexpected_token",
                     message: "unexpected break/continue outside range",
                     offset: 0,
-                },
-            )),
+                }))
+            }
             Terminator::Eof => Err(NativeRenderError::Parse(GoTemplateScanError {
                 code: "unexpected_eof",
                 message: "unexpected EOF",
@@ -718,13 +716,13 @@ fn eval_range(
                     message: "unexpected else-chain in range",
                     offset: 0,
                 })),
-                Terminator::Break | Terminator::Continue => Err(NativeRenderError::Parse(
-                    GoTemplateScanError {
+                Terminator::Break | Terminator::Continue => {
+                    Err(NativeRenderError::Parse(GoTemplateScanError {
                         code: "unexpected_token",
                         message: "unexpected break/continue outside range",
                         offset: 0,
-                    },
-                )),
+                    }))
+                }
                 Terminator::Eof => Err(NativeRenderError::Parse(GoTemplateScanError {
                     code: "unexpected_eof",
                     message: "unexpected EOF",
@@ -740,15 +738,7 @@ fn eval_range(
                 apply_range_iteration_bindings(expr, d, key, &item, state)?;
             }
             let eval = eval_block(
-                tokens,
-                start_idx,
-                templates,
-                root,
-                &item,
-                true,
-                options,
-                resolver,
-                call_depth,
+                tokens, start_idx, templates, root, &item, true, options, resolver, call_depth,
                 state,
             )?;
             state.pop_scope();
@@ -916,7 +906,7 @@ fn eval_template_invocation(
     } else {
         dot.clone()
     };
-    let mut isolated_state = EvalState::new();
+    let mut isolated_state = EvalState::new(options.missing_value_mode);
     let eval = eval_block(
         body,
         0,
@@ -965,7 +955,7 @@ fn eval_block_invocation(
         .get(name)
         .map(Vec::as_slice)
         .unwrap_or(fallback_body);
-    let mut isolated_state = EvalState::new();
+    let mut isolated_state = EvalState::new(options.missing_value_mode);
     let eval = eval_block(
         render_body,
         0,
@@ -1072,32 +1062,8 @@ fn parse_template_invocation_clause(raw: &str) -> Option<(String, Option<String>
     if trimmed.is_empty() {
         return None;
     }
-    let bytes = trimmed.as_bytes();
-    let quote = *bytes.first()?;
-    if quote != b'"' && quote != b'`' {
-        return None;
-    }
-    let mut i = 1usize;
-    let mut escaped = false;
-    while i < bytes.len() {
-        if quote == b'"' && !escaped && bytes[i] == b'\\' {
-            escaped = true;
-            i += 1;
-            continue;
-        }
-        if !escaped && bytes[i] == quote {
-            break;
-        }
-        escaped = false;
-        i += 1;
-    }
-    if i >= bytes.len() || bytes[i] != quote {
-        return None;
-    }
-
-    let name_literal = &trimmed[..=i];
-    let name = decode_string_literal(name_literal)?;
-    let tail = trimmed[i + 1..].trim();
+    let (name, tail) = compat::parse_go_quoted_prefix(trimmed)?;
+    let tail = tail.trim();
     let arg = if tail.is_empty() {
         None
     } else {
@@ -1123,18 +1089,26 @@ fn eval_expr_truthy(
 }
 
 fn is_truthy(v: &Option<Value>) -> bool {
-    match v {
-        None => false,
-        Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => {
+    let Some(value) = v.as_ref() else {
+        return false;
+    };
+    if let Some(len) = go_bytes_len(value).or_else(|| go_string_bytes_len(value)) {
+        return len > 0;
+    }
+    if let Some(typed_map) = decode_go_typed_map_value(value) {
+        return typed_map.entries.is_some_and(|entries| !entries.is_empty());
+    }
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => {
             n.as_i64().is_some_and(|i| i != 0)
                 || n.as_u64().is_some_and(|u| u != 0)
                 || n.as_f64().is_some_and(|f| f != 0.0)
         }
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(o)) => !o.is_empty(),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
     }
 }
 
@@ -1160,7 +1134,7 @@ fn eval_expr_value_result(
         return eval_pipeline_expr(action, expr, root, dot, state, resolver);
     }
     ensure_variable_is_defined(expr, state)?;
-    Ok(eval_simple_expr_value(expr, root, dot, state))
+    eval_simple_expr_value(expr, root, dot, state)
 }
 
 fn eval_simple_expr_value(
@@ -1168,26 +1142,28 @@ fn eval_simple_expr_value(
     root: &Value,
     dot: &Value,
     state: &EvalState,
-) -> Option<Value> {
+) -> Result<Option<Value>, NativeRenderError> {
     if expr == "nil" {
-        return Some(Value::Null);
+        return Ok(Some(Value::Null));
     }
     if is_quoted_string(expr) {
-        return decode_string_literal(expr).map(Value::String);
+        return Ok(decode_string_literal(expr).map(Value::String));
     }
     if let Some(v) = parse_char_constant(expr) {
-        return Some(Value::Number(Number::from(v)));
+        return Ok(Some(Value::Number(Number::from(v))));
     }
     if expr == "true" {
-        return Some(Value::Bool(true));
+        return Ok(Some(Value::Bool(true)));
     }
     if expr == "false" {
-        return Some(Value::Bool(false));
+        return Ok(Some(Value::Bool(false)));
     }
     if let Some(n) = parse_number_value(expr) {
-        return Some(n);
+        return Ok(Some(n));
     }
-    resolve_simple_path(root, dot, state, expr)
+    resolve_simple_path(root, dot, expr, state.missing_value_mode, |name| {
+        state.lookup_var(name)
+    })
 }
 
 fn render_output_expr(
@@ -1207,7 +1183,7 @@ fn render_output_expr(
     match value {
         Some(v) => Ok(format_value_like_go(&v)),
         None => match options.missing_value_mode {
-            MissingValueMode::GoDefault => Ok("<no value>".to_string()),
+            MissingValueMode::GoDefault | MissingValueMode::GoZero => Ok("<no value>".to_string()),
             MissingValueMode::Error => Err(NativeRenderError::MissingValue {
                 action: action.to_string(),
                 path: expr.to_string(),
@@ -1307,7 +1283,9 @@ fn eval_pipeline_command(
         let mut args =
             Vec::with_capacity(tokens.len().saturating_sub(1) + usize::from(has_pipe_input));
         for token in tokens.iter().skip(1) {
-            args.push(eval_command_token_value(action, token, root, dot, state, resolver)?);
+            args.push(eval_command_token_value(
+                action, token, root, dot, state, resolver,
+            )?);
         }
         if has_pipe_input {
             args.push(pipe_input);
@@ -1494,7 +1472,12 @@ fn try_eval_external_function(
     let mut args = Vec::with_capacity(arg_tokens.len() + usize::from(has_pipe_input));
     for token in arg_tokens {
         args.push(eval_command_token_value(
-            action, token, root, dot, state, Some(resolver),
+            action,
+            token,
+            root,
+            dot,
+            state,
+            Some(resolver),
         )?);
     }
     if has_pipe_input {
@@ -1571,10 +1554,10 @@ fn is_identifier_name(name: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
+    if !is_identifier_start_char(first) {
         return false;
     }
-    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    chars.all(is_identifier_continue_char)
 }
 
 fn eval_command_token_value(
@@ -1601,7 +1584,7 @@ fn eval_command_token_value(
         });
     }
     ensure_variable_is_defined(token, state)?;
-    Ok(eval_simple_expr_value(token, root, dot, state))
+    eval_simple_expr_value(token, root, dot, state)
 }
 
 fn looks_like_numeric_literal(expr: &str) -> bool {
@@ -1692,9 +1675,7 @@ fn is_variable_token(token: &str) -> bool {
     if !token.starts_with('$') || token == "$" {
         return false;
     }
-    token[1..]
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    token[1..].chars().all(is_identifier_continue_char)
 }
 
 fn is_decl_op_token(token: &str) -> bool {
@@ -1803,18 +1784,32 @@ fn builtin_len(action: &str, args: &[Option<Value>]) -> Result<usize, NativeRend
     if args.len() != 1 {
         return Err(wrong_number_of_args(action, "len", "1", args.len()));
     }
-    match args[0].as_ref() {
-        Some(Value::String(s)) => Ok(s.len()),
-        Some(Value::Array(a)) => Ok(a.len()),
-        Some(Value::Object(m)) => Ok(m.len()),
-        Some(Value::Null) | None => Err(NativeRenderError::UnsupportedAction {
+    let value = args[0]
+        .as_ref()
+        .ok_or_else(|| NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: "error calling len: reflect: call of reflect.Value.Type on zero Value"
-                .to_string(),
+            reason: "error calling len: len of nil pointer".to_string(),
+        })?;
+    if let Some(len) = go_bytes_len(value).or_else(|| go_string_bytes_len(value)) {
+        return Ok(len);
+    }
+    if let Some(typed_map) = decode_go_typed_map_value(value) {
+        return Ok(typed_map.entries.map_or(0, |entries| entries.len()));
+    }
+    match value {
+        Value::Null => Err(NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: "error calling len: len of nil pointer".to_string(),
         }),
-        Some(_) => Err(NativeRenderError::UnsupportedAction {
+        Value::String(s) => Ok(s.len()),
+        Value::Array(a) => Ok(a.len()),
+        Value::Object(m) => Ok(m.len()),
+        _ => Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: "error calling len: len of unsupported type".to_string(),
+            reason: format!(
+                "error calling len: len of type {}",
+                value_type_name_for_template(value)
+            ),
         }),
     }
 }
@@ -1834,43 +1829,83 @@ fn builtin_index(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
         return Ok(cur);
     }
     for idx in args.iter().skip(1) {
+        if let Some(ref value) = cur {
+            if let Some(typed_map) = decode_go_typed_map_value(value) {
+                let next = match map_key_arg(idx) {
+                    MapKeyArg::Key(key) => typed_map
+                        .entries
+                        .and_then(|entries| entries.get(&key))
+                        .cloned()
+                        .unwrap_or_else(|| go_zero_value_for_type(typed_map.elem_type)),
+                    MapKeyArg::StringLikeNonUtf8 => go_zero_value_for_type(typed_map.elem_type),
+                    MapKeyArg::WrongType => {
+                        let suffix = if matches!(idx, None | Some(Value::Null)) {
+                            "value is nil; should be string".to_string()
+                        } else {
+                            format!(
+                                "value has type {}; should be string",
+                                option_type_name_for_template(idx)
+                            )
+                        };
+                        return Err(NativeRenderError::UnsupportedAction {
+                            action: action.to_string(),
+                            reason: format!("error calling index: {suffix}"),
+                        });
+                    }
+                };
+                cur = Some(next);
+                continue;
+            }
+            if let Some(len) = go_bytes_len(value) {
+                let pos = parse_slice_like_index(action, "index", idx, len)?;
+                let byte = go_bytes_get(value, pos).ok_or_else(|| {
+                    NativeRenderError::UnsupportedAction {
+                        action: action.to_string(),
+                        reason: "error calling index: malformed []byte value".to_string(),
+                    }
+                })?;
+                cur = Some(Value::Number(Number::from(byte)));
+                continue;
+            }
+            if let Some(len) = go_string_bytes_len(value) {
+                let pos = parse_slice_like_index(action, "index", idx, len)?;
+                let byte = go_string_bytes_get(value, pos).ok_or_else(|| {
+                    NativeRenderError::UnsupportedAction {
+                        action: action.to_string(),
+                        reason: "error calling index: malformed string value".to_string(),
+                    }
+                })?;
+                cur = Some(Value::Number(Number::from(byte)));
+                continue;
+            }
+        }
         let next = match cur {
             Some(Value::Array(ref items)) => {
-                let pos =
-                    value_to_i64(idx).ok_or_else(|| NativeRenderError::UnsupportedAction {
-                        action: action.to_string(),
-                        reason: "error calling index: array index must be integer".to_string(),
-                    })?;
-                if pos < 0 || (pos as usize) >= items.len() {
+                let pos = parse_slice_like_index(action, "index", idx, items.len())?;
+                Some(items[pos].clone())
+            }
+            Some(Value::Object(ref map)) => match map_key_arg(idx) {
+                MapKeyArg::Key(key) => map.get(&key).cloned(),
+                MapKeyArg::StringLikeNonUtf8 => None,
+                MapKeyArg::WrongType => {
+                    let suffix = if matches!(idx, None | Some(Value::Null)) {
+                        "value is nil; should be string".to_string()
+                    } else {
+                        format!(
+                            "value has type {}; should be string",
+                            option_type_name_for_template(idx)
+                        )
+                    };
                     return Err(NativeRenderError::UnsupportedAction {
                         action: action.to_string(),
-                        reason: format!("error calling index: index out of range: {pos}"),
+                        reason: format!("error calling index: {suffix}"),
                     });
                 }
-                Some(items[pos as usize].clone())
-            }
-            Some(Value::Object(ref map)) => {
-                let key =
-                    value_to_map_key(idx).ok_or_else(|| NativeRenderError::UnsupportedAction {
-                        action: action.to_string(),
-                        reason: "error calling index: map key must be string".to_string(),
-                    })?;
-                map.get(&key).cloned()
-            }
+            },
             Some(Value::String(ref s)) => {
-                let pos =
-                    value_to_i64(idx).ok_or_else(|| NativeRenderError::UnsupportedAction {
-                        action: action.to_string(),
-                        reason: "error calling index: string index must be integer".to_string(),
-                    })?;
                 let bytes = s.as_bytes();
-                if pos < 0 || (pos as usize) >= bytes.len() {
-                    return Err(NativeRenderError::UnsupportedAction {
-                        action: action.to_string(),
-                        reason: format!("error calling index: index out of range: {pos}"),
-                    });
-                }
-                Some(Value::Number(Number::from(bytes[pos as usize])))
+                let pos = parse_slice_like_index(action, "index", idx, bytes.len())?;
+                Some(Value::Number(Number::from(bytes[pos])))
             }
             Some(Value::Null) | None => {
                 return Err(NativeRenderError::UnsupportedAction {
@@ -1878,10 +1913,13 @@ fn builtin_index(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
                     reason: "error calling index: index of untyped nil".to_string(),
                 });
             }
-            Some(_) => {
+            Some(ref value) => {
                 return Err(NativeRenderError::UnsupportedAction {
                     action: action.to_string(),
-                    reason: "error calling index: unsupported container type".to_string(),
+                    reason: format!(
+                        "error calling index: can't index item of type {}",
+                        value_type_name_for_template(value)
+                    ),
                 });
             }
         };
@@ -1910,19 +1948,61 @@ fn builtin_slice(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
             reason: "error calling slice: slice of untyped nil".to_string(),
         })?;
 
-    let parse_index = |idx_arg: &Option<Value>, cap: usize| -> Result<usize, NativeRenderError> {
-        let raw = value_to_i64(idx_arg).ok_or_else(|| NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "error calling slice: cannot index slice/array with given type".to_string(),
-        })?;
-        if raw < 0 || raw as usize > cap {
+    if let Some(bytes) = decode_go_bytes_value(item) {
+        let cap = bytes.len();
+        let len = bytes.len();
+        let mut idx = [0usize, len, cap];
+        for (i, index_arg) in args.iter().skip(1).enumerate() {
+            idx[i] = parse_slice_like_index(action, "slice", index_arg, cap)?;
+        }
+        if idx[0] > idx[1] {
             return Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: format!("error calling slice: index out of range: {raw}"),
+                reason: format!(
+                    "error calling slice: invalid slice index: {} > {}",
+                    idx[0], idx[1]
+                ),
             });
         }
-        Ok(raw as usize)
-    };
+        if args.len() < 4 {
+            return Ok(Some(encode_go_bytes_value(&bytes[idx[0]..idx[1]])));
+        }
+        if idx[1] > idx[2] {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!(
+                    "error calling slice: invalid slice index: {} > {}",
+                    idx[1], idx[2]
+                ),
+            });
+        }
+        return Ok(Some(encode_go_bytes_value(&bytes[idx[0]..idx[1]])));
+    }
+    if let Some(bytes) = decode_go_string_bytes_value(item) {
+        let cap = bytes.len();
+        let len = bytes.len();
+        let mut idx = [0usize, len, cap];
+        for (i, index_arg) in args.iter().skip(1).enumerate() {
+            idx[i] = parse_slice_like_index(action, "slice", index_arg, cap)?;
+        }
+        if idx[0] > idx[1] {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!(
+                    "error calling slice: invalid slice index: {} > {}",
+                    idx[0], idx[1]
+                ),
+            });
+        }
+        if args.len() == 4 {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: "error calling slice: cannot 3-index slice a string".to_string(),
+            });
+        }
+        let sliced = bytes[idx[0]..idx[1]].to_vec();
+        return Ok(Some(value_from_go_string_bytes(sliced)));
+    }
 
     match item {
         Value::Array(items) => {
@@ -1930,7 +2010,7 @@ fn builtin_slice(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
             let len = items.len();
             let mut idx = [0usize, len, cap];
             for (i, index_arg) in args.iter().skip(1).enumerate() {
-                idx[i] = parse_index(index_arg, cap)?;
+                idx[i] = parse_slice_like_index(action, "slice", index_arg, cap)?;
             }
             if idx[0] > idx[1] {
                 return Err(NativeRenderError::UnsupportedAction {
@@ -1966,7 +2046,7 @@ fn builtin_slice(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
             let len = s.len();
             let mut idx = [0usize, len];
             for (i, index_arg) in args.iter().skip(1).enumerate() {
-                idx[i] = parse_index(index_arg, cap)?;
+                idx[i] = parse_slice_like_index(action, "slice", index_arg, cap)?;
             }
             if idx[0] > idx[1] {
                 return Err(NativeRenderError::UnsupportedAction {
@@ -1978,13 +2058,14 @@ fn builtin_slice(action: &str, args: &[Option<Value>]) -> Result<Option<Value>, 
                 });
             }
             let bytes = s.as_bytes()[idx[0]..idx[1]].to_vec();
-            Ok(Some(Value::String(
-                String::from_utf8_lossy(&bytes).into_owned(),
-            )))
+            Ok(Some(value_from_go_string_bytes(bytes)))
         }
         _ => Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: "error calling slice: can't slice item of this type".to_string(),
+            reason: format!(
+                "error calling slice: can't slice item of type {}",
+                value_type_name_for_template(item)
+            ),
         }),
     }
 }
@@ -1994,7 +2075,9 @@ fn builtin_print(args: &[Option<Value>], with_newline: bool) -> String {
     let mut prev_is_string = false;
     for (idx, arg) in args.iter().enumerate() {
         let piece = format_value_for_print(arg);
-        let cur_is_string = matches!(arg, Some(Value::String(_)));
+        let cur_is_string = arg
+            .as_ref()
+            .is_some_and(|v| matches!(v, Value::String(_)) || go_string_bytes_len(v).is_some());
         if idx > 0 && !prev_is_string && !cur_is_string {
             out.push(' ');
         }
@@ -2008,7 +2091,7 @@ fn builtin_print(args: &[Option<Value>], with_newline: bool) -> String {
 }
 
 fn builtin_urlquery(args: &[Option<Value>]) -> String {
-    query_escape(&join_text_template_args(args))
+    query_escape_bytes(&join_text_template_args_bytes(args))
 }
 
 fn builtin_html(args: &[Option<Value>]) -> String {
@@ -2027,7 +2110,9 @@ fn join_text_template_args(args: &[Option<Value>]) -> String {
             None => "<no value>".to_string(),
             Some(v) => format_value_like_go(v),
         };
-        let cur_is_string = matches!(arg, Some(Value::String(_)));
+        let cur_is_string = arg
+            .as_ref()
+            .is_some_and(|v| matches!(v, Value::String(_)) || go_string_bytes_len(v).is_some());
         if idx > 0 && !prev_is_string && !cur_is_string {
             joined.push(' ');
         }
@@ -2037,9 +2122,33 @@ fn join_text_template_args(args: &[Option<Value>]) -> String {
     joined
 }
 
-fn query_escape(input: &str) -> String {
+fn join_text_template_args_bytes(args: &[Option<Value>]) -> Vec<u8> {
+    let mut joined = Vec::new();
+    let mut prev_is_string = false;
+    for (idx, arg) in args.iter().enumerate() {
+        let (piece, cur_is_string) = match arg {
+            None => (b"<no value>".as_slice().to_vec(), false),
+            Some(Value::String(s)) => (s.as_bytes().to_vec(), true),
+            Some(v) => {
+                if let Some(bytes) = decode_go_string_bytes_value(v) {
+                    (bytes, true)
+                } else {
+                    (format_value_like_go(v).into_bytes(), false)
+                }
+            }
+        };
+        if idx > 0 && !prev_is_string && !cur_is_string {
+            joined.push(b' ');
+        }
+        joined.extend_from_slice(&piece);
+        prev_is_string = cur_is_string;
+    }
+    joined
+}
+
+fn query_escape_bytes(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len() + input.len() / 3);
-    for b in input.as_bytes() {
+    for b in input {
         match *b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(*b as char)
@@ -2157,207 +2266,182 @@ fn builtin_printf(action: &str, args: &[Option<Value>]) -> Result<String, Native
     })
 }
 
-fn wrong_number_of_args(
-    action: &str,
-    fn_name: &str,
-    want: &str,
-    got: usize,
-) -> NativeRenderError {
+fn wrong_number_of_args(action: &str, fn_name: &str, want: &str, got: usize) -> NativeRenderError {
     NativeRenderError::UnsupportedAction {
         action: action.to_string(),
         reason: format!("wrong number of args for {fn_name}: want {want} got {got}"),
     }
 }
 
-fn builtin_eq(action: &str, args: &[Option<Value>]) -> Result<bool, NativeRenderError> {
-    if args.is_empty() {
-        return Err(wrong_number_of_args(action, "eq", "at least 1", 0));
+fn value_to_i64(v: &Option<Value>) -> Option<i64> {
+    match v.as_ref() {
+        Some(Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                Some(i)
+            } else {
+                n.as_u64().map(|u| u as i64)
+            }
+        }
+        _ => None,
     }
-    if args.len() == 1 {
+}
+
+fn parse_slice_like_index(
+    action: &str,
+    call_name: &str,
+    idx_arg: &Option<Value>,
+    cap: usize,
+) -> Result<usize, NativeRenderError> {
+    let raw = match idx_arg.as_ref() {
+        None | Some(Value::Null) => {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!("error calling {call_name}: cannot index slice/array with nil"),
+            });
+        }
+        Some(v) => value_to_i64(idx_arg).ok_or_else(|| NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: format!(
+                "error calling {call_name}: cannot index slice/array with type {}",
+                value_type_name_for_template(v)
+            ),
+        })?,
+    };
+    let out_of_range = if call_name == "index" {
+        raw < 0 || raw as usize >= cap
+    } else {
+        raw < 0 || raw as usize > cap
+    };
+    if out_of_range {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: "error calling eq: missing argument for comparison".to_string(),
+            reason: format!("error calling {call_name}: index out of range: {raw}"),
         });
     }
-    let head = &args[0];
-    for other in args.iter().skip(1) {
-        if compare_eq(action, head, other)? {
-            return Ok(true);
+    Ok(raw as usize)
+}
+
+fn value_from_go_string_bytes(bytes: Vec<u8>) -> Value {
+    match String::from_utf8(bytes) {
+        Ok(s) => Value::String(s),
+        Err(err) => encode_go_string_bytes_value(&err.into_bytes()),
+    }
+}
+
+enum MapKeyArg {
+    Key(String),
+    StringLikeNonUtf8,
+    WrongType,
+}
+
+fn map_key_arg(v: &Option<Value>) -> MapKeyArg {
+    match v.as_ref() {
+        Some(Value::String(s)) => MapKeyArg::Key(s.clone()),
+        Some(other) if go_string_bytes_len(other).is_some() => {
+            let Some(bytes) = decode_go_string_bytes_value(other) else {
+                return MapKeyArg::StringLikeNonUtf8;
+            };
+            match String::from_utf8(bytes) {
+                Ok(s) => MapKeyArg::Key(s),
+                Err(_) => MapKeyArg::StringLikeNonUtf8,
+            }
         }
-    }
-    Ok(false)
-}
-
-fn builtin_cmp(
-    action: &str,
-    fn_name: &str,
-    args: &[Option<Value>],
-    pred: impl Fn(std::cmp::Ordering) -> bool,
-) -> Result<bool, NativeRenderError> {
-    if args.len() != 2 {
-        return Err(wrong_number_of_args(action, fn_name, "2", args.len()));
-    }
-    let ord = compare_ordering(action, &args[0], &args[1])?;
-    Ok(pred(ord))
-}
-
-fn builtin_ne(action: &str, args: &[Option<Value>]) -> Result<bool, NativeRenderError> {
-    if args.len() != 2 {
-        return Err(wrong_number_of_args(action, "ne", "2", args.len()));
-    }
-    Ok(!compare_eq(action, &args[0], &args[1])?)
-}
-
-fn compare_eq(
-    action: &str,
-    a: &Option<Value>,
-    b: &Option<Value>,
-) -> Result<bool, NativeRenderError> {
-    match (a, b) {
-        (None, None) => Ok(true),
-        (None, Some(Value::Null)) | (Some(Value::Null), None) => Ok(true),
-        (Some(Value::Null), Some(Value::Null)) => Ok(true),
-        (Some(Value::Bool(av)), Some(Value::Bool(bv))) => Ok(av == bv),
-        (Some(Value::String(av)), Some(Value::String(bv))) => Ok(av == bv),
-        (Some(Value::Number(_)), Some(Value::Number(_))) => compare_number_eq(action, a, b),
-        (Some(Value::Array(_)), Some(Value::Array(_)))
-        | (Some(Value::Object(_)), Some(Value::Object(_))) => {
-            Err(NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: "error calling eq: non-comparable types for comparison".to_string(),
-            })
-        }
-        (None, _) | (_, None) | (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(false),
-        _ => Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "error calling eq: incompatible types for comparison".to_string(),
-        }),
+        _ => MapKeyArg::WrongType,
     }
 }
 
-fn compare_ordering(
-    action: &str,
-    a: &Option<Value>,
-    b: &Option<Value>,
-) -> Result<std::cmp::Ordering, NativeRenderError> {
-    if let (Some(na), Some(nb)) = (number_kind(a), number_kind(b)) {
-        return compare_number_ordering(action, na, nb);
+fn option_string_like_bytes(v: &Option<Value>) -> Option<Cow<'_, [u8]>> {
+    match v.as_ref() {
+        Some(Value::String(s)) => Some(Cow::Borrowed(s.as_bytes())),
+        Some(other) => decode_go_string_bytes_value(other).map(Cow::Owned),
+        None => None,
     }
-    if let (Some(sa), Some(sb)) = (
-        a.as_ref().and_then(Value::as_str),
-        b.as_ref().and_then(Value::as_str),
-    ) {
-        return Ok(sa.cmp(sb));
-    }
-    Err(NativeRenderError::UnsupportedAction {
-        action: action.to_string(),
-        reason: "error calling comparison: incompatible types for comparison".to_string(),
+}
+
+fn is_go_bytes_slice_option(v: &Option<Value>) -> bool {
+    v.as_ref()
+        .is_some_and(|value| go_bytes_len(value).is_some())
+}
+
+fn is_map_object_option(v: &Option<Value>) -> bool {
+    v.as_ref().is_some_and(|value| {
+        matches!(value, Value::Object(_))
+            && go_bytes_len(value).is_none()
+            && go_string_bytes_len(value).is_none()
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-enum NumberKind {
-    Int(i64),
-    Uint(u64),
-    Float(f64),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonComparableKind {
+    Slice,
+    Map,
 }
 
-fn number_kind(v: &Option<Value>) -> Option<NumberKind> {
-    let Some(Value::Number(n)) = v.as_ref() else {
-        return None;
-    };
-    if let Some(i) = n.as_i64() {
-        return Some(NumberKind::Int(i));
-    }
-    if let Some(u) = n.as_u64() {
-        return Some(NumberKind::Uint(u));
-    }
-    n.as_f64().map(NumberKind::Float)
-}
-
-fn compare_number_eq(
-    action: &str,
-    a: &Option<Value>,
-    b: &Option<Value>,
-) -> Result<bool, NativeRenderError> {
-    let Some(na) = number_kind(a) else {
-        return Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "error calling eq: incompatible types for comparison".to_string(),
-        });
-    };
-    let Some(nb) = number_kind(b) else {
-        return Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "error calling eq: incompatible types for comparison".to_string(),
-        });
-    };
-    match (na, nb) {
-        (NumberKind::Int(x), NumberKind::Int(y)) => Ok(x == y),
-        (NumberKind::Uint(x), NumberKind::Uint(y)) => Ok(x == y),
-        (NumberKind::Float(x), NumberKind::Float(y)) => Ok(x == y),
-        (NumberKind::Int(x), NumberKind::Uint(y)) => Ok(x >= 0 && (x as u64) == y),
-        (NumberKind::Uint(x), NumberKind::Int(y)) => Ok(y >= 0 && x == (y as u64)),
-        _ => Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "error calling eq: incompatible types for comparison".to_string(),
-        }),
-    }
-}
-
-fn compare_number_ordering(
-    action: &str,
-    a: NumberKind,
-    b: NumberKind,
-) -> Result<std::cmp::Ordering, NativeRenderError> {
-    use std::cmp::Ordering;
-    let ord = match (a, b) {
-        (NumberKind::Int(x), NumberKind::Int(y)) => x.cmp(&y),
-        (NumberKind::Uint(x), NumberKind::Uint(y)) => x.cmp(&y),
-        (NumberKind::Float(x), NumberKind::Float(y)) => {
-            x.partial_cmp(&y)
-                .ok_or_else(|| NativeRenderError::UnsupportedAction {
-                    action: action.to_string(),
-                    reason: "comparison failed".to_string(),
-                })?
-        }
-        (NumberKind::Int(x), NumberKind::Uint(y)) => {
-            if x < 0 {
-                Ordering::Less
-            } else {
-                (x as u64).cmp(&y)
-            }
-        }
-        (NumberKind::Uint(x), NumberKind::Int(y)) => {
-            if y < 0 {
-                Ordering::Greater
-            } else {
-                x.cmp(&(y as u64))
-            }
-        }
-        _ => {
-            return Err(NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: "error calling comparison: incompatible types for comparison".to_string(),
-            });
-        }
-    };
-    Ok(ord)
-}
-
-fn value_to_i64(v: &Option<Value>) -> Option<i64> {
+fn non_comparable_kind_option(v: &Option<Value>) -> Option<NonComparableKind> {
     match v.as_ref() {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok())),
+        Some(Value::Array(_)) => Some(NonComparableKind::Slice),
+        Some(value) if go_bytes_len(value).is_some() => Some(NonComparableKind::Slice),
+        Some(value)
+            if matches!(value, Value::Object(_))
+                && go_bytes_len(value).is_none()
+                && go_string_bytes_len(value).is_none() =>
+        {
+            Some(NonComparableKind::Map)
+        }
         _ => None,
     }
 }
 
-fn value_to_map_key(v: &Option<Value>) -> Option<String> {
+fn format_non_comparable_type_reason(v: &Option<Value>) -> String {
+    format!(
+        "error calling eq: non-comparable type {}: {}",
+        format_value_for_print(v),
+        option_type_name_for_template(v)
+    )
+}
+
+fn format_non_comparable_types_reason(a: &Option<Value>, b: &Option<Value>) -> String {
+    format!(
+        "error calling eq: non-comparable types {}: {}, {}: {}",
+        format_value_for_print(a),
+        option_type_name_for_template(a),
+        option_type_name_for_template(b),
+        format_value_for_print(b)
+    )
+}
+
+fn option_type_name_for_template(v: &Option<Value>) -> String {
     match v.as_ref() {
-        Some(Value::String(s)) => Some(s.clone()),
-        _ => None,
+        Some(value) => value_type_name_for_template(value),
+        None => "<nil>".to_string(),
+    }
+}
+
+fn value_type_name_for_template(v: &Value) -> String {
+    if go_bytes_len(v).is_some() {
+        return "[]uint8".to_string();
+    }
+    if go_string_bytes_len(v).is_some() {
+        return "string".to_string();
+    }
+    if let Some(typed_map) = decode_go_typed_map_value(v) {
+        return format!("map[string]{}", typed_map.elem_type);
+    }
+    match v {
+        Value::Null => "<nil>".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::String(_) => "string".to_string(),
+        Value::Array(_) => "[]interface {}".to_string(),
+        Value::Object(_) => "map[string]interface {}".to_string(),
+        Value::Number(n) => {
+            if n.as_i64().is_some() {
+                "int".to_string()
+            } else if n.as_u64().is_some() {
+                "uint".to_string()
+            } else {
+                "float64".to_string()
+            }
+        }
     }
 }
 
@@ -2510,8 +2594,7 @@ fn split_command_tokens(command: &str) -> Vec<String> {
     while i < bytes.len() {
         match state {
             State::Normal => {
-                let ch = bytes[i] as char;
-                if ch.is_ascii_whitespace() && paren_depth == 0 {
+                if bytes[i].is_ascii_whitespace() && paren_depth == 0 {
                     if !buf.is_empty() {
                         out.push(std::mem::take(&mut buf));
                     }
@@ -2555,43 +2638,48 @@ fn split_command_tokens(command: &str) -> Vec<String> {
                         i += 1;
                     }
                     _ => {
-                        buf.push(bytes[i] as char);
-                        i += 1;
+                        i = push_utf8_char_from_bytes(bytes, i, &mut buf);
                     }
                 }
             }
             State::SingleQuote => {
-                buf.push(bytes[i] as char);
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    buf.push('\\');
                     i += 1;
-                    buf.push(bytes[i] as char);
-                    i += 1;
+                    i = push_utf8_char_from_bytes(bytes, i, &mut buf);
                     continue;
                 }
                 if bytes[i] == b'\'' {
+                    buf.push('\'');
                     state = State::Normal;
-                }
-                i += 1;
-            }
-            State::DoubleQuote => {
-                buf.push(bytes[i] as char);
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 1;
-                    buf.push(bytes[i] as char);
                     i += 1;
                     continue;
                 }
-                if bytes[i] == b'"' {
-                    state = State::Normal;
+                i = push_utf8_char_from_bytes(bytes, i, &mut buf);
+            }
+            State::DoubleQuote => {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    buf.push('\\');
+                    i += 1;
+                    i = push_utf8_char_from_bytes(bytes, i, &mut buf);
+                    continue;
                 }
-                i += 1;
+                if bytes[i] == b'"' {
+                    buf.push('"');
+                    state = State::Normal;
+                    i += 1;
+                    continue;
+                }
+                i = push_utf8_char_from_bytes(bytes, i, &mut buf);
             }
             State::RawQuote => {
-                buf.push(bytes[i] as char);
                 if bytes[i] == b'`' {
+                    buf.push('`');
                     state = State::Normal;
+                    i += 1;
+                    continue;
                 }
-                i += 1;
+                i = push_utf8_char_from_bytes(bytes, i, &mut buf);
             }
         }
     }
@@ -2615,6 +2703,44 @@ fn range_items(
     let Some(value) = source else {
         return Ok(Vec::new());
     };
+    if let Some(len) = go_bytes_len(&value) {
+        let mut out = Vec::with_capacity(len);
+        for idx in 0..len {
+            let b =
+                go_bytes_get(&value, idx).ok_or_else(|| NativeRenderError::UnsupportedAction {
+                    action: format!("{{{{range {expr}}}}}"),
+                    reason: "malformed []byte value".to_string(),
+                })?;
+            out.push((
+                Some(Value::Number(Number::from(idx as u64))),
+                Value::Number(Number::from(b)),
+            ));
+        }
+        return Ok(out);
+    }
+    if go_string_bytes_len(&value).is_some() {
+        return Err(NativeRenderError::UnsupportedAction {
+            action: format!("{{{{range {expr}}}}}"),
+            reason: format!(
+                "range can't iterate over {}",
+                format_value_for_print(&Some(value))
+            ),
+        });
+    }
+    if let Some(typed_map) = decode_go_typed_map_value(&value) {
+        let Some(entries) = typed_map.entries else {
+            return Ok(Vec::new());
+        };
+        let mut keys: Vec<String> = entries.keys().cloned().collect();
+        keys.sort_unstable();
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(v) = entries.get(&key) {
+                out.push((Some(Value::String(key)), v.clone()));
+            }
+        }
+        return Ok(out);
+    }
     match value {
         Value::Null => Ok(Vec::new()),
         Value::Array(items) => Ok(items
@@ -2633,44 +2759,12 @@ fn range_items(
             }
             Ok(out)
         }
-        Value::String(s) => Ok(s
-            .chars()
-            .enumerate()
-            .map(|(idx, ch)| {
-                (
-                    Some(Value::Number(Number::from(idx as u64))),
-                    Value::String(ch.to_string()),
-                )
-            })
-            .collect()),
-        Value::Number(n) => {
-            let count = if let Some(i) = n.as_i64() {
-                if i <= 0 {
-                    return Ok(Vec::new());
-                }
-                u64::try_from(i).ok()
-            } else {
-                n.as_u64()
-            }
-            .ok_or_else(|| NativeRenderError::UnsupportedAction {
-                action: format!("{{{{range {expr}}}}}"),
-                reason: "range over non-integer number is not supported".to_string(),
-            })?;
-
-            let max = usize::try_from(count).map_err(|_| NativeRenderError::UnsupportedAction {
-                action: format!("{{{{range {expr}}}}}"),
-                reason: "range iteration count is too large".to_string(),
-            })?;
-            Ok((0..max)
-                .map(|idx| {
-                    let v = Value::Number(Number::from(idx as u64));
-                    (Some(v.clone()), v)
-                })
-                .collect())
-        }
-        _ => Err(NativeRenderError::UnsupportedAction {
+        other => Err(NativeRenderError::UnsupportedAction {
             action: format!("{{{{range {expr}}}}}"),
-            reason: "range over scalar value is not supported by native executor".to_string(),
+            reason: format!(
+                "range can't iterate over {}",
+                format_value_for_print(&Some(other))
+            ),
         }),
     }
 }
@@ -2739,85 +2833,6 @@ fn action_inner(action: &str) -> Option<&str> {
     Some(&inner[start..end])
 }
 
-fn resolve_simple_path(root: &Value, dot: &Value, state: &EvalState, expr: &str) -> Option<Value> {
-    if expr == "." {
-        return Some(dot.clone());
-    }
-    if expr == "$" {
-        return Some(root.clone());
-    }
-    let (base, mut path) = if let Some(rest) = expr.strip_prefix("$.") {
-        (Some(root.clone()), rest)
-    } else if let Some(rest) = expr.strip_prefix('.') {
-        (Some(dot.clone()), rest)
-    } else if let Some((name, rest)) = split_variable_reference(expr) {
-        let value = if name == "$" {
-            Some(root.clone())
-        } else {
-            state.lookup_var(name).unwrap_or(None)
-        };
-        (value, rest)
-    } else {
-        return None;
-    };
-    if path.is_empty() {
-        return base;
-    }
-
-    let mut cur = base?;
-    while !path.is_empty() {
-        let (seg, rest) = split_first_segment(path)?;
-        cur = match &cur {
-            Value::Object(map) => map.get(seg)?,
-            _ => return None,
-        }
-        .clone();
-        path = rest;
-    }
-    Some(cur)
-}
-
-fn split_variable_reference(expr: &str) -> Option<(&str, &str)> {
-    if expr == "$" {
-        return Some(("$", ""));
-    }
-    if !expr.starts_with('$') || expr.starts_with("$.") {
-        return None;
-    }
-    let bytes = expr.as_bytes();
-    let mut i = 1usize;
-    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-        i += 1;
-    }
-    if i == 1 {
-        return None;
-    }
-    let name = &expr[..i];
-    if i == bytes.len() {
-        return Some((name, ""));
-    }
-    if bytes[i] != b'.' {
-        return None;
-    }
-    Some((name, &expr[i + 1..]))
-}
-
-fn split_first_segment(path: &str) -> Option<(&str, &str)> {
-    let mut iter = path.splitn(2, '.');
-    let seg = iter.next()?;
-    if seg.is_empty() {
-        return None;
-    }
-    if !seg
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return None;
-    }
-    let rest = iter.next().unwrap_or("");
-    Some((seg, rest))
-}
-
 fn parse_number_value(expr: &str) -> Option<Value> {
     compat::parse_number_value(expr)
 }
@@ -2827,6 +2842,23 @@ fn parse_char_constant(expr: &str) -> Option<i64> {
 }
 
 fn format_value_like_go(v: &Value) -> String {
+    if let Some(bytes) = decode_go_bytes_value(v) {
+        let mut out = String::from("[");
+        for (idx, b) in bytes.iter().enumerate() {
+            if idx > 0 {
+                out.push(' ');
+            }
+            out.push_str(&b.to_string());
+        }
+        out.push(']');
+        return out;
+    }
+    if let Some(bytes) = decode_go_string_bytes_value(v) {
+        return String::from_utf8_lossy(&bytes).into_owned();
+    }
+    if let Some(typed_map) = decode_go_typed_map_value(v) {
+        return format_map_entries_like_go(typed_map.entries);
+    }
     match v {
         Value::Null => "<no value>".to_string(),
         Value::Bool(b) => b.to_string(),
@@ -2843,38 +2875,32 @@ fn format_value_like_go(v: &Value) -> String {
             out.push(']');
             out
         }
-        Value::Object(map) => {
-            let mut keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
-            keys.sort_unstable();
-            let mut out = String::from("map[");
-            for (idx, k) in keys.iter().enumerate() {
-                if idx > 0 {
-                    out.push(' ');
-                }
-                out.push_str(k);
-                out.push(':');
-                if let Some(v) = map.get(*k) {
-                    out.push_str(&format_value_like_go(v));
-                }
-            }
-            out.push(']');
-            out
-        }
+        Value::Object(map) => format_map_entries_like_go(Some(map)),
     }
 }
 
+fn format_map_entries_like_go(entries: Option<&serde_json::Map<String, Value>>) -> String {
+    let mut out = String::from("map[");
+    if let Some(map) = entries {
+        let mut keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        for (idx, k) in keys.iter().enumerate() {
+            if idx > 0 {
+                out.push(' ');
+            }
+            out.push_str(k);
+            out.push(':');
+            if let Some(v) = map.get(*k) {
+                out.push_str(&format_value_like_go(v));
+            }
+        }
+    }
+    out.push(']');
+    out
+}
+
 fn decode_string_literal(inner: &str) -> Option<String> {
-    if inner.len() < 2 {
-        return None;
-    }
-    let bytes = inner.as_bytes();
-    if bytes[0] == b'`' && bytes[inner.len() - 1] == b'`' {
-        return Some(inner[1..inner.len() - 1].to_string());
-    }
-    if bytes[0] == b'"' && bytes[inner.len() - 1] == b'"' {
-        return serde_json::from_str::<String>(inner).ok();
-    }
-    None
+    compat::decode_go_string_literal(inner)
 }
 
 fn is_quoted_string(inner: &str) -> bool {
@@ -3008,6 +3034,39 @@ mod tests {
     }
 
     #[test]
+    fn native_renderer_go_zero_mode_keeps_leaf_missing_as_no_value() {
+        let data = json!({"m":{"a":1}});
+        let out = render_template_native_with_options(
+            "{{.m.missing}}",
+            &data,
+            NativeRenderOptions {
+                missing_value_mode: MissingValueMode::GoZero,
+            },
+        )
+        .expect("must render");
+        assert_eq!(out, "<no value>");
+    }
+
+    #[test]
+    fn native_renderer_go_zero_mode_errors_on_nested_missing_after_nil_interface() {
+        let data = json!({"m":{"a":1}});
+        let err = render_template_native_with_options(
+            "{{.m.missing.y}}",
+            &data,
+            NativeRenderOptions {
+                missing_value_mode: MissingValueMode::GoZero,
+            },
+        )
+        .expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("nil pointer evaluating interface {}.y"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn native_renderer_applies_trim_markers() {
         let data = json!({"a":{"b":"ok"}});
         let out = render_template_native("x {{- .a.b -}} y", &data).expect("must render");
@@ -3085,7 +3144,8 @@ mod tests {
         assert_eq!(out, "1001");
         let out = render_template_native("{{printf \"%g\" 3.5}}", &data).expect("must render");
         assert_eq!(out, "3.5");
-        let out = render_template_native("{{printf \"%G\" 1234567.0}}", &data).expect("must render");
+        let out =
+            render_template_native("{{printf \"%G\" 1234567.0}}", &data).expect("must render");
         assert_eq!(out, "1.234567E+06");
         let out = render_template_native("{{printf \"%T\" 0xef}}", &data).expect("must render");
         assert_eq!(out, "int");
@@ -3109,9 +3169,13 @@ mod tests {
         assert_eq!(out, "bc");
         let out = render_template_native("{{urlquery \"a b\" \"+\"}}", &data).expect("must render");
         assert_eq!(out, "a+b%2B");
+        let out = render_template_native("{{urlquery (slice \"日本\" 1 2)}}", &data)
+            .expect("must render");
+        assert_eq!(out, "%97");
         let out = render_template_native("{{urlquery .missing}}", &data).expect("must render");
         assert_eq!(out, "%3Cno+value%3E");
-        let out = render_template_native("{{html \"<x&'\\\"\\u0000>\"}}", &data).expect("must render");
+        let out =
+            render_template_native("{{html \"<x&'\\\"\\u0000>\"}}", &data).expect("must render");
         assert_eq!(out, "&lt;x&amp;&#39;&#34;\u{FFFD}&gt;");
         let out = render_template_native("{{js \"<x&'\\\"=\\n>\"}}", &data).expect("must render");
         assert_eq!(out, "\\u003Cx\\u0026\\'\\\"\\u003D\\u000A\\u003E");
@@ -3125,17 +3189,309 @@ mod tests {
         let err = render_template_native("{{index .items \"1\"}}", &data).expect_err("must fail");
         match err {
             NativeRenderError::UnsupportedAction { reason, .. } => {
-                assert!(reason.contains("array index must be integer"));
+                assert!(reason.contains("cannot index slice/array with type string"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
         let err = render_template_native("{{index .m 1}}", &data).expect_err("must fail");
         match err {
             NativeRenderError::UnsupportedAction { reason, .. } => {
-                assert!(reason.contains("map key must be string"));
+                assert!(reason.contains("value has type int; should be string"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn native_renderer_builtins_support_typed_go_bytes() {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "b".to_string(),
+            crate::gotemplates::encode_go_bytes_value(b"abc"),
+        );
+        let root = Value::Object(data);
+
+        let out = render_template_native("{{len .b}}", &root).expect("must render");
+        assert_eq!(out, "3");
+
+        let out = render_template_native("{{index .b 1}}", &root).expect("must render");
+        assert_eq!(out, "98");
+
+        let out =
+            render_template_native("{{printf \"%s\" (slice .b 1 3)}}", &root).expect("must render");
+        assert_eq!(out, "bc");
+    }
+
+    #[test]
+    fn native_renderer_treats_typed_go_bytes_as_slice_in_if_and_range() {
+        let mut non_empty = serde_json::Map::new();
+        non_empty.insert(
+            "b".to_string(),
+            crate::gotemplates::encode_go_bytes_value(b"ab"),
+        );
+        let non_empty = Value::Object(non_empty);
+        let out = render_template_native("{{if .b}}yes{{else}}no{{end}}", &non_empty)
+            .expect("must render");
+        assert_eq!(out, "yes");
+        let out = render_template_native("{{range $i, $v := .b}}{{$i}}:{{$v}};{{end}}", &non_empty)
+            .expect("must render");
+        assert_eq!(out, "0:97;1:98;");
+
+        let mut empty = serde_json::Map::new();
+        empty.insert(
+            "b".to_string(),
+            crate::gotemplates::encode_go_bytes_value(b""),
+        );
+        let empty = Value::Object(empty);
+        let out =
+            render_template_native("{{if .b}}yes{{else}}no{{end}}", &empty).expect("must render");
+        assert_eq!(out, "no");
+    }
+
+    #[test]
+    fn native_renderer_go_zero_mode_returns_typed_map_zero_values() {
+        let mut int_entries = serde_json::Map::new();
+        int_entries.insert("a".to_string(), Value::Number(Number::from(1)));
+
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "m".to_string(),
+            crate::gotemplates::encode_go_typed_map_value("int", Some(int_entries)),
+        );
+        let root = Value::Object(root);
+
+        let out = render_template_native_with_options(
+            "{{.m.missing}}|{{printf \"%T\" .m.missing}}",
+            &root,
+            NativeRenderOptions {
+                missing_value_mode: MissingValueMode::GoZero,
+            },
+        )
+        .expect("must render");
+        assert_eq!(out, "0|int");
+
+        let out = render_template_native(
+            "{{index .m \"missing\"}}|{{printf \"%T\" (index .m \"missing\")}}",
+            &root,
+        )
+        .expect("must render");
+        assert_eq!(out, "0|int");
+    }
+
+    #[test]
+    fn native_renderer_handles_nested_typed_map_missing_like_go() {
+        let mut inner = serde_json::Map::new();
+        inner.insert("y".to_string(), Value::Number(Number::from(2)));
+        let mut outer = serde_json::Map::new();
+        outer.insert(
+            "x".to_string(),
+            crate::gotemplates::encode_go_typed_map_value("int", Some(inner)),
+        );
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "m".to_string(),
+            crate::gotemplates::encode_go_typed_map_value("map[string]int", Some(outer)),
+        );
+        root.insert(
+            "nilMap".to_string(),
+            crate::gotemplates::encode_go_typed_map_value("int", None),
+        );
+        let root = Value::Object(root);
+
+        let out = render_template_native_with_options(
+            "{{.m.missing.y}}|{{index .m \"missing\"}}|{{printf \"%T\" (index .m \"missing\")}}",
+            &root,
+            NativeRenderOptions {
+                missing_value_mode: MissingValueMode::GoZero,
+            },
+        )
+        .expect("must render");
+        assert_eq!(out, "0|map[]|map[string]int");
+
+        let out = render_template_native_with_options(
+            "{{.m.missing.y}}",
+            &root,
+            NativeRenderOptions {
+                missing_value_mode: MissingValueMode::GoDefault,
+            },
+        )
+        .expect("must render");
+        assert_eq!(out, "<no value>");
+
+        let out = render_template_native("{{len .nilMap}}", &root).expect("must render");
+        assert_eq!(out, "0");
+        let out = render_template_native("{{range .nilMap}}x{{else}}empty{{end}}", &root)
+            .expect("must render");
+        assert_eq!(out, "empty");
+    }
+
+    #[test]
+    fn native_renderer_builtin_errors_follow_go_text_template_style() {
+        let data = json!({"items":["x"], "s":"abc"});
+
+        let err = render_template_native("{{len 3}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling len: len of type int"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let err = render_template_native("{{index 1 0}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling index: can't index item of type int"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let data = json!({"m": {"k": "v"}});
+        let err = render_template_native("{{index .m nil}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling index: value is nil; should be string"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let data = json!({"items":["x"], "u": u64::MAX});
+        let err = render_template_native("{{index .items .u}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling index: index out of range: -1"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let err = render_template_native("{{slice 1 0}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling slice: can't slice item of type int"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let err = render_template_native("{{range true}}x{{end}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("range can't iterate over true"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let err = render_template_native("{{range 1.5}}x{{end}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("range can't iterate over 1.5"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let err = render_template_native("{{lt true false}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling lt: invalid type for comparison"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let err = render_template_native("{{lt true 1}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling lt: incompatible types for comparison"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_renderer_eq_reports_non_comparable_like_go_text_template() {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "arr".to_string(),
+            Value::Array(vec![
+                Value::Number(Number::from(1)),
+                Value::Number(Number::from(2)),
+            ]),
+        );
+        let mut obj = serde_json::Map::new();
+        obj.insert("a".to_string(), Value::Number(Number::from(1)));
+        m.insert("mapv".to_string(), Value::Object(obj));
+        m.insert(
+            "bytes".to_string(),
+            crate::gotemplates::encode_go_bytes_value(b"ab"),
+        );
+        let data = Value::Object(m);
+
+        let err = render_template_native("{{eq .arr .arr}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling eq: non-comparable type"));
+                assert!(reason.contains("[]interface {}"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let err = render_template_native("{{eq .arr .mapv}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling eq: non-comparable types"));
+                assert!(reason.contains("[]interface {}"));
+                assert!(reason.contains("map[string]interface {}"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let err = render_template_native("{{eq .bytes .arr}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling eq: non-comparable type"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_renderer_compares_string_bytes_like_go_strings() {
+        let data = json!({"m":{"a":"ok"}});
+
+        let out = render_template_native("{{eq (slice \"日本\" 1 2) (slice \"日本\" 1 2)}}", &data)
+            .expect("must render");
+        assert_eq!(out, "true");
+
+        let out = render_template_native("{{ne (slice \"日本\" 1 2) (slice \"日本\" 1 2)}}", &data)
+            .expect("must render");
+        assert_eq!(out, "false");
+
+        let out = render_template_native("{{lt (slice \"ab\" 0 1) (slice \"ab\" 1 2)}}", &data)
+            .expect("must render");
+        assert_eq!(out, "true");
+
+        let err =
+            render_template_native("{{eq (slice \"日本\" 1 2) .m}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("error calling eq: incompatible types for comparison"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_renderer_allows_string_bytes_as_map_index_key() {
+        let data = json!({"m":{"a":"ok"}, "m2":{"�":"hit"}});
+
+        let out =
+            render_template_native("{{index .m (slice \"ab\" 0 1)}}", &data).expect("must render");
+        assert_eq!(out, "ok");
+
+        let out = render_template_native("{{index .m (slice \"日本\" 1 2)}}", &data)
+            .expect("must render");
+        assert_eq!(out, "<no value>");
+
+        let out = render_template_native("{{index .m2 (slice \"日本\" 1 2)}}", &data)
+            .expect("must render");
+        assert_eq!(out, "<no value>");
     }
 
     #[test]
@@ -3174,29 +3530,63 @@ mod tests {
     }
 
     #[test]
-    fn native_renderer_supports_range_over_integer() {
+    fn native_renderer_rejects_range_over_integer_like_go() {
         let data = json!({});
-        let out = render_template_native("{{range 3}}{{.}}{{end}}", &data).expect("must render");
-        assert_eq!(out, "012");
-        let out = render_template_native("{{range $i, $v := 3}}{{$i}}={{$v}};{{end}}", &data)
-            .expect("must render");
-        assert_eq!(out, "0=0;1=1;2=2;");
+        let err = render_template_native("{{range 3}}{{.}}{{end}}", &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("range can't iterate over 3"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let err = render_template_native("{{range $i, $v := 3}}{{$i}}={{$v}};{{end}}", &data)
+            .expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("range can't iterate over 3"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
     fn native_renderer_supports_range_break_and_continue() {
-        let data = json!({});
-        let out = render_template_native("{{range 4}}{{if eq . 2}}{{break}}{{end}}{{.}}{{end}}", &data)
-            .expect("must render");
+        let data = json!({"items":[0,1,2,3]});
+        let out = render_template_native(
+            "{{range .items}}{{if eq . 2}}{{break}}{{end}}{{.}}{{end}}",
+            &data,
+        )
+        .expect("must render");
         assert_eq!(out, "01");
         let out = render_template_native(
-            "{{range 4}}{{if eq . 2}}{{continue}}{{end}}{{.}}{{end}}",
+            "{{range .items}}{{if eq . 2}}{{continue}}{{end}}{{.}}{{end}}",
             &data,
         )
         .expect("must render");
         assert_eq!(out, "013");
         assert!(render_template_native("{{break}}", &data).is_err());
         assert!(render_template_native("{{continue}}", &data).is_err());
+    }
+
+    #[test]
+    fn native_renderer_slice_string_keeps_byte_semantics_for_printf() {
+        let data = json!({});
+        let out = render_template_native("{{printf \"%x\" (slice \"日本\" 1 2)}}", &data)
+            .expect("must render");
+        assert_eq!(out, "97");
+
+        let out = render_template_native("{{printf \"%q\" (slice \"日本\" 1 2)}}", &data)
+            .expect("must render");
+        assert_eq!(out, "\"\\x97\"");
+    }
+
+    #[test]
+    fn native_renderer_preserves_unicode_literals_in_function_args() {
+        let data = json!({});
+        let out =
+            render_template_native("{{printf \"%s\" \"日本語\"}}", &data).expect("must render");
+        assert_eq!(out, "日本語");
     }
 
     #[test]
@@ -3298,6 +3688,51 @@ mod tests {
         )
         .expect("must render");
         assert_eq!(out, "called:z");
+    }
+
+    #[test]
+    fn native_renderer_supports_unicode_identifiers_in_resolver_and_paths() {
+        let data = json!({"fn":"привет","данные":{"ключ":"значение"}});
+        let resolver = |name: &str, args: &[Option<Value>]| {
+            if name != "привет" {
+                return Err(NativeFunctionResolverError::UnknownFunction);
+            }
+            Ok(Some(Value::String(format!(
+                "ok:{}",
+                format_value_for_print(&args[0])
+            ))))
+        };
+
+        let out = render_template_native_with_resolver(
+            "{{привет \"мир\"}}",
+            &data,
+            NativeRenderOptions::default(),
+            Some(&resolver),
+        )
+        .expect("must render");
+        assert_eq!(out, "ok:мир");
+
+        let out = render_template_native_with_resolver(
+            "{{call .fn \"x\"}}",
+            &data,
+            NativeRenderOptions::default(),
+            Some(&resolver),
+        )
+        .expect("must render");
+        assert_eq!(out, "ok:x");
+
+        let out = render_template_native_with_resolver(
+            "{{.fn \"y\"}}",
+            &data,
+            NativeRenderOptions::default(),
+            Some(&resolver),
+        )
+        .expect("must render");
+        assert_eq!(out, "ok:y");
+
+        let out =
+            render_template_native("{{$имя := .данные.ключ}}{{$имя}}", &data).expect("must render");
+        assert_eq!(out, "значение");
     }
 
     #[test]

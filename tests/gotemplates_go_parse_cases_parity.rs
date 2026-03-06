@@ -12,7 +12,7 @@ fn gotemplates_matches_go_parse_subset_cases() {
     }
 
     let runner = GoParseRunner::new().expect("prepare go parser runner");
-    let known_functions = ["printf", "print", "contains"];
+    let known_functions = ["printf", "print", "contains", "привет"];
 
     let cases = vec![
         r#"{{.X}}"#,
@@ -37,6 +37,8 @@ fn gotemplates_matches_go_parse_subset_cases() {
         r#"hello{{undefined}}"#,
         r#"{{$x}}"#,
         r#"{{with $x := 4}}{{end}}{{$x}}"#,
+        r#"{{привет .}}"#,
+        r#"{{$имя := .данные.ключ}}{{$имя}}"#,
         r#"{{template $v}}"#,
         r#"{{with $x.Y := 4}}{{end}}"#,
         r#"{{printf 3, 4}}"#,
@@ -58,8 +60,18 @@ fn gotemplates_matches_go_parse_subset_cases() {
         r#"{{define "a"}}{{end}}{{define "a"}}b{{end}}"#,
         r#"{{define "a"}}a{{end}}{{define "a"}}{{end}}"#,
     ];
+    let go_codes = runner
+        .parse_error_codes(&cases, &known_functions)
+        .expect("go parser should return mapped codes");
+    assert_eq!(
+        go_codes.len(),
+        cases.len(),
+        "go batch size mismatch: got={} want={}",
+        go_codes.len(),
+        cases.len()
+    );
 
-    for src in cases {
+    for (idx, src) in cases.iter().enumerate() {
         let rust_code = parse_template_tokens_strict_with_options(
             src,
             ParseCompatOptions {
@@ -72,9 +84,7 @@ fn gotemplates_matches_go_parse_subset_cases() {
         .err()
         .map(|e| e.code.to_string());
 
-        let go_code = runner
-            .parse_error_code(src, &known_functions)
-            .expect("go parser should return mapped code");
+        let go_code = go_codes[idx].clone();
 
         assert_eq!(rust_code, go_code, "rust/go mismatch for case: {src}");
     }
@@ -101,34 +111,46 @@ impl GoParseRunner {
         Ok(Self { _tmp: tmp, program })
     }
 
-    fn parse_error_code(&self, src: &str, funcs: &[&str]) -> Result<Option<String>, String> {
-        let encoded_src = base64_encode(src.as_bytes());
+    fn parse_error_codes(
+        &self,
+        cases: &[&str],
+        funcs: &[&str],
+    ) -> Result<Vec<Option<String>>, String> {
+        let cases_json =
+            serde_json::to_string(cases).map_err(|e| format!("serialize cases: {e}"))?;
+        let encoded_cases = base64_encode(cases_json.as_bytes());
         let funcs_arg = funcs.join(",");
         let output = Command::new("go")
             .arg("run")
             .arg(&self.program)
-            .arg(encoded_src)
+            .arg(encoded_cases)
             .arg(funcs_arg)
             .output()
             .map_err(|e| format!("go run failed to start: {e}"))?;
 
-        if output.status.success() {
-            return Ok(None);
-        }
-
-        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if raw.is_empty() {
+        if !output.status.success() {
             return Err(format!(
-                "go run failed without parser output: status={} stderr={}",
+                "go run failed: status={} stdout={} stderr={}",
                 output.status,
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
 
-        match map_go_error_to_code(&raw) {
-            Some(code) => Ok(Some(code.to_string())),
-            None => Err(format!("unmapped go parse error: {raw}")),
+        let raw = serde_json::from_slice::<Vec<String>>(&output.stdout)
+            .map_err(|e| format!("decode go results: {e}"))?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (idx, msg) in raw.into_iter().enumerate() {
+            if msg.is_empty() {
+                out.push(None);
+                continue;
+            }
+            match map_go_error_to_code(&msg) {
+                Some(code) => out.push(Some(code.to_string())),
+                None => return Err(format!("unmapped go parse error at index {idx}: {msg}")),
+            }
         }
+        Ok(out)
     }
 }
 
@@ -248,6 +270,7 @@ fn go_program_source() -> &'static str {
 
 import (
     "encoding/base64"
+    "encoding/json"
     "fmt"
     "os"
     "strings"
@@ -256,7 +279,7 @@ import (
 
 func main() {
     if len(os.Args) != 3 {
-        fmt.Print("need src and funcs")
+        fmt.Print("need cases and funcs")
         os.Exit(3)
     }
     data, err := base64.StdEncoding.DecodeString(os.Args[1])
@@ -275,12 +298,27 @@ func main() {
             funcs[n] = func(args ...any) any { return nil }
         }
     }
-    tr := p.New("x")
-    _, err = tr.Parse(string(data), "", "", map[string]*p.Tree{}, funcs)
+    var cases []string
+    if err := json.Unmarshal(data, &cases); err != nil {
+        fmt.Print(err.Error())
+        os.Exit(5)
+    }
+    out := make([]string, 0, len(cases))
+    for _, src := range cases {
+        tr := p.New("x")
+        _, err = tr.Parse(src, "", "", map[string]*p.Tree{}, funcs)
+        if err != nil {
+            out = append(out, err.Error())
+        } else {
+            out = append(out, "")
+        }
+    }
+    encoded, err := json.Marshal(out)
     if err != nil {
         fmt.Print(err.Error())
-        os.Exit(2)
+        os.Exit(6)
     }
+    fmt.Print(string(encoded))
 }
 "#
 }

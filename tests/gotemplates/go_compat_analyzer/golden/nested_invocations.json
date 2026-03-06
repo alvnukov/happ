@@ -1,0 +1,59 @@
+{
+  "tree_count": 4,
+  "max_depth": 2,
+  "node_counts": {
+    "If": 1,
+    "Range": 1,
+    "Template": 4,
+    "Text": 13
+  },
+  "template_invocations": [
+    "blk",
+    "inner",
+    "known",
+    "missing"
+  ],
+  "invocation_sites": [
+    {
+      "tree_name": "blk",
+      "action_text": "{{template \"\\x69nner\" .}}",
+      "called_template": "inner",
+      "from_block": false,
+      "line": 2,
+      "column": 3
+    },
+    {
+      "tree_name": "main",
+      "action_text": "{{template \"known\" .}}",
+      "called_template": "known",
+      "from_block": false,
+      "line": 3,
+      "column": 3
+    },
+    {
+      "tree_name": "main",
+      "action_text": "{{template \"missing\" .}}",
+      "called_template": "missing",
+      "from_block": false,
+      "line": 6,
+      "column": 5
+    },
+    {
+      "tree_name": "main",
+      "action_text": "{{template \"blk\" .}}",
+      "called_template": "blk",
+      "from_block": false,
+      "line": 9,
+      "column": 1
+    }
+  ],
+  "unresolved": [
+    {
+      "tree_name": "main",
+      "called_template": "missing",
+      "action_text": "{{template \"missing\" .}}",
+      "line": 6,
+      "column": 5
+    }
+  ]
+}

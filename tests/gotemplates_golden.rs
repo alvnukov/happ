@@ -36,11 +36,20 @@ fn gotemplates_golden_cases_match_go_oracle() {
 
     let cases = load_golden_cases();
     let runner = GoParseRunner::new().expect("prepare go parser runner");
+    let case_srcs: Vec<&str> = cases.iter().map(|c| c.src.as_str()).collect();
+    let go_codes = runner
+        .parse_error_codes(&case_srcs)
+        .expect("go parser should return code mapping");
+    assert_eq!(
+        go_codes.len(),
+        cases.len(),
+        "go batch size mismatch: got={} want={}",
+        go_codes.len(),
+        cases.len()
+    );
 
-    for case in &cases {
-        let go_code = runner
-            .parse_error_code(&case.src)
-            .expect("go parser should return code mapping");
+    for (idx, case) in cases.iter().enumerate() {
+        let go_code = go_codes[idx].clone();
         assert_eq!(
             go_code, case.expected_code,
             "golden drift from go parser for case: {}",
@@ -79,8 +88,10 @@ impl GoParseRunner {
         Ok(Self { _tmp: tmp, program })
     }
 
-    fn parse_error_code(&self, src: &str) -> Result<Option<String>, String> {
-        let encoded = base64_encode(src.as_bytes());
+    fn parse_error_codes(&self, src_list: &[&str]) -> Result<Vec<Option<String>>, String> {
+        let payload =
+            serde_json::to_string(src_list).map_err(|e| format!("serialize cases: {e}"))?;
+        let encoded = base64_encode(payload.as_bytes());
         let output = Command::new("go")
             .arg("run")
             .arg(&self.program)
@@ -88,20 +99,27 @@ impl GoParseRunner {
             .output()
             .map_err(|e| format!("go run failed to start: {e}"))?;
 
-        if output.status.success() {
-            return Ok(None);
-        }
-
-        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if raw.is_empty() {
+        if !output.status.success() {
             return Err(format!(
-                "go run failed without parser output: status={} stderr={}",
+                "go run failed: status={} stdout={} stderr={}",
                 output.status,
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
 
-        Ok(map_go_error_to_code(&raw).map(ToString::to_string))
+        let raw = serde_json::from_slice::<Vec<String>>(&output.stdout)
+            .map_err(|e| format!("decode go results: {e}"))?;
+        Ok(raw
+            .into_iter()
+            .map(|msg| {
+                if msg.is_empty() {
+                    None
+                } else {
+                    map_go_error_to_code(&msg).map(ToString::to_string)
+                }
+            })
+            .collect())
     }
 }
 
@@ -217,6 +235,7 @@ fn go_program_source() -> &'static str {
 
 import (
     "encoding/base64"
+    "encoding/json"
     "fmt"
     "os"
     "text/template"
@@ -224,7 +243,7 @@ import (
 
 func main() {
     if len(os.Args) != 2 {
-        fmt.Print("missing input")
+        fmt.Print("missing input list")
         os.Exit(3)
     }
     data, err := base64.StdEncoding.DecodeString(os.Args[1])
@@ -233,14 +252,29 @@ func main() {
         os.Exit(4)
     }
 
-    src := string(data)
-    _, err = template.New("x").Funcs(template.FuncMap{
-        "include": func(name string, data any) string { return "" },
-    }).Parse(src)
+    var srcList []string
+    if err := json.Unmarshal(data, &srcList); err != nil {
+        fmt.Print(err.Error())
+        os.Exit(5)
+    }
+
+    out := make([]string, 0, len(srcList))
+    for _, src := range srcList {
+        _, err = template.New("x").Funcs(template.FuncMap{
+            "include": func(name string, data any) string { return "" },
+        }).Parse(src)
+        if err != nil {
+            out = append(out, err.Error())
+        } else {
+            out = append(out, "")
+        }
+    }
+    encoded, err := json.Marshal(out)
     if err != nil {
         fmt.Print(err.Error())
-        os.Exit(2)
+        os.Exit(6)
     }
+    fmt.Print(string(encoded))
 }
 "#
 }

@@ -1,4 +1,4 @@
-use super::collect_action_spans;
+use super::{collect_action_spans, compat, utf8scan::push_utf8_char_from_bytes};
 
 const LEFT_DELIM: &str = "{{";
 const RIGHT_DELIM: &str = "}}";
@@ -250,7 +250,10 @@ fn command_function_name(command: &str) -> Option<String> {
     if candidate.is_empty() {
         return None;
     }
-    if is_non_function_token(&candidate) || is_go_template_keyword(&candidate) {
+    if is_non_function_token(&candidate)
+        || is_go_template_keyword(&candidate)
+        || !is_identifier_name(&candidate)
+    {
         return None;
     }
     Some(candidate)
@@ -276,8 +279,7 @@ fn split_command_tokens(command: &str) -> Vec<String> {
             State::Normal => {
                 if bytes[i].is_ascii_whitespace() {
                     if !buf.is_empty() {
-                        out.push(buf.clone());
-                        buf.clear();
+                        out.push(std::mem::take(&mut buf));
                     }
                     i += 1;
                     continue;
@@ -299,43 +301,48 @@ fn split_command_tokens(command: &str) -> Vec<String> {
                         i += 1;
                     }
                     _ => {
-                        buf.push(bytes[i] as char);
-                        i += 1;
+                        i = push_utf8_char_from_bytes(bytes, i, &mut buf);
                     }
                 }
             }
             State::SingleQuote => {
-                buf.push(bytes[i] as char);
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    buf.push('\\');
                     i += 1;
-                    buf.push(bytes[i] as char);
-                    i += 1;
+                    i = push_utf8_char_from_bytes(bytes, i, &mut buf);
                     continue;
                 }
                 if bytes[i] == b'\'' {
+                    buf.push('\'');
                     state = State::Normal;
-                }
-                i += 1;
-            }
-            State::DoubleQuote => {
-                buf.push(bytes[i] as char);
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 1;
-                    buf.push(bytes[i] as char);
                     i += 1;
                     continue;
                 }
-                if bytes[i] == b'"' {
-                    state = State::Normal;
+                i = push_utf8_char_from_bytes(bytes, i, &mut buf);
+            }
+            State::DoubleQuote => {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    buf.push('\\');
+                    i += 1;
+                    i = push_utf8_char_from_bytes(bytes, i, &mut buf);
+                    continue;
                 }
-                i += 1;
+                if bytes[i] == b'"' {
+                    buf.push('"');
+                    state = State::Normal;
+                    i += 1;
+                    continue;
+                }
+                i = push_utf8_char_from_bytes(bytes, i, &mut buf);
             }
             State::RawQuote => {
-                buf.push(bytes[i] as char);
                 if bytes[i] == b'`' {
+                    buf.push('`');
                     state = State::Normal;
+                    i += 1;
+                    continue;
                 }
-                i += 1;
+                i = push_utf8_char_from_bytes(bytes, i, &mut buf);
             }
         }
     }
@@ -358,7 +365,13 @@ fn is_non_function_token(token: &str) -> bool {
     if t.starts_with('"') || t.starts_with('\'') || t.starts_with('`') {
         return true;
     }
-    if t.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+    if matches!(t, "true" | "false" | "nil") {
+        return true;
+    }
+    if t.chars().next().is_some_and(|c| c.is_numeric()) {
+        return true;
+    }
+    if compat::looks_like_numeric_literal(t) || compat::looks_like_char_literal(t) {
         return true;
     }
     false
@@ -369,6 +382,17 @@ fn is_go_template_keyword(token: &str) -> bool {
         token,
         "if" | "else" | "end" | "range" | "with" | "define" | "block" | "template"
     )
+}
+
+fn is_identifier_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_alphanumeric())
 }
 
 fn starts_with(haystack: &[u8], offset: usize, needle: &[u8]) -> bool {
@@ -437,6 +461,27 @@ mod tests {
             r#"{{ include "x" (printf "%s|%s" "a" "b") | quote }}"#,
         );
         assert_eq!(calls, vec!["include".to_string(), "quote".to_string()]);
+    }
+
+    #[test]
+    fn collect_function_calls_handles_unicode_string_literals() {
+        let calls = collect_function_calls_in_action(r#"{{ printf "%s" "日本語" | quote }}"#);
+        assert_eq!(calls, vec!["printf".to_string(), "quote".to_string()]);
+    }
+
+    #[test]
+    fn collect_function_calls_ignores_literals_that_look_like_functions() {
+        let calls = collect_function_calls_in_action(r#"{{ +12 | printf "%d" | quote }}"#);
+        assert_eq!(calls, vec!["printf".to_string(), "quote".to_string()]);
+
+        let calls = collect_function_calls_in_action(r#"{{ nil | default "x" }}"#);
+        assert_eq!(calls, vec!["default".to_string()]);
+    }
+
+    #[test]
+    fn collect_function_calls_ignores_non_identifier_heads() {
+        let calls = collect_function_calls_in_action(r#"{{ +foo "x" | quote }}"#);
+        assert_eq!(calls, vec!["quote".to_string()]);
     }
 
     #[test]

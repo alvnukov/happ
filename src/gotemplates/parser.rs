@@ -1,4 +1,4 @@
-use super::GoTemplateScanError;
+use super::{compat, GoTemplateScanError};
 
 const LEFT_DELIM: &str = "{{";
 const RIGHT_DELIM: &str = "}}";
@@ -320,9 +320,11 @@ impl<'a> Parser<'a> {
         let name = self.next_non_space();
         match name.kind {
             TokKind::String | TokKind::RawString => {
+                let decoded = compat::decode_go_string_literal(name.text(self.src))
+                    .ok_or_else(|| self.unexpected_token(&name, "define clause"))?;
                 let tail = self.next_non_space();
                 if tail.kind == TokKind::Eof {
-                    Ok(unquote_string_like(name.text(self.src)))
+                    Ok(decoded)
                 } else {
                     Err(self.unexpected_token(&tail, "define clause"))
                 }
@@ -336,6 +338,8 @@ impl<'a> Parser<'a> {
         let name = self.next_non_space();
         match name.kind {
             TokKind::String | TokKind::RawString => {
+                compat::decode_go_string_literal(name.text(self.src))
+                    .ok_or_else(|| self.unexpected_token(&name, "template clause"))?;
                 if self.peek_non_space().kind == TokKind::Eof {
                     return Ok(());
                 }
@@ -350,6 +354,8 @@ impl<'a> Parser<'a> {
         let name = self.next_non_space();
         match name.kind {
             TokKind::String | TokKind::RawString => {
+                compat::decode_go_string_literal(name.text(self.src))
+                    .ok_or_else(|| self.unexpected_token(&name, "block clause"))?;
                 if self.peek_non_space().kind == TokKind::Eof {
                     return Err(GoTemplateScanError {
                         code: "missing_value_for_context",
@@ -796,17 +802,6 @@ fn keyword_function_candidate(kind: TokKind) -> Option<&'static str> {
     }
 }
 
-fn unquote_string_like(raw: &str) -> String {
-    if raw.len() >= 2 {
-        let first = raw.as_bytes()[0];
-        let last = raw.as_bytes()[raw.len() - 1];
-        if (first == b'"' && last == b'"') || (first == b'`' && last == b'`') {
-            return raw[1..raw.len() - 1].to_string();
-        }
-    }
-    raw.to_string()
-}
-
 fn context_message(context: &'static str) -> &'static str {
     match context {
         "command" => "unexpected token in command",
@@ -997,12 +992,13 @@ fn lex_action_inner(src: &str, abs_base: usize) -> Result<Vec<Tok>, GoTemplateSc
                 out.push(tok(TokKind::Number, i, end));
                 i = end;
             }
-            _ if is_alpha_numeric(b) => {
+            _ if is_identifier_start_at(bytes, i) => {
                 let start = i;
-                i += 1;
-                while i < bytes.len() && is_alpha_numeric(bytes[i]) {
-                    i += 1;
-                }
+                i = consume_identifier(bytes, i, false).ok_or_else(|| GoTemplateScanError {
+                    code: "bad_character",
+                    message: "bad character in action",
+                    offset: abs_base + start,
+                })?;
                 if !at_terminator(bytes, i) {
                     return Err(GoTemplateScanError {
                         code: "bad_character",
@@ -1071,9 +1067,11 @@ fn lex_field_or_variable(
         }
         return Ok((TokKind::Dot, i));
     }
-    while i < bytes.len() && is_alpha_numeric(bytes[i]) {
-        i += 1;
-    }
+    i = consume_identifier(bytes, i, true).ok_or_else(|| GoTemplateScanError {
+        code: "bad_character",
+        message: "bad character in action",
+        offset: abs_base + i,
+    })?;
     if !at_terminator(bytes, i) {
         return Err(GoTemplateScanError {
             code: "bad_character",
@@ -1263,8 +1261,43 @@ fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
 }
 
-fn is_alpha_numeric(b: u8) -> bool {
-    b == b'_' || b.is_ascii_alphanumeric()
+fn consume_identifier(bytes: &[u8], start: usize, allow_digit_first: bool) -> Option<usize> {
+    let (first, mut i) = decode_utf8_char(bytes, start)?;
+    if allow_digit_first {
+        if !is_identifier_continue_char(first) {
+            return None;
+        }
+    } else if !is_identifier_start_char(first) {
+        return None;
+    }
+    while i < bytes.len() {
+        let Some((ch, next)) = decode_utf8_char(bytes, i) else {
+            return None;
+        };
+        if !is_identifier_continue_char(ch) {
+            break;
+        }
+        i = next;
+    }
+    Some(i)
+}
+
+fn is_identifier_start_at(bytes: &[u8], start: usize) -> bool {
+    decode_utf8_char(bytes, start).is_some_and(|(ch, _)| is_identifier_start_char(ch))
+}
+
+fn decode_utf8_char(bytes: &[u8], start: usize) -> Option<(char, usize)> {
+    let tail = std::str::from_utf8(bytes.get(start..)?).ok()?;
+    let ch = tail.chars().next()?;
+    Some((ch, start + ch.len_utf8()))
+}
+
+fn is_identifier_start_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphabetic()
+}
+
+fn is_identifier_continue_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
 }
 
 fn is_number_digit(b: u8, base: u8) -> bool {
@@ -1316,6 +1349,27 @@ mod tests {
     }
 
     #[test]
+    fn parser_decodes_define_name_like_go_string_literal() {
+        let report = parse_action_report_with_options(
+            "{{ define \"\\x61\" }}",
+            0,
+            ParseCompatOptions {
+                skip_func_check: true,
+                known_functions: &[],
+                check_variables: false,
+                visible_variables: &[],
+            },
+        )
+        .expect("must parse");
+        assert_eq!(
+            report.control,
+            ControlAction::Open(ControlKind::Define),
+            "define must be recognized as control open"
+        );
+        assert_eq!(report.define_name.as_deref(), Some("a"));
+    }
+
+    #[test]
     fn parser_can_check_function_existence() {
         let err = parse_action_compat_with_options(
             "{{ totallyUnknown . }}",
@@ -1357,6 +1411,35 @@ mod tests {
                 known_functions: &["break"],
                 check_variables: false,
                 visible_variables: &[],
+            },
+        )
+        .expect("must parse");
+        assert_eq!(action, ControlAction::None);
+    }
+
+    #[test]
+    fn parser_accepts_unicode_function_and_variable_names() {
+        let action = parse_action_compat_with_options(
+            "{{ привет . }}",
+            0,
+            ParseCompatOptions {
+                skip_func_check: false,
+                known_functions: &["привет"],
+                check_variables: false,
+                visible_variables: &[],
+            },
+        )
+        .expect("must parse");
+        assert_eq!(action, ControlAction::None);
+
+        let action = parse_action_compat_with_options(
+            "{{ $имя }}",
+            0,
+            ParseCompatOptions {
+                skip_func_check: true,
+                known_functions: &[],
+                check_variables: true,
+                visible_variables: &["$имя"],
             },
         )
         .expect("must parse");

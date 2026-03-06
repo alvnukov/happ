@@ -1,4 +1,4 @@
-use happ::gotemplates::render_template_native;
+use happ::gotemplates::{render_template_native, NativeRenderError};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -50,18 +50,28 @@ fn native_executor_matches_go_std_exec_success_subset() {
         "{{printf \"%E\" 1.2}}",
         "{{printf \"%g\" 3.5}}",
         "{{printf \"%G\" 1234567.0}}",
+        "{{printf \"%b\" 1.0}}",
+        "{{printf \"%.4b\" -1.0}}",
+        "{{printf \"%+.3x\" 1.0}}",
+        "{{printf \"%#.0x\" 123.0}}",
+        "{{printf \"%#.4e\" 1.0}}",
+        "{{printf \"%#g\" 1230000.0}}",
         "{{printf `%T` 0xef}}",
         "{{printf \"%o\" 9}}",
         "{{printf \"%b\" 9}}",
         "{{printf \"%04x\" -1}}",
         "{{printf \"%d\" \"7\"}}",
+        "{{(1)}}",
         "{{\"aaa\"|printf}}",
+        "{{print nil}}",
         "{{html \"<tag attr='x'>&\\\"\"}}",
         "{{js \"<tag>&'\\\"=\\n\"}}",
         "{{urlquery \"http://www.example.org/\"}}",
+        "{{urlquery (slice \"日本\" 1 2)}}",
         "{{index .SI 0}}",
         "{{index .MSI `one`}}",
         "{{index .MSI `XXX`}}",
+        "{{index .MRep (slice \"日本\" 1 2)}}",
         "{{slice .SI}}",
         "{{slice .SI 1}}",
         "{{slice .SI 1 2}}",
@@ -71,7 +81,9 @@ fn native_executor_matches_go_std_exec_success_subset() {
         "{{$x := 2}}{{$x = 3}}{{$x}}",
         "{{range $x, $y := .SI}}<{{$x}}={{$y}}>{{end}}",
         "{{range .MSI}}-{{.}}-{{else}}EMPTY{{end}}",
+        "{{$имя := .данные.ключ}}{{$имя}}",
         "{{if eq 1 3}}{{else if eq 3 3}}3{{end}}",
+        "{{if false}}FALSE{{else if true}}TRUE{{end}}",
         "{{not true}} {{not false}}",
         "{{and false 0}} {{and 1 0}} {{and 0 true}} {{and 1 1}}",
         "{{and 1}}",
@@ -86,13 +98,27 @@ fn native_executor_matches_go_std_exec_success_subset() {
         "{{or 0 1 (index nil 0)}}",
         "{{and 1 0 (index nil 0)}}",
     ];
+    let go_results = runner
+        .render_batch(&cases, &data)
+        .expect("go render should succeed for sourced subset");
+    assert_eq!(
+        go_results.len(),
+        cases.len(),
+        "go batch size mismatch: got={} want={}",
+        go_results.len(),
+        cases.len()
+    );
 
-    for src in cases {
+    for (idx, src) in cases.iter().enumerate() {
         let rust_out = render_template_native(src, &data).expect("rust render should succeed");
-        let go_out = runner
-            .render(src, &data)
-            .expect("go render should succeed for sourced subset");
-        assert_eq!(rust_out, go_out, "rust/go output mismatch for: {src}");
+        let go = &go_results[idx];
+        assert!(
+            go.ok,
+            "go should succeed for sourced subset: {src}; err={}",
+            go.err
+        );
+        let go_out = &go.out;
+        assert_eq!(rust_out, *go_out, "rust/go output mismatch for: {src}");
     }
 }
 
@@ -120,6 +146,8 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{1.1|printf}}",
         "{{print '\\400'}}",
         "{{print '\\777'}}",
+        "{{1 2}}",
+        "{{(1) 2}}",
         "{{and}}",
         "{{or}}",
         "{{not}}",
@@ -131,6 +159,8 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{ne 1 2 3}}",
         "{{lt}}",
         "{{lt 1}}",
+        "{{lt true false}}",
+        "{{lt true 1}}",
         "{{le 1}}",
         "{{gt 1}}",
         "{{ge 1}}",
@@ -142,25 +172,124 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{slice}}",
         "{{printf}}",
         "{{len 3}}",
+        "{{range 3}}{{.}}{{end}}",
+        "{{range \"abc\"}}{{.}}{{end}}",
         "{{range 1.5}}{{.}}{{end}}",
         "{{break}}",
         "{{continue}}",
         "{{or 0 0 (index nil 0)}}",
         "{{and 1 1 (index nil 0)}}",
     ];
+    let go_results = runner
+        .render_batch(&failing_cases, &data)
+        .expect("go render batch should complete");
+    assert_eq!(
+        go_results.len(),
+        failing_cases.len(),
+        "go batch size mismatch: got={} want={}",
+        go_results.len(),
+        failing_cases.len()
+    );
 
-    for src in failing_cases {
+    for (idx, src) in failing_cases.iter().enumerate() {
         let rust = render_template_native(src, &data);
-        let go = runner.render(src, &data);
+        let go = &go_results[idx];
+        let rust_err = match rust {
+            Ok(out) => panic!("rust should fail for sourced negative case: {src}; out={out}"),
+            Err(err) => err,
+        };
         assert!(
-            rust.is_err(),
-            "rust should fail for sourced negative case: {src}"
+            !go.ok,
+            "go should fail for sourced negative case: {src}; out={}",
+            go.out
         );
-        assert!(
-            go.is_err(),
-            "go should fail for sourced negative case: {src}"
+
+        let rust_class = classify_exec_error_rust(&rust_err);
+        let go_class = classify_exec_error_go(&go.err);
+        assert_eq!(
+            rust_class, go_class,
+            "rust/go exec error class mismatch for: {src}; rust={rust_err:?}; go={}",
+            go.err
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecErrorClass {
+    Parse,
+    WrongArgCount,
+    Index,
+    Slice,
+    Len,
+    Range,
+    Compare,
+    Other,
+}
+
+fn classify_exec_reason(reason: &str) -> ExecErrorClass {
+    if reason.contains("illegal number syntax")
+        || reason.contains("bad number syntax")
+        || reason.contains("unterminated quoted string")
+        || reason.contains("unterminated character constant")
+        || reason.contains("unexpected ")
+        || reason.contains("missing value for ")
+    {
+        return ExecErrorClass::Parse;
+    }
+    if reason.contains("wrong number of args") {
+        return ExecErrorClass::WrongArgCount;
+    }
+    if reason.contains("error calling index:") {
+        return ExecErrorClass::Index;
+    }
+    if reason.contains("error calling slice:") {
+        return ExecErrorClass::Slice;
+    }
+    if reason.contains("error calling len:") {
+        return ExecErrorClass::Len;
+    }
+    if reason.contains("range can't iterate over") {
+        return ExecErrorClass::Range;
+    }
+    if reason.contains("error calling eq:")
+        || reason.contains("error calling ne:")
+        || reason.contains("error calling lt:")
+        || reason.contains("error calling le:")
+        || reason.contains("error calling gt:")
+        || reason.contains("error calling ge:")
+    {
+        return ExecErrorClass::Compare;
+    }
+    ExecErrorClass::Other
+}
+
+fn classify_exec_error_rust(err: &NativeRenderError) -> ExecErrorClass {
+    match err {
+        NativeRenderError::Parse(_) => ExecErrorClass::Parse,
+        NativeRenderError::UnsupportedAction { reason, .. } => classify_exec_reason(reason),
+        NativeRenderError::MissingValue { .. }
+        | NativeRenderError::TemplateNotFound { .. }
+        | NativeRenderError::TemplateRecursionLimit { .. } => ExecErrorClass::Other,
+    }
+}
+
+fn classify_exec_error_go(err: &str) -> ExecErrorClass {
+    if err.contains(": parse:")
+        || err.contains("bad number syntax")
+        || err.contains("illegal number syntax")
+        || err.contains("unterminated quoted string")
+        || err.contains("unterminated character constant")
+        || err.contains("unclosed action")
+        || err.contains("unexpected ")
+        || err.contains("missing value for ")
+    {
+        return ExecErrorClass::Parse;
+    }
+    if err.contains("{{break}} outside {{range}}") || err.contains("{{continue}} outside {{range}}")
+    {
+        return ExecErrorClass::Parse;
+    }
+    classify_exec_reason(err)
 }
 
 fn source_like_data() -> serde_json::Value {
@@ -173,6 +302,8 @@ fn source_like_data() -> serde_json::Value {
         "SI": [3, 4, 5],
         "AI": [3, 4, 5],
         "MSI": { "one": 1, "two": 2, "three": 3 },
+        "MRep": { "�": "hit" },
+        "данные": { "ключ": "значение" },
         "MSIone": { "one": 1 },
         "MSIEmpty": {},
         "Empty0": null,
@@ -192,6 +323,15 @@ struct GoExecRunner {
     program: PathBuf,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct GoBatchResult {
+    ok: bool,
+    #[serde(default)]
+    out: String,
+    #[serde(default)]
+    err: String,
+}
+
 impl GoExecRunner {
     fn new() -> Result<Self, String> {
         let tmp = TempDir::new().map_err(|e| format!("tmpdir: {e}"))?;
@@ -201,15 +341,21 @@ impl GoExecRunner {
         Ok(Self { _tmp: tmp, program })
     }
 
-    fn render(&self, src: &str, data: &serde_json::Value) -> Result<String, String> {
-        let encoded_src = base64_encode(src.as_bytes());
+    fn render_batch(
+        &self,
+        templates: &[&str],
+        data: &serde_json::Value,
+    ) -> Result<Vec<GoBatchResult>, String> {
+        let templates_json =
+            serde_json::to_string(templates).map_err(|e| format!("serialize templates: {e}"))?;
+        let encoded_templates = base64_encode(templates_json.as_bytes());
         let data_json = serde_json::to_string(data).map_err(|e| format!("serialize data: {e}"))?;
         let encoded_data = base64_encode(data_json.as_bytes());
 
         let output = Command::new("go")
             .arg("run")
             .arg(&self.program)
-            .arg(encoded_src)
+            .arg(encoded_templates)
             .arg(encoded_data)
             .output()
             .map_err(|e| format!("go run failed to start: {e}"))?;
@@ -222,7 +368,8 @@ impl GoExecRunner {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        serde_json::from_slice::<Vec<GoBatchResult>>(&output.stdout)
+            .map_err(|e| format!("decode go results: {e}"))
     }
 }
 
@@ -271,10 +418,10 @@ import (
 
 func main() {
     if len(os.Args) != 3 {
-        fmt.Print("need template and data")
+        fmt.Print("need templates and data")
         os.Exit(3)
     }
-    srcBytes, err := base64.StdEncoding.DecodeString(os.Args[1])
+    templatesBytes, err := base64.StdEncoding.DecodeString(os.Args[1])
     if err != nil {
         fmt.Print(err.Error())
         os.Exit(4)
@@ -290,17 +437,38 @@ func main() {
         os.Exit(6)
     }
 
-    t, err := template.New("x").Parse(string(srcBytes))
+    var templates []string
+    if err := json.Unmarshal(templatesBytes, &templates); err != nil {
+        fmt.Print(err.Error())
+        os.Exit(8)
+    }
+
+    type result struct {
+        Ok bool `json:"ok"`
+        Out string `json:"out,omitempty"`
+        Err string `json:"err,omitempty"`
+    }
+
+    out := make([]result, 0, len(templates))
+    for _, src := range templates {
+        t, err := template.New("x").Parse(src)
+        if err != nil {
+            out = append(out, result{Ok: false, Err: err.Error()})
+            continue
+        }
+        var buf bytes.Buffer
+        if err := t.Execute(&buf, data); err != nil {
+            out = append(out, result{Ok: false, Err: err.Error()})
+            continue
+        }
+        out = append(out, result{Ok: true, Out: buf.String()})
+    }
+    encoded, err := json.Marshal(out)
     if err != nil {
         fmt.Print(err.Error())
-        os.Exit(2)
+        os.Exit(9)
     }
-    var buf bytes.Buffer
-    if err := t.Execute(&buf, data); err != nil {
-        fmt.Print(err.Error())
-        os.Exit(7)
-    }
-    fmt.Print(buf.String())
+    fmt.Print(string(encoded))
 }
 "#
 }

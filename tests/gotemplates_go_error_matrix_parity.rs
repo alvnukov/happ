@@ -71,13 +71,23 @@ fn gotemplates_error_matrix_matches_go_parse_package() {
         (r#"{{define "a"}}a{{end}}{{define "a"}}{{end}}"#, None),
     ];
 
-    for (src, expected_code) in cases {
+    let templates: Vec<&str> = cases.iter().map(|(src, _)| *src).collect();
+    let go_codes = runner
+        .parse_error_codes(&templates)
+        .expect("go parser should return mapped codes");
+    assert_eq!(
+        go_codes.len(),
+        cases.len(),
+        "go batch size mismatch: got={} want={}",
+        go_codes.len(),
+        cases.len()
+    );
+
+    for (idx, (src, expected_code)) in cases.iter().enumerate() {
         let rust_code = parse_template_tokens_strict(src)
             .err()
             .map(|e| e.code.to_string());
-        let go_code = runner
-            .parse_error_code(src)
-            .expect("go parser should return code mapping");
+        let go_code = go_codes[idx].clone();
 
         assert_eq!(
             go_code,
@@ -109,8 +119,10 @@ impl GoParseRunner {
         Ok(Self { _tmp: tmp, program })
     }
 
-    fn parse_error_code(&self, src: &str) -> Result<Option<String>, String> {
-        let encoded = base64_encode(src.as_bytes());
+    fn parse_error_codes(&self, cases: &[&str]) -> Result<Vec<Option<String>>, String> {
+        let cases_json =
+            serde_json::to_string(cases).map_err(|e| format!("serialize cases: {e}"))?;
+        let encoded = base64_encode(cases_json.as_bytes());
         let output = Command::new("go")
             .arg("run")
             .arg(&self.program)
@@ -118,20 +130,29 @@ impl GoParseRunner {
             .output()
             .map_err(|e| format!("go run failed to start: {e}"))?;
 
-        if output.status.success() {
-            return Ok(None);
-        }
-
-        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if raw.is_empty() {
+        if !output.status.success() {
             return Err(format!(
-                "go run failed without parser output: status={} stderr={}",
+                "go run failed: status={} stdout={} stderr={}",
                 output.status,
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
 
-        Ok(map_go_error_to_code(&raw).map(ToString::to_string))
+        let raw = serde_json::from_slice::<Vec<String>>(&output.stdout)
+            .map_err(|e| format!("decode go results: {e}"))?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (idx, msg) in raw.into_iter().enumerate() {
+            if msg.is_empty() {
+                out.push(None);
+                continue;
+            }
+            match map_go_error_to_code(&msg) {
+                Some(code) => out.push(Some(code.to_string())),
+                None => return Err(format!("unmapped go parse error at index {idx}: {msg}")),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -238,6 +259,7 @@ fn go_program_source() -> &'static str {
 
 import (
     "encoding/base64"
+    "encoding/json"
     "fmt"
     "os"
     p "text/template/parse"
@@ -253,15 +275,29 @@ func main() {
         fmt.Print(err.Error())
         os.Exit(4)
     }
-
-    tr := p.New("x")
-    _, err = tr.Parse(string(data), "", "", map[string]*p.Tree{}, map[string]any{
-        "printf": fmt.Sprintf,
-        "print": fmt.Sprint,
-    })
-    if err != nil {
+    var cases []string
+    if err := json.Unmarshal(data, &cases); err != nil {
         fmt.Print(err.Error())
-        os.Exit(2)
+        os.Exit(5)
+    }
+
+    out := make([]string, len(cases))
+    for i, src := range cases {
+        tr := p.New("x")
+        _, err = tr.Parse(src, "", "", map[string]*p.Tree{}, map[string]any{
+            "printf": fmt.Sprintf,
+            "print": fmt.Sprint,
+        })
+        if err != nil {
+            out[i] = err.Error()
+        }
+    }
+
+    enc := json.NewEncoder(os.Stdout)
+    enc.SetEscapeHTML(false)
+    if err := enc.Encode(out); err != nil {
+        fmt.Print(err.Error())
+        os.Exit(6)
     }
 }
 "#

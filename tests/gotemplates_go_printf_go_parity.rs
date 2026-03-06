@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
+#[path = "gotemplates/go_printf_cases.rs"]
+mod gotemplates_go_printf_cases;
+
 #[derive(Debug, Clone)]
 enum Arg {
     Nil,
@@ -14,6 +17,7 @@ enum Arg {
     Uint(u64),
     Float(f64),
     Str(&'static str),
+    RawStrBytes(&'static [u8]),
     Bytes(&'static [u8]),
     Strs(&'static [&'static str]),
     MapStrInt(&'static [(&'static str, i64)]),
@@ -29,11 +33,10 @@ impl Arg {
             Self::Uint(v) => Some(Value::Number(Number::from(*v))),
             Self::Float(v) => Number::from_f64(*v).map(Value::Number),
             Self::Str(v) => Some(Value::String((*v).to_string())),
+            Self::RawStrBytes(v) => Some(happ::gotemplates::encode_go_string_bytes_value(v)),
             Self::Bytes(v) => Some(encode_go_bytes_value(v)),
             Self::Strs(v) => Some(Value::Array(
-                v.iter()
-                    .map(|s| Value::String((*s).to_string()))
-                    .collect(),
+                v.iter().map(|s| Value::String((*s).to_string())).collect(),
             )),
             Self::MapStrInt(v) => {
                 let mut map = serde_json::Map::new();
@@ -60,6 +63,7 @@ impl Arg {
             Self::Uint(v) => json!({"k":"uint","u":v}),
             Self::Float(v) => json!({"k":"float","f":v}),
             Self::Str(v) => json!({"k":"string","s":v}),
+            Self::RawStrBytes(v) => json!({"k":"raw_string_bytes","y":v}),
             Self::Bytes(v) => json!({"k":"bytes","y":v}),
             Self::Strs(v) => json!({"k":"strings","ss":v}),
             Self::MapStrInt(v) => {
@@ -90,644 +94,170 @@ fn compat_go_printf_matches_go_fmt_subset_from_source_tests() {
 
     let runner = GoFmtRunner::new().expect("prepare go fmt runner");
 
-    // Cases are taken from Go source:
-    // $GOROOT/src/fmt/fmt_test.go (fmtTests subset supported by our runtime)
-    let cases = vec![
-        Case {
-            source_line: 147,
-            fmt: "%d",
-            args: vec![Arg::Int(12345)],
-        },
-        Case {
-            source_line: 148,
-            fmt: "%v",
-            args: vec![Arg::Int(12345)],
-        },
-        Case {
-            source_line: 741,
-            fmt: "%v",
-            args: vec![Arg::Float(1.0)],
-        },
-        Case {
-            source_line: 149,
-            fmt: "%t",
-            args: vec![Arg::Bool(true)],
-        },
-        Case {
-            source_line: 152,
-            fmt: "%s",
-            args: vec![Arg::Str("abc")],
-        },
-        Case {
-            source_line: 824,
-            fmt: "%s",
-            args: vec![Arg::Int(7)],
-        },
-        Case {
-            source_line: 154,
-            fmt: "%x",
-            args: vec![Arg::Str("abc")],
-        },
-        Case {
-            source_line: 174,
-            fmt: "%q",
-            args: vec![Arg::Bytes(b"abc")],
-        },
-        Case {
-            source_line: 154,
-            fmt: "%x",
-            args: vec![Arg::Bytes(b"abc")],
-        },
-        Case {
-            source_line: 158,
-            fmt: "%x",
-            args: vec![Arg::Str("")],
-        },
-        Case {
-            source_line: 159,
-            fmt: "% x",
-            args: vec![Arg::Str("")],
-        },
-        Case {
-            source_line: 160,
-            fmt: "%#x",
-            args: vec![Arg::Str("")],
-        },
-        Case {
-            source_line: 161,
-            fmt: "%# x",
-            args: vec![Arg::Str("")],
-        },
-        Case {
-            source_line: 162,
-            fmt: "%x",
-            args: vec![Arg::Str("xyz")],
-        },
-        Case {
-            source_line: 163,
-            fmt: "%X",
-            args: vec![Arg::Str("xyz")],
-        },
-        Case {
-            source_line: 164,
-            fmt: "% x",
-            args: vec![Arg::Str("xyz")],
-        },
-        Case {
-            source_line: 165,
-            fmt: "% X",
-            args: vec![Arg::Str("xyz")],
-        },
-        Case {
-            source_line: 166,
-            fmt: "%#x",
-            args: vec![Arg::Str("xyz")],
-        },
-        Case {
-            source_line: 167,
-            fmt: "%#X",
-            args: vec![Arg::Str("xyz")],
-        },
-        Case {
-            source_line: 168,
-            fmt: "%# x",
-            args: vec![Arg::Str("xyz")],
-        },
-        Case {
-            source_line: 169,
-            fmt: "%# X",
-            args: vec![Arg::Str("xyz")],
-        },
-        Case {
-            source_line: 247,
-            fmt: "%c",
-            args: vec![Arg::Uint('x' as u64)],
-        },
-        Case {
-            source_line: 659,
-            fmt: "%c",
-            args: vec![Arg::Bytes(b"ABC")],
-        },
-        Case {
-            source_line: 248,
-            fmt: "%c",
-            args: vec![Arg::Int(0xe4)],
-        },
-        Case {
-            source_line: 251,
-            fmt: "%.0c",
-            args: vec![Arg::Int('⌘' as i64)],
-        },
-        Case {
-            source_line: 252,
-            fmt: "%3c",
-            args: vec![Arg::Int('⌘' as i64)],
-        },
-        Case {
-            source_line: 221,
-            fmt: "%03c",
-            args: vec![Arg::Int('⌘' as i64)],
-        },
-        Case {
-            source_line: 153,
-            fmt: "%q",
-            args: vec![Arg::Str("abc")],
-        },
-        Case {
-            source_line: 255,
-            fmt: "%q",
-            args: vec![Arg::Int('⌘' as i64)],
-        },
-        Case {
-            source_line: 256,
-            fmt: "%q",
-            args: vec![Arg::Int('\n' as i64)],
-        },
-        Case {
-            source_line: 291,
-            fmt: "%q",
-            args: vec![Arg::Int(0x0e00)],
-        },
-        Case {
-            source_line: 292,
-            fmt: "%q",
-            args: vec![Arg::Int(0x10ffff)],
-        },
-        Case {
-            source_line: 294,
-            fmt: "%q",
-            args: vec![Arg::Int(-1)],
-        },
-        Case {
-            source_line: 763,
-            fmt: "%q",
-            args: vec![Arg::Strs(&["a", "b"])],
-        },
-        Case {
-            source_line: 296,
-            fmt: "%q",
-            args: vec![Arg::Int(0x110000)],
-        },
-        Case {
-            source_line: 218,
-            fmt: "%10q",
-            args: vec![Arg::Str("⌘")],
-        },
-        Case {
-            source_line: 220,
-            fmt: "%-10q",
-            args: vec![Arg::Str("⌘")],
-        },
-        Case {
-            source_line: 222,
-            fmt: "%010q",
-            args: vec![Arg::Str("⌘")],
-        },
-        Case {
-            source_line: 208,
-            fmt: "%+q",
-            args: vec![Arg::Str("日本語")],
-        },
-        Case {
-            source_line: 193,
-            fmt: "%#q",
-            args: vec![Arg::Str("")],
-        },
-        Case {
-            source_line: 195,
-            fmt: "%#q",
-            args: vec![Arg::Str("\"")],
-        },
-        Case {
-            source_line: 197,
-            fmt: "%#q",
-            args: vec![Arg::Str("`")],
-        },
-        Case {
-            source_line: 199,
-            fmt: "%#q",
-            args: vec![Arg::Str("\n")],
-        },
-        Case {
-            source_line: 201,
-            fmt: "%#q",
-            args: vec![Arg::Str("\\n")],
-        },
-        Case {
-            source_line: 203,
-            fmt: "%#q",
-            args: vec![Arg::Str("abc")],
-        },
-        Case {
-            source_line: 206,
-            fmt: "%#q",
-            args: vec![Arg::Str("日本語")],
-        },
-        Case {
-            source_line: 241,
-            fmt: "%#q",
-            args: vec![Arg::Str("\u{FFFD}")],
-        },
-        Case {
-            source_line: 671,
-            fmt: "%#v",
-            args: vec![Arg::Bytes(&[1, 11, 111])],
-        },
-        Case {
-            source_line: 720,
-            fmt: "%#v",
-            args: vec![Arg::Int(1_000_000_000)],
-        },
-        Case {
-            source_line: 719,
-            fmt: "%#v",
-            args: vec![Arg::Uint(u64::MAX)],
-        },
-        Case {
-            source_line: 721,
-            fmt: "%#v",
-            args: vec![Arg::MapStrInt(&[("a", 1)])],
-        },
-        Case {
-            source_line: 719,
-            fmt: "%#v",
-            args: vec![Arg::MapStrUint(&[("a", u64::MAX)])],
-        },
-        Case {
-            source_line: 723,
-            fmt: "%#v",
-            args: vec![Arg::Strs(&["a", "b"])],
-        },
-        Case {
-            source_line: 733,
-            fmt: "%#v",
-            args: vec![Arg::Str("foo")],
-        },
-        Case {
-            source_line: 741,
-            fmt: "%#v",
-            args: vec![Arg::Float(1.0)],
-        },
-        Case {
-            source_line: 742,
-            fmt: "%#v",
-            args: vec![Arg::Float(1_000_000.0)],
-        },
-        Case {
-            source_line: 339,
-            fmt: "%d",
-            args: vec![Arg::Uint(12345)],
-        },
-        Case {
-            source_line: 340,
-            fmt: "%d",
-            args: vec![Arg::Int(-12345)],
-        },
-        Case {
-            source_line: 349,
-            fmt: "%.d",
-            args: vec![Arg::Int(0)],
-        },
-        Case {
-            source_line: 351,
-            fmt: "%6.0d",
-            args: vec![Arg::Int(0)],
-        },
-        Case {
-            source_line: 352,
-            fmt: "%06.0d",
-            args: vec![Arg::Int(0)],
-        },
-        Case {
-            source_line: 366,
-            fmt: "%o",
-            args: vec![Arg::Int(668)],
-        },
-        Case {
-            source_line: 657,
-            fmt: "%o",
-            args: vec![Arg::Bytes(b"ABC")],
-        },
-        Case {
-            source_line: 367,
-            fmt: "%o",
-            args: vec![Arg::Int(-668)],
-        },
-        Case {
-            source_line: 368,
-            fmt: "%#o",
-            args: vec![Arg::Int(668)],
-        },
-        Case {
-            source_line: 369,
-            fmt: "%#o",
-            args: vec![Arg::Int(-668)],
-        },
-        Case {
-            source_line: 657,
-            fmt: "%b",
-            args: vec![Arg::Bytes(b"ABC")],
-        },
-        Case {
-            source_line: 382,
-            fmt: "%20.8d",
-            args: vec![Arg::Int(1234)],
-        },
-        Case {
-            source_line: 383,
-            fmt: "%20.8d",
-            args: vec![Arg::Int(-1234)],
-        },
-        Case {
-            source_line: 384,
-            fmt: "%020.8d",
-            args: vec![Arg::Int(1234)],
-        },
-        Case {
-            source_line: 385,
-            fmt: "%020.8d",
-            args: vec![Arg::Int(-1234)],
-        },
-        Case {
-            source_line: 388,
-            fmt: "%-#20.8x",
-            args: vec![Arg::Int(0x1234abc)],
-        },
-        Case {
-            source_line: 389,
-            fmt: "%-#20.8X",
-            args: vec![Arg::Int(0x1234abc)],
-        },
-        Case {
-            source_line: 390,
-            fmt: "%-#20.8o",
-            args: vec![Arg::Int(668)],
-        },
-        Case {
-            source_line: 404,
-            fmt: "%U",
-            args: vec![Arg::Int(0)],
-        },
-        Case {
-            source_line: 657,
-            fmt: "%U",
-            args: vec![Arg::Bytes(b"ABC")],
-        },
-        Case {
-            source_line: 405,
-            fmt: "%U",
-            args: vec![Arg::Int(-1)],
-        },
-        Case {
-            source_line: 406,
-            fmt: "%U",
-            args: vec![Arg::Int('\n' as i64)],
-        },
-        Case {
-            source_line: 407,
-            fmt: "%#U",
-            args: vec![Arg::Int('\n' as i64)],
-        },
-        Case {
-            source_line: 411,
-            fmt: "%#U",
-            args: vec![Arg::Int('☺' as i64)],
-        },
-        Case {
-            source_line: 410,
-            fmt: "%#.2U",
-            args: vec![Arg::Int('x' as i64)],
-        },
-        Case {
-            source_line: 413,
-            fmt: "%#14.6U",
-            args: vec![Arg::Int('⌘' as i64)],
-        },
-        Case {
-            source_line: 635,
-            fmt: "%20.5s",
-            args: vec![Arg::Str("qwertyuiop")],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%s",
-            args: vec![Arg::Bytes(b"abc")],
-        },
-        Case {
-            source_line: 636,
-            fmt: "%.5s",
-            args: vec![Arg::Str("qwertyuiop")],
-        },
-        Case {
-            source_line: 637,
-            fmt: "%-20.5s",
-            args: vec![Arg::Str("qwertyuiop")],
-        },
-        Case {
-            source_line: 603,
-            fmt: "%e",
-            args: vec![Arg::Float(1.0)],
-        },
-        Case {
-            source_line: 604,
-            fmt: "%g",
-            args: vec![Arg::Float(1234.5678e3)],
-        },
-        Case {
-            source_line: 608,
-            fmt: "%g",
-            args: vec![Arg::Float(-1e-9)],
-        },
-        Case {
-            source_line: 610,
-            fmt: "%E",
-            args: vec![Arg::Float(1.0)],
-        },
-        Case {
-            source_line: 615,
-            fmt: "%G",
-            args: vec![Arg::Float(1234.5678e3)],
-        },
-        Case {
-            source_line: 619,
-            fmt: "%G",
-            args: vec![Arg::Float(-1e-9)],
-        },
-        Case {
-            source_line: 681,
-            fmt: "% d",
-            args: vec![Arg::Int(7)],
-        },
-        Case {
-            source_line: 681,
-            fmt: "%+d",
-            args: vec![Arg::Int(7)],
-        },
-        // Type-mismatch marker shape (mirrors fmt behavior).
-        Case {
-            source_line: 824,
-            fmt: "%d",
-            args: vec![Arg::Str("7")],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%",
-            args: vec![],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%d",
-            args: vec![],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%d",
-            args: vec![Arg::Int(1), Arg::Int(2)],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%*d",
-            args: vec![Arg::Str("x"), Arg::Int(7)],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%.*d",
-            args: vec![Arg::Str("x"), Arg::Int(7)],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%*.*f",
-            args: vec![Arg::Int(8), Arg::Int(2), Arg::Float(1.2)],
-        },
-        Case {
-            source_line: 1223,
-            fmt: "%2147483648d",
-            args: vec![Arg::Int(42)],
-        },
-        Case {
-            source_line: 1224,
-            fmt: "%-2147483648d",
-            args: vec![Arg::Int(42)],
-        },
-        Case {
-            source_line: 1225,
-            fmt: "%.2147483648d",
-            args: vec![Arg::Int(42)],
-        },
-        Case {
-            source_line: 1673,
-            fmt: "%*d",
-            args: vec![Arg::Int(10_000_000), Arg::Int(42)],
-        },
-        Case {
-            source_line: 1674,
-            fmt: "%*d",
-            args: vec![Arg::Int(-10_000_000), Arg::Int(42)],
-        },
-        Case {
-            source_line: 1677,
-            fmt: "%.*d",
-            args: vec![Arg::Int(10_000_000), Arg::Int(42)],
-        },
-        Case {
-            source_line: 1679,
-            fmt: "%.*d",
-            args: vec![Arg::Uint(1u64 << 63), Arg::Int(42)],
-        },
-        Case {
-            source_line: 1680,
-            fmt: "%.*d",
-            args: vec![Arg::Uint(u64::MAX), Arg::Int(42)],
-        },
-        Case {
-            source_line: 1683,
-            fmt: "%*",
-            args: vec![Arg::Int(4)],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%[2]d %[1]d",
-            args: vec![Arg::Int(1), Arg::Int(2)],
-        },
-        Case {
-            source_line: 1208,
-            fmt: "%[d",
-            args: vec![Arg::Int(2), Arg::Int(1)],
-        },
-        Case {
-            source_line: 1210,
-            fmt: "%[]d",
-            args: vec![Arg::Int(2), Arg::Int(1)],
-        },
-        Case {
-            source_line: 1211,
-            fmt: "%[-3]d",
-            args: vec![Arg::Int(2), Arg::Int(1)],
-        },
-        Case {
-            source_line: 1212,
-            fmt: "%[99]d",
-            args: vec![Arg::Int(2), Arg::Int(1)],
-        },
-        Case {
-            source_line: 1213,
-            fmt: "%[3]",
-            args: vec![Arg::Int(2), Arg::Int(1)],
-        },
-        Case {
-            source_line: 1219,
-            fmt: "%[5]d %[2]d %d",
-            args: vec![Arg::Int(1), Arg::Int(2), Arg::Int(3)],
-        },
-        Case {
-            source_line: 1220,
-            fmt: "%d %[3]d %d",
-            args: vec![Arg::Int(1), Arg::Int(2)],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%[2]2d",
-            args: vec![Arg::Int(1), Arg::Int(2)],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%[2].2d",
-            args: vec![Arg::Int(1), Arg::Int(2)],
-        },
-        Case {
-            source_line: 1216,
-            fmt: "%3.[2]d",
-            args: vec![Arg::Int(7)],
-        },
-        Case {
-            source_line: 1217,
-            fmt: "%.[2]d",
-            args: vec![Arg::Int(7)],
-        },
-        Case {
-            source_line: 1221,
-            fmt: "%.[]",
-            args: vec![],
-        },
-        Case {
-            source_line: 0,
-            fmt: "%v",
-            args: vec![Arg::Nil],
-        },
-    ];
-
-    for case in cases {
-        let rust_args: Vec<Option<Value>> = case.args.iter().map(Arg::to_rust_value).collect();
+    let cases = gotemplates_go_printf_cases::cases();
+    let mut go_batch = Vec::with_capacity(cases.len());
+    for case in &cases {
         let go_args: Vec<Value> = case.args.iter().map(Arg::to_go_wire).collect();
+        go_batch.push(json!({"fmt": case.fmt, "args": go_args}));
+    }
+    let go_outputs = runner
+        .sprintf_batch(&go_batch)
+        .expect("go fmt.Sprintf must succeed");
+    assert_eq!(
+        go_outputs.len(),
+        cases.len(),
+        "go batch size mismatch: got={} want={}",
+        go_outputs.len(),
+        cases.len()
+    );
 
+    for (idx, case) in cases.into_iter().enumerate() {
+        let rust_args: Vec<Option<Value>> = case.args.iter().map(Arg::to_rust_value).collect();
         let rust_out = go_printf(case.fmt, &rust_args).expect("compat go_printf must succeed");
-        let go_out = runner
-            .sprintf(case.fmt, &go_args)
-            .expect("go fmt.Sprintf must succeed");
+        let go_out = &go_outputs[idx];
         assert_eq!(
-            rust_out, go_out,
+            rust_out, *go_out,
             "mismatch for source_line={} fmt={} args={:?}",
             case.source_line, case.fmt, case.args
+        );
+    }
+}
+
+#[test]
+fn compat_go_printf_matches_go_fmt_generated_matrix() {
+    if !has_go_toolchain() {
+        eprintln!("skip: go toolchain is unavailable");
+        return;
+    }
+
+    let runner = GoFmtRunner::new().expect("prepare go fmt runner");
+
+    let pool = vec![
+        Arg::Int(-7),
+        Arg::Uint(u64::MAX),
+        Arg::Float(1.25),
+        Arg::Str("abc"),
+        Arg::Bytes(b"ab"),
+        Arg::Bool(true),
+        Arg::Nil,
+    ];
+    let formats = vec![
+        "%d",
+        "%+d",
+        "% d",
+        "%08d",
+        "%-8d",
+        "%.3d",
+        "%8.3d",
+        "%x",
+        "%#x",
+        "% X",
+        "%# X",
+        "%o",
+        "%O",
+        "%b",
+        "%c",
+        "%U",
+        "%s",
+        "%.2s",
+        "%8.2s",
+        "%q",
+        "%+q",
+        "%#q",
+        "%v",
+        "%+v",
+        "%#v",
+        "%T",
+        "%t",
+        "%f",
+        "%.2f",
+        "%8.2f",
+        "%e",
+        "%E",
+        "%g",
+        "%G",
+        "%[2]d",
+        "%[3]q",
+        "%[1]x %#[1]x",
+        "%[8]d",
+        "%[2]*d",
+        "%[2]*.[1]*f",
+        "%[1].2d",
+        "%[1]2d",
+        "%3.[2]d",
+        "%.[2]d",
+        "%[5]d %[2]d %d",
+        "%d %[3]d %d",
+        "%[2]2d",
+        "%[2].2d",
+        "%[d",
+        "%[]d",
+        "%[-3]d",
+        "%[99]d",
+        "%[3]",
+        "%]d",
+        "%.[]",
+        "%*d",
+        "%.*f",
+        "%*.*f",
+        "%d %d %d",
+        "%s %q %x",
+        "%v %T %#[1]v",
+        "%q %q %q",
+    ];
+    let arg_sizes = [0usize, 1, 2, 3, 4, 7];
+    let mut arg_sets = vec![
+        vec![],
+        vec![Arg::Int(-7)],
+        vec![Arg::Str("x")],
+        vec![Arg::Float(1.25)],
+        vec![Arg::Bool(true)],
+        vec![Arg::Nil],
+        vec![Arg::RawStrBytes(&[0x97])],
+        vec![Arg::RawStrBytes(&[0x97, 0x61])],
+        vec![Arg::Int(-7), Arg::Int(3)],
+        vec![Arg::Str("x"), Arg::Int(3)],
+        vec![Arg::Int(-7), Arg::Str("x")],
+        vec![Arg::Int(-7), Arg::Float(1.25)],
+        vec![Arg::Int(-7), Arg::Int(3), Arg::Float(1.25)],
+        vec![Arg::Int(-7), Arg::Bool(true)],
+        vec![Arg::Uint(u64::MAX), Arg::Int(3)],
+    ];
+    for size in arg_sizes {
+        arg_sets.push(pool.iter().take(size).cloned().collect());
+    }
+
+    let mut matrix: Vec<(&str, Vec<Arg>)> = Vec::new();
+    for fmt in &formats {
+        for args in &arg_sets {
+            matrix.push((*fmt, args.clone()));
+        }
+    }
+
+    let mut go_batch = Vec::with_capacity(matrix.len());
+    for (fmt, args) in &matrix {
+        let go_args: Vec<Value> = args.iter().map(Arg::to_go_wire).collect();
+        go_batch.push(json!({"fmt": fmt, "args": go_args}));
+    }
+    let go_outputs = runner
+        .sprintf_batch(&go_batch)
+        .expect("go fmt.Sprintf must succeed");
+    assert_eq!(
+        go_outputs.len(),
+        matrix.len(),
+        "go batch size mismatch: got={} want={}",
+        go_outputs.len(),
+        matrix.len()
+    );
+
+    for (idx, (fmt, args)) in matrix.into_iter().enumerate() {
+        let rust_args: Vec<Option<Value>> = args.iter().map(Arg::to_rust_value).collect();
+        let rust_out = go_printf(fmt, &rust_args).expect("compat go_printf must succeed");
+        let go_out = &go_outputs[idx];
+        assert_eq!(
+            rust_out, *go_out,
+            "generated mismatch idx={} fmt={} args={:?}",
+            idx, fmt, args
         );
     }
 }
@@ -753,16 +283,14 @@ impl GoFmtRunner {
         Ok(Self { _tmp: tmp, program })
     }
 
-    fn sprintf(&self, fmt: &str, args: &[Value]) -> Result<String, String> {
-        let encoded_fmt = base64_encode(fmt.as_bytes());
-        let args_json = serde_json::to_string(args).map_err(|e| format!("serialize args: {e}"))?;
-        let encoded_args = base64_encode(args_json.as_bytes());
+    fn sprintf_batch(&self, cases: &[Value]) -> Result<Vec<String>, String> {
+        let payload = serde_json::to_string(cases).map_err(|e| format!("serialize cases: {e}"))?;
+        let encoded_payload = base64_encode(payload.as_bytes());
 
         let output = Command::new("go")
             .arg("run")
             .arg(&self.program)
-            .arg(encoded_fmt)
-            .arg(encoded_args)
+            .arg(encoded_payload)
             .output()
             .map_err(|e| format!("go run failed to start: {e}"))?;
 
@@ -774,7 +302,8 @@ impl GoFmtRunner {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        serde_json::from_slice::<Vec<String>>(&output.stdout)
+            .map_err(|e| format!("decode go results: {e}"))
     }
 }
 
@@ -832,6 +361,11 @@ type wireArg struct {
 	MSU []wireMapStrUintEntry `json:"msu"`
 }
 
+type wireCase struct {
+	Fmt string `json:"fmt"`
+	Args []wireArg `json:"args"`
+}
+
 type wireMapStrIntEntry struct {
 	K string `json:"k"`
 	I int64 `json:"i"`
@@ -851,11 +385,13 @@ func decodeArg(a wireArg) (any, error) {
 	case "int":
 		return int(a.I), nil
 	case "uint":
-		return a.U, nil
+		return uint(a.U), nil
 	case "float":
 		return a.F, nil
 	case "string":
 		return a.S, nil
+	case "raw_string_bytes":
+		return string([]byte(a.Y)), nil
 	case "bytes":
 		return []byte(a.Y), nil
 	case "strings":
@@ -878,36 +414,41 @@ func decodeArg(a wireArg) (any, error) {
 }
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Print("need format and args")
+	if len(os.Args) != 2 {
+		fmt.Print("need cases payload")
 		os.Exit(3)
 	}
-	fmtBytes, err := base64.StdEncoding.DecodeString(os.Args[1])
+	payloadBytes, err := base64.StdEncoding.DecodeString(os.Args[1])
 	if err != nil {
 		fmt.Print(err.Error())
 		os.Exit(4)
 	}
-	argsBytes, err := base64.StdEncoding.DecodeString(os.Args[2])
-	if err != nil {
-		fmt.Print(err.Error())
-		os.Exit(5)
-	}
-
-	var wire []wireArg
-	if err := json.Unmarshal(argsBytes, &wire); err != nil {
+	var cases []wireCase
+	if err := json.Unmarshal(payloadBytes, &cases); err != nil {
 		fmt.Print(err.Error())
 		os.Exit(6)
 	}
-	args := make([]any, 0, len(wire))
-	for _, item := range wire {
-		v, err := decodeArg(item)
-		if err != nil {
-			fmt.Print(err.Error())
-			os.Exit(7)
+
+	results := make([]string, 0, len(cases))
+	for _, c := range cases {
+		args := make([]any, 0, len(c.Args))
+		for _, item := range c.Args {
+			v, err := decodeArg(item)
+			if err != nil {
+				fmt.Print(err.Error())
+				os.Exit(7)
+			}
+			args = append(args, v)
 		}
-		args = append(args, v)
+		results = append(results, fmt.Sprintf(c.Fmt, args...))
 	}
-	fmt.Print(fmt.Sprintf(string(fmtBytes), args...))
+
+	encoded, err := json.Marshal(results)
+	if err != nil {
+		fmt.Print(err.Error())
+		os.Exit(8)
+	}
+	fmt.Print(string(encoded))
 }
 "#
 }
