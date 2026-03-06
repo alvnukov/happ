@@ -159,6 +159,8 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{range nil}}x{{end}}",
         "{{(nil)}}",
         "{{print (nil)}}",
+        "{{1 | nil}}",
+        "{{1 | (nil)}}",
         "{{1 2}}",
         "{{(1) 2}}",
         "{{and}}",
