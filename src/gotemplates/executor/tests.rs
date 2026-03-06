@@ -956,7 +956,12 @@ fn native_renderer_call_builtin_reports_go_like_non_function_errors() {
             "{{call \"x\"}}",
             "error calling call: non-function \"x\" of type string",
         ),
+        (
+            "{{call (\"x\")}}",
+            "error calling call: non-function \"x\" of type string",
+        ),
         ("{{call 1}}", "error calling call: non-function 1 of type int"),
+        ("{{call (1)}}", "error calling call: non-function 1 of type int"),
     ] {
         let err = render_template_native(src, &data).expect_err("must fail");
         match err {
