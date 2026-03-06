@@ -942,7 +942,16 @@ fn native_renderer_call_builtin_reports_go_like_non_function_errors() {
             "{{call .fn}}",
             "error calling call: non-function .fn of type string",
         ),
+        (
+            "{{call (.fn)}}",
+            "error calling call: non-function .fn of type string",
+        ),
+        (
+            "{{call ((.fn))}}",
+            "error calling call: non-function (.fn) of type string",
+        ),
         ("{{call .missing}}", "error calling call: call of nil"),
+        ("{{call (.missing)}}", "error calling call: call of nil"),
         (
             "{{call \"x\"}}",
             "error calling call: non-function \"x\" of type string",

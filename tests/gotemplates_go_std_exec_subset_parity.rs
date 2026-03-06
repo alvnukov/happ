@@ -206,6 +206,7 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{call \"x\"}}",
         "{{call 1}}",
         "{{call .Unknown}}",
+        "{{call (.Unknown)}}",
         "{{len 3}}",
         "{{range 3}}{{.}}{{end}}",
         "{{range \"abc\"}}{{.}}{{end}}",
