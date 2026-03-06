@@ -478,6 +478,90 @@ fn native_renderer_rejects_nil_as_command_like_go() {
 }
 
 #[test]
+fn native_renderer_reports_non_function_commands_like_go() {
+    let data = json!({});
+    for (src, want) in [
+        ("{{nil 1}}", "can't give argument to non-function nil"),
+        ("{{\"x\" 1}}", "can't give argument to non-function \"x\""),
+        ("{{(1) 2}}", "can't give argument to non-function 1"),
+        (
+            "{{(printf) 2}}",
+            "can't give argument to non-function printf",
+        ),
+        (
+            "{{$x := 1}}{{1 | $x}}",
+            "can't give argument to non-function $x",
+        ),
+        ("{{1 | (nil)}}", "can't give argument to non-function nil"),
+        (
+            "{{1 | (\"x\")}}",
+            "can't give argument to non-function \"x\"",
+        ),
+    ] {
+        let err = render_template_native(src, &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains(want), "src={src} reason={reason}");
+            }
+            other => panic!("unexpected error for {src}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn native_renderer_preserves_non_executable_pipeline_stage_errors_like_go_parse() {
+    let data = json!({});
+    for src in ["{{1 | nil}}", "{{1 | \"x\"}}", "{{1 | .}}", "{{1 | true}}"] {
+        let err = render_template_native(src, &data).expect_err("must fail");
+        match err {
+            NativeRenderError::Parse(parse) => {
+                assert!(
+                    parse.message.contains("non executable command in pipeline stage"),
+                    "src={src} parse={parse:?}"
+                );
+            }
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(
+                    reason.contains("non executable command in pipeline stage"),
+                    "src={src} reason={reason}"
+                );
+            }
+            other => panic!("unexpected error for {src}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn native_renderer_reports_field_invocation_argument_errors_like_go() {
+    let data = json!({"x": 7, "m": {"a": 1}});
+    for (src, want) in [
+        ("{{.x 2}}", "x is not a method but has arguments"),
+        (
+            "{{$m := .m}}{{$m.a 2}}",
+            "a is not a method but has arguments",
+        ),
+        ("{{1 | .x}}", "x is not a method but has arguments"),
+    ] {
+        let err = render_template_native(src, &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains(want), "src={src} reason={reason}");
+            }
+            other => panic!("unexpected error for {src}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn native_renderer_allows_field_with_args_when_dot_is_nil_like_go() {
+    let data = Value::Null;
+    let out = render_template_native("{{.x 2}}", &data).expect("must render");
+    assert_eq!(out, "<no value>");
+    let out = render_template_native("{{1 | .x}}", &data).expect("must render");
+    assert_eq!(out, "<no value>");
+}
+
+#[test]
 fn native_renderer_eq_reports_non_comparable_like_go_text_template() {
     let mut m = serde_json::Map::new();
     m.insert(

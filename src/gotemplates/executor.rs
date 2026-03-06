@@ -1329,6 +1329,32 @@ fn eval_pipeline_command(
         return Ok(result);
     }
 
+    if has_pipe_input && is_non_executable_pipeline_head(head) {
+        return Err(NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: "non executable command in pipeline stage".to_string(),
+        });
+    }
+
+    if has_pipe_input || tokens.len() > 1 {
+        if let Some(target) = non_function_command_target(head) {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!("can't give argument to non-function {target}"),
+            });
+        }
+        if let Some(field_name) = command_field_like_final_segment(head) {
+            let value = eval_command_token_value(action, head, root, dot, state, resolver)?;
+            if value.is_none() {
+                return Ok(None);
+            }
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: format!("{field_name} is not a method but has arguments"),
+            });
+        }
+    }
+
     if has_pipe_input {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
@@ -1348,8 +1374,80 @@ fn eval_pipeline_command(
 
     Err(NativeRenderError::UnsupportedAction {
         action: action.to_string(),
-        reason: format!("unknown function: {head}"),
+        reason: format!("\"{head}\" is not a defined function"),
     })
+}
+
+fn is_non_executable_pipeline_head(token: &str) -> bool {
+    let trimmed = token.trim();
+    if trimmed.is_empty() || strip_outer_parens(trimmed).is_some() {
+        return false;
+    }
+    if matches!(trimmed, "." | "nil" | "true" | "false") {
+        return true;
+    }
+    if is_quoted_string(trimmed) || looks_like_numeric_literal(trimmed) {
+        return true;
+    }
+    looks_like_char_literal(trimmed)
+}
+
+fn non_function_command_target(token: &str) -> Option<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(inner) = strip_outer_parens(trimmed) {
+        return Some(inner.trim().to_string());
+    }
+    if matches!(trimmed, "." | "nil" | "true" | "false") {
+        return Some(trimmed.to_string());
+    }
+    if is_quoted_string(trimmed) || looks_like_numeric_literal(trimmed) || looks_like_char_literal(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    if trimmed.starts_with('$') {
+        if let Some((_, rest)) = split_variable_reference(trimmed) {
+            if rest.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn command_field_like_final_segment(token: &str) -> Option<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() || strip_outer_parens(trimmed).is_some() {
+        return None;
+    }
+
+    let path = if let Some(rest) = trimmed.strip_prefix("$.") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix('.') {
+        rest
+    } else if let Some((_, rest)) = split_variable_reference(trimmed) {
+        rest
+    } else {
+        return None;
+    };
+
+    if path.is_empty() {
+        return None;
+    }
+
+    let mut last: Option<&str> = None;
+    for segment in path.split('.') {
+        if segment.is_empty() || !segment.chars().all(is_field_path_segment_char) {
+            return None;
+        }
+        last = Some(segment);
+    }
+    last.map(ToString::to_string)
+}
+
+fn is_field_path_segment_char(ch: char) -> bool {
+    is_identifier_continue_char(ch) || ch == '-'
 }
 
 fn eval_short_circuit_builtin(
@@ -1454,7 +1552,7 @@ fn eval_call_builtin(
         Err(NativeFunctionResolverError::UnknownFunction) => {
             Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: format!("unknown function: {fn_name}"),
+                reason: format!("\"{fn_name}\" is not a defined function"),
             })
         }
         Err(NativeFunctionResolverError::Failed { reason }) => {

@@ -174,6 +174,17 @@ fn go_compat_template_exec_matrix_matches_go_text_template_subset() {
             json!({"arr":[1,2,3]}),
         ),
         Case::new(r#"{{define "main"}}{{lt true 1}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{1 | nil}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{1 | (nil)}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{"x" 1}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{nil 1}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{(printf) 2}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{$x := 1}}{{$x 2}}{{end}}"#, json!({})),
+        Case::new(r#"{{define "main"}}{{$x := 1}}{{1 | $x}}{{end}}"#, json!({})),
+        Case::new(
+            r#"{{define "main"}}{{$m := .m}}{{$m.a 2}}{{end}}"#,
+            json!({"m":{"a":1}}),
+        ),
     ];
 
     let go_results = runner

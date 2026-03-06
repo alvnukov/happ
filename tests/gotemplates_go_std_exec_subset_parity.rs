@@ -161,8 +161,17 @@ fn native_executor_matches_go_std_exec_failure_subset() {
         "{{print (nil)}}",
         "{{1 | nil}}",
         "{{1 | (nil)}}",
+        "{{1 | \"x\"}}",
+        "{{1 | (\"x\")}}",
+        "{{nil 1}}",
         "{{1 2}}",
         "{{(1) 2}}",
+        "{{\"x\" 1}}",
+        "{{(printf) 2}}",
+        "{{$x := 1}}{{$x 2}}",
+        "{{$x := 1}}{{1 | $x}}",
+        "{{.MSI.one 2}}",
+        "{{$m := .MSI}}{{$m.one 2}}",
         "{{and}}",
         "{{or}}",
         "{{not}}",
@@ -248,6 +257,7 @@ fn classify_exec_reason(reason: &str) -> ExecErrorClass {
         || reason.contains("unterminated character constant")
         || reason.contains("unexpected ")
         || reason.contains("missing value for ")
+        || reason.contains("non executable command in pipeline stage")
     {
         return ExecErrorClass::Parse;
     }
