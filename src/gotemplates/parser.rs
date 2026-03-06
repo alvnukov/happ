@@ -413,7 +413,7 @@ impl<'a> Parser<'a> {
                             "non executable command in pipeline stage {}",
                             stage
                         ),
-                        offset: self.current_offset_for_stage(stage),
+                        offset: self.abs(first.first_start),
                     });
                 }
                 continue;
@@ -510,6 +510,7 @@ impl<'a> Parser<'a> {
 
     fn parse_command(&mut self) -> Result<CommandInfo<'a>, GoTemplateScanError> {
         let mut first_term = None;
+        let mut first_start = None;
         let mut first_identifier = None;
         let mut first_variable = None;
         let mut args = 0usize;
@@ -519,6 +520,7 @@ impl<'a> Parser<'a> {
             if let Some(term) = operand {
                 if first_term.is_none() {
                     first_term = Some(term);
+                    first_start = Some(first_tok.start);
                     if term == TermKind::Identifier && first_tok.kind == TokKind::Identifier {
                         first_identifier = Some(IdentifierRef {
                             name: first_tok.text(self.src),
@@ -568,6 +570,7 @@ impl<'a> Parser<'a> {
 
         Ok(CommandInfo {
             first_term: first_term.unwrap_or(TermKind::OtherExec),
+            first_start: first_start.unwrap_or(self.src.len()),
             first_identifier,
         })
     }
@@ -664,10 +667,6 @@ impl<'a> Parser<'a> {
             .get(self.idx)
             .or_else(|| self.tokens.last())
             .map_or(self.base, |t| self.abs(t.start))
-    }
-
-    fn current_offset_for_stage(&self, _stage: usize) -> usize {
-        self.current_offset()
     }
 
     fn keyword_token_is_function(&self, tok: Tok) -> bool {
@@ -788,6 +787,7 @@ impl<'a> Parser<'a> {
 #[derive(Debug, Clone, Copy)]
 struct CommandInfo<'a> {
     first_term: TermKind,
+    first_start: usize,
     first_identifier: Option<IdentifierRef<'a>>,
 }
 
