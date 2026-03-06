@@ -55,6 +55,13 @@ fn gotemplates_error_matrix_matches_go_parse_package() {
             r#"{{12|false}}"#,
             Some("non_executable_command_in_pipeline"),
         ),
+        (
+            r#"{{1 | print | nil}}"#,
+            Some("non_executable_command_in_pipeline"),
+        ),
+        (r#"{{unknownFn}}"#, Some("undefined_function")),
+        (r#"{{1 | unknownFn}}"#, Some("undefined_function")),
+        (r#"{{(unknownFn)}}"#, Some("undefined_function")),
         (r#"{{printf "%d" ( ) }}"#, Some("missing_value_for_context")),
         (r#"{{range $k,}}{{end}}"#, Some("missing_value_for_context")),
         (

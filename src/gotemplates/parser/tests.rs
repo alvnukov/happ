@@ -66,6 +66,20 @@ fn parser_can_check_function_existence() {
     .expect_err("must fail");
     assert_eq!(err.code, "undefined_function");
     assert!(err.message.contains("function \"totallyUnknown\" not defined"));
+
+    let err = parse_action_compat_with_options(
+        "{{ 1 | totallyUnknown }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: false,
+            known_functions: &[],
+            check_variables: false,
+            visible_variables: &[],
+        },
+    )
+    .expect_err("must fail");
+    assert_eq!(err.code, "undefined_function");
+    assert!(err.message.contains("function \"totallyUnknown\" not defined"));
 }
 
 #[test]
