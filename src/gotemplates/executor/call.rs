@@ -1,8 +1,9 @@
 use super::{
     eval_command_token_value, format_value_for_print, is_identifier_name, strip_outer_parens,
-    value_type_name_for_template, wrong_number_of_args, EvalState, NativeFunctionResolver,
-    NativeFunctionResolverError, NativeRenderError,
+    wrong_number_of_args, EvalState, NativeFunctionResolver, NativeFunctionResolverError,
+    NativeRenderError,
 };
+use super::typeutil::value_type_name_for_template;
 use serde_json::Value;
 
 pub(super) fn eval_call_builtin(

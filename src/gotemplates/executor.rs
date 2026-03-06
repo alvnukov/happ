@@ -47,12 +47,6 @@ use rangeeval::{apply_range_iteration_bindings, range_items};
 use textfmt::{builtin_html, builtin_js, builtin_print, builtin_urlquery, format_value_for_print};
 use tokenize::{split_command_tokens, split_pipeline_commands, strip_outer_parens};
 use truth::{builtin_and, builtin_or, is_truthy};
-use typeutil::{
-    format_non_comparable_type_reason, format_non_comparable_types_reason, is_go_bytes_slice_option,
-    is_map_object_option, map_key_arg, non_comparable_kind_option, option_string_like_bytes,
-    option_type_name_for_template, parse_slice_like_index, value_from_go_string_bytes,
-    value_type_name_for_template, MapKeyArg,
-};
 use trim::apply_lexical_trims;
 use varcheck::{
     ensure_variable_is_defined, looks_like_char_literal, looks_like_numeric_literal,

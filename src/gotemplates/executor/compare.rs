@@ -1,4 +1,10 @@
-use super::*;
+use super::{wrong_number_of_args, NativeRenderError};
+use super::typeutil::{
+    format_non_comparable_type_reason, format_non_comparable_types_reason,
+    is_go_bytes_slice_option, is_map_object_option, non_comparable_kind_option,
+    option_string_like_bytes,
+};
+use serde_json::Value;
 
 pub(super) fn builtin_eq(action: &str, args: &[Option<Value>]) -> Result<bool, NativeRenderError> {
     if args.is_empty() {

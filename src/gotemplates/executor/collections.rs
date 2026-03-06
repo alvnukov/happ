@@ -2,9 +2,12 @@ use super::{
     decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
     decode_go_typed_slice_value, encode_go_bytes_value, encode_go_nil_bytes_value,
     encode_go_typed_slice_value, go_bytes_get, go_bytes_is_nil, go_bytes_len,
-    go_string_bytes_get, go_string_bytes_len, go_zero_value_for_type, map_key_arg,
-    option_type_name_for_template, parse_slice_like_index, value_from_go_string_bytes,
-    value_type_name_for_template, wrong_number_of_args, MapKeyArg, NativeRenderError,
+    go_string_bytes_get, go_string_bytes_len, go_zero_value_for_type, wrong_number_of_args,
+    NativeRenderError,
+};
+use super::typeutil::{
+    map_key_arg, option_type_name_for_template, parse_slice_like_index, value_from_go_string_bytes,
+    value_type_name_for_template, MapKeyArg,
 };
 use serde_json::{Number, Value};
 
