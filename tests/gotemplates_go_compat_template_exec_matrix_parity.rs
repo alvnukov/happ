@@ -98,12 +98,18 @@ fn go_compat_template_exec_matrix_matches_go_text_template_subset() {
 
     let runner = GoTemplateRunner::new().expect("prepare go template runner");
     let cases = vec![
-        Case::new(r#"{{define "main"}}hello {{.name}}{{end}}"#, json!({"name":"zol"})),
+        Case::new(
+            r#"{{define "main"}}hello {{.name}}{{end}}"#,
+            json!({"name":"zol"}),
+        ),
         Case::new(
             r#"{{define "x"}}{{.v}}{{end}}{{define "main"}}[{{template "x" .}}]{{end}}"#,
             json!({"v":"ok"}),
         ),
-        Case::new(r#"{{define "main"}}{{$x := 1}}{{$x = 2}}{{$x}}{{end}}"#, json!({})),
+        Case::new(
+            r#"{{define "main"}}{{$x := 1}}{{$x = 2}}{{$x}}{{end}}"#,
+            json!({}),
+        ),
         Case::new(
             r#"{{define "main"}}{{range $i, $v := .items}}{{$i}}={{$v}};{{else}}EMPTY{{end}}{{end}}"#,
             json!({"items":[10,20]}),
@@ -122,17 +128,27 @@ fn go_compat_template_exec_matrix_matches_go_text_template_subset() {
             r#"{{define "main"}}{{printf "%[2]*.[1]*f" 2 6 12.0}}{{end}}"#,
             json!({}),
         ),
+        Case::new(r#"{{define "main"}}{{.foo}}{{end}}"#, json!(null)),
         Case::new(
             r#"{{define "\x61"}}A{{end}}{{define "main"}}{{template "\x61" .}}{{end}}"#,
             json!({}),
         ),
-        Case::new(r#"<<define "main">><<if .ok>>OK<<else>>NO<<end>><<end>>"#, json!({"ok": true}))
-            .delims("<<", ">>"),
-        Case::new(r#"{{define "main"}}{{ext .name}}{{end}}"#, json!({"name":"zol"}))
-            .funcs(&["ext"]),
+        Case::new(
+            r#"<<define "main">><<if .ok>>OK<<else>>NO<<end>><<end>>"#,
+            json!({"ok": true}),
+        )
+        .delims("<<", ">>"),
+        Case::new(
+            r#"{{define "main"}}{{ext .name}}{{end}}"#,
+            json!({"name":"zol"}),
+        )
+        .funcs(&["ext"]),
         Case::new(r#"{{define "main"}}{{sum 1 2 3}}{{end}}"#, json!({})).funcs(&["sum"]),
-        Case::new(r#"{{define "main"}}{{failif .v}}{{end}}"#, json!({"v":"boom"}))
-            .funcs(&["failif"]),
+        Case::new(
+            r#"{{define "main"}}{{failif .v}}{{end}}"#,
+            json!({"v":"boom"}),
+        )
+        .funcs(&["failif"]),
         Case::new(r#"{{define "main""#, json!({})),
         Case::new(r#"{{define "main"}}{{nope 1}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}x{{end}}"#, json!({})).name("missing"),
@@ -148,8 +164,14 @@ fn go_compat_template_exec_matrix_matches_go_text_template_subset() {
         )
         .option("missingkey=zero"),
         Case::new(r#"{{define "main"}}{{len 1 2}}{{end}}"#, json!({})),
-        Case::new(r#"{{define "main"}}{{index .arr 10}}{{end}}"#, json!({"arr":[1,2,3]})),
-        Case::new(r#"{{define "main"}}{{slice .arr -1}}{{end}}"#, json!({"arr":[1,2,3]})),
+        Case::new(
+            r#"{{define "main"}}{{index .arr 10}}{{end}}"#,
+            json!({"arr":[1,2,3]}),
+        ),
+        Case::new(
+            r#"{{define "main"}}{{slice .arr -1}}{{end}}"#,
+            json!({"arr":[1,2,3]}),
+        ),
         Case::new(r#"{{define "main"}}{{lt true 1}}{{end}}"#, json!({})),
     ];
 
@@ -243,7 +265,10 @@ fn rust_external_resolver(
                     reason: "missing argument".to_string(),
                 });
             };
-            Ok(Some(Value::String(format!("{}-ok", sprint_like_go(&value)))))
+            Ok(Some(Value::String(format!(
+                "{}-ok",
+                sprint_like_go(&value)
+            ))))
         }
         "sum" => {
             let mut sum: i64 = 0;

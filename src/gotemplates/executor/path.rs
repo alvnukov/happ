@@ -95,6 +95,7 @@ pub(super) fn resolve_simple_path(
                         reason: format!("nil pointer evaluating interface {{}}.{seg}"),
                     });
                 }
+                Value::Null => return Ok(None),
                 _ => {
                     return Err(NativeRenderError::UnsupportedAction {
                         action: format!("{{{{{expr}}}}}"),
