@@ -873,6 +873,27 @@ fn native_renderer_and_or_short_circuit_matches_go() {
 }
 
 #[test]
+fn native_renderer_and_or_pipeline_argument_order_matches_go() {
+    let data = json!({});
+    for src in [
+        "{{0 | and (index nil 0)}}",
+        "{{0 | or (index nil 0)}}",
+        "{{1 | or (index nil 0)}}",
+    ] {
+        let err = render_template_native(src, &data).expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(
+                    reason.contains("error calling index: index of untyped nil"),
+                    "src={src} reason={reason}"
+                );
+            }
+            other => panic!("unexpected error for {src}: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn native_renderer_supports_external_function_resolver_with_args() {
     let data = json!({});
     let out = render_template_native_with_resolver(

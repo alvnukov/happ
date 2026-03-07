@@ -419,9 +419,9 @@ pub(super) fn builtin_slice(
 
 #[cfg(test)]
 mod tests {
-    use super::builtin_index;
+    use super::{builtin_index, builtin_len, builtin_slice};
     use crate::gotemplates::NativeRenderError;
-    use serde_json::json;
+    use serde_json::{json, Map, Number, Value};
 
     fn reason(err: NativeRenderError) -> String {
         match err {
@@ -443,5 +443,51 @@ mod tests {
     fn index_above_len_keeps_index_out_of_range_message() {
         let err = builtin_index("", &[Some(json!([1, 2])), Some(json!(3))]).expect_err("must fail");
         assert!(reason(err).contains("error calling index: index out of range: 3"));
+    }
+
+    #[test]
+    fn len_matches_go_for_supported_and_unsupported_values() {
+        assert_eq!(builtin_len("", &[Some(json!([1, 2, 3]))]).expect("len"), 3);
+        assert_eq!(builtin_len("", &[Some(json!("abc"))]).expect("len"), 3);
+
+        let err = builtin_len("", &[None]).expect_err("must fail");
+        assert!(reason(err).contains("error calling len: len of nil pointer"));
+
+        let err = builtin_len("", &[Some(json!(3))]).expect_err("must fail");
+        assert!(reason(err).contains("error calling len: len of type int"));
+    }
+
+    #[test]
+    fn index_map_missing_key_returns_zero_value_for_typed_maps() {
+        let mut entries = Map::new();
+        entries.insert("a".to_string(), Value::Number(Number::from(7)));
+        let typed = crate::gotemplates::encode_go_typed_map_value("int", Some(entries));
+        let out = builtin_index("", &[Some(typed), Some(json!("missing"))]).expect("index");
+        assert_eq!(out, Some(Value::Number(Number::from(0))));
+    }
+
+    #[test]
+    fn slice_respects_string_and_index_rules() {
+        let out =
+            builtin_slice("", &[Some(json!("abcd")), Some(json!(1)), Some(json!(3))]).expect("slice");
+        assert_eq!(out, Some(json!("bc")));
+
+        let err = builtin_slice(
+            "",
+            &[Some(json!("abcd")), Some(json!(1)), Some(json!(2)), Some(json!(2))],
+        )
+        .expect_err("must fail");
+        assert!(reason(err).contains("error calling slice: cannot 3-index slice a string"));
+    }
+
+    #[test]
+    fn slice_validates_bounds_like_go() {
+        let err = builtin_slice("", &[Some(json!([1, 2, 3])), Some(json!(2)), Some(json!(1))])
+            .expect_err("must fail");
+        assert!(reason(err).contains("error calling slice: invalid slice index: 2 > 1"));
+
+        let err = builtin_slice("", &[Some(json!([1, 2, 3])), Some(json!(4)), Some(json!(5))])
+            .expect_err("must fail");
+        assert!(reason(err).contains("error calling slice: index out of range: 4"));
     }
 }
