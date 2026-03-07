@@ -1,4 +1,5 @@
 mod assets;
+mod batch;
 pub mod chart_analyzer;
 pub mod chart_ir;
 mod cli;

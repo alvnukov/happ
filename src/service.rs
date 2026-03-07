@@ -17,6 +17,8 @@ pub enum Error {
     ComposeInspect(#[from] crate::composeinspect::Error),
     #[error(transparent)]
     Lsp(#[from] crate::lsp::Error),
+    #[error(transparent)]
+    ChartAnalyzer(#[from] crate::chart_analyzer::Error),
     #[error("convert: {0}")]
     Convert(String),
     #[error("dyff differences found")]
@@ -48,69 +50,16 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
         ));
     };
     match command {
-        Command::Chart(args) => {
-            let docs = crate::source::load_documents_for_chart(&args)?;
-            let values = crate::convert::build_values(&args, &docs).map_err(Error::Convert)?;
-            let values_yaml_for_chart = crate::output::values_yaml(&values)?;
-            let mut verify_chart_dir: Option<String> = None;
-            let mut verify_temp_dir: Option<tempfile::TempDir> = None;
-            if let Some(out) = args.out_chart_dir.as_deref() {
-                crate::output::generate_consumer_chart(
-                    out,
-                    args.chart_name.as_deref(),
-                    &values,
-                    args.library_chart_path.as_deref(),
-                )?;
-                let _ = crate::output::sync_imported_include_helpers_from_source_chart(
-                    &args.path,
-                    out,
-                    &values_yaml_for_chart,
-                )?;
-                let _ = crate::output::ensure_values_examples_for_imported_helpers(out)?;
-                let _ = crate::output::copy_chart_crds_if_any(&args.path, out)?;
-                verify_chart_dir = Some(out.to_string());
-            }
-            if args.verify_equivalence {
-                if verify_chart_dir.is_none() {
-                    let tmp = tempfile::Builder::new()
-                        .prefix("happ-verify-")
-                        .tempdir()
-                        .map_err(|e| Error::Convert(format!("create verify temp dir: {e}")))?;
-                    let generated_chart_dir = tmp.path().join("chart");
-                    let generated_chart_dir_text =
-                        generated_chart_dir.to_string_lossy().to_string();
-                    crate::output::generate_consumer_chart(
-                        &generated_chart_dir_text,
-                        args.chart_name.as_deref(),
-                        &values,
-                        args.library_chart_path.as_deref(),
-                    )?;
-                    let _ = crate::output::sync_imported_include_helpers_from_source_chart(
-                        &args.path,
-                        &generated_chart_dir_text,
-                        &values_yaml_for_chart,
-                    )?;
-                    let _ = crate::output::ensure_values_examples_for_imported_helpers(
-                        &generated_chart_dir_text,
-                    )?;
-                    let _ = crate::output::copy_chart_crds_if_any(
-                        &args.path,
-                        &generated_chart_dir_text,
-                    )?;
-                    verify_chart_dir = Some(generated_chart_dir_text);
-                    verify_temp_dir = Some(tmp);
-                }
-                let summary = verify_chart_equivalence(
-                    &args,
-                    &docs,
-                    verify_chart_dir.as_deref().expect("verify chart dir"),
-                )?;
-                eprintln!("verify equivalence: {summary}");
-            }
-            if args.out_chart_dir.is_none() || args.output.is_some() {
-                crate::output::write_values(args.output.as_deref(), &values)?;
-            }
-            drop(verify_temp_dir);
+        Command::Chart(args) => run_chart_command(&args),
+        Command::Batch(args) => {
+            let report = crate::batch::run_batch_convert(&args, |import_args| {
+                run_chart_command(import_args).map_err(|e| e.to_string())
+            })
+            .map_err(Error::Convert)?;
+            eprintln!(
+                "batch convert: total={}, succeeded={}, failed={}",
+                report.total, report.succeeded, report.failed
+            );
             Ok(())
         }
         Command::Manifests(args) => {
@@ -354,6 +303,69 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
             Ok(())
         }
     }
+}
+
+fn run_chart_command(args: &crate::cli::ImportArgs) -> Result<(), Error> {
+    let analyzed = crate::chart_analyzer::analyze_chart(args)?;
+    let docs = analyzed.documents;
+    let values = analyzed.values;
+    let values_yaml_for_chart = crate::output::values_yaml(&values)?;
+    let mut verify_chart_dir: Option<String> = None;
+    let mut verify_temp_dir: Option<tempfile::TempDir> = None;
+    if let Some(out) = args.out_chart_dir.as_deref() {
+        crate::output::generate_consumer_chart(
+            out,
+            args.chart_name.as_deref(),
+            &values,
+            args.library_chart_path.as_deref(),
+        )?;
+        let _ = crate::output::sync_imported_include_helpers_from_source_chart(
+            &args.path,
+            out,
+            &values_yaml_for_chart,
+        )?;
+        let _ = crate::output::ensure_values_examples_for_imported_helpers(out)?;
+        let _ = crate::output::copy_chart_crds_if_any(&args.path, out)?;
+        verify_chart_dir = Some(out.to_string());
+    }
+    if args.verify_equivalence {
+        if verify_chart_dir.is_none() {
+            let tmp = tempfile::Builder::new()
+                .prefix("happ-verify-")
+                .tempdir()
+                .map_err(|e| Error::Convert(format!("create verify temp dir: {e}")))?;
+            let generated_chart_dir = tmp.path().join("chart");
+            let generated_chart_dir_text = generated_chart_dir.to_string_lossy().to_string();
+            crate::output::generate_consumer_chart(
+                &generated_chart_dir_text,
+                args.chart_name.as_deref(),
+                &values,
+                args.library_chart_path.as_deref(),
+            )?;
+            let _ = crate::output::sync_imported_include_helpers_from_source_chart(
+                &args.path,
+                &generated_chart_dir_text,
+                &values_yaml_for_chart,
+            )?;
+            let _ = crate::output::ensure_values_examples_for_imported_helpers(
+                &generated_chart_dir_text,
+            )?;
+            let _ = crate::output::copy_chart_crds_if_any(&args.path, &generated_chart_dir_text)?;
+            verify_chart_dir = Some(generated_chart_dir_text);
+            verify_temp_dir = Some(tmp);
+        }
+        let summary = verify_chart_equivalence(
+            args,
+            &docs,
+            verify_chart_dir.as_deref().expect("verify chart dir"),
+        )?;
+        eprintln!("verify equivalence: {summary}");
+    }
+    if args.out_chart_dir.is_none() || args.output.is_some() {
+        crate::output::write_values(args.output.as_deref(), &values)?;
+    }
+    drop(verify_temp_dir);
+    Ok(())
 }
 
 fn read_stdin_to_eof() -> Result<Option<String>, Error> {
@@ -763,7 +775,8 @@ fn format_dyff_github(args: &crate::cli::DyffArgs, entries: &[DiffEntry]) -> Res
 mod tests {
     use super::*;
     use crate::cli::{
-        Command, CompletionArgs, DyffArgs, ImportArgs, InspectArgs, QueryArgs, ValidateArgs,
+        BatchArgs, Command, CompletionArgs, DyffArgs, ImportArgs, ImportSharedArgs, InspectArgs,
+        QueryArgs, ValidateArgs,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -1172,6 +1185,29 @@ mod tests {
         assert!(
             matches!(result, Error::Convert(ref msg) if msg.contains("--verify-equivalence is supported only for chart source")),
             "unexpected error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn batch_command_fails_for_missing_input_dir() {
+        let td = TempDir::new().expect("tmp");
+        let out = td.path().join("out");
+        let cli = Cli {
+            web: false,
+            web_stdin: false,
+            web_addr: "127.0.0.1:8088".to_string(),
+            web_open_browser: true,
+            command: Some(Command::Batch(BatchArgs {
+                charts_dir: td.path().join("missing").to_string_lossy().to_string(),
+                out_dir: out.to_string_lossy().to_string(),
+                keep_going: true,
+                import: ImportSharedArgs::default(),
+            })),
+        };
+        let err = run_with(cli).expect_err("must fail");
+        assert!(
+            matches!(err, Error::Convert(ref msg) if msg.contains("does not exist")),
+            "unexpected error: {err:?}"
         );
     }
 
