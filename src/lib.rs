@@ -1,4 +1,6 @@
 mod assets;
+pub mod chart_analyzer;
+pub mod chart_ir;
 mod cli;
 mod composeimport;
 mod composeinspect;
@@ -9,6 +11,7 @@ pub mod gotemplates;
 mod inspectweb;
 mod lsp;
 mod output;
+mod process_guard;
 mod query;
 mod service;
 mod source;

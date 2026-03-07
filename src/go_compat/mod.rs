@@ -14,6 +14,7 @@
 // - expr             -> go/src/text/template/parse/parse.go
 // - externalfn       -> go/src/text/template/exec.go
 // - functions        -> go/src/text/template/funcs.go (action-level function-call analysis helpers)
+// - helm_ir_ffi      -> helm pkg/engine + chart/common/util (resource model over Helm SDK)
 // - ident            -> go/src/text/template/parse/lex.go
 // - parse/*          -> go/src/text/template/parse/*
 // - parse/action     -> canonical parse-action API surface
@@ -38,15 +39,17 @@ pub mod actionparse;
 pub mod analyzer;
 pub mod backend;
 pub mod call;
-pub mod compat;
 pub mod collections;
-pub mod compare;
 pub mod commandkind;
+pub mod compare;
+pub mod compat;
 pub mod evaldiag;
 pub mod expr;
 pub mod externalfn;
+pub(crate) mod ffi_runtime;
 pub mod functions;
 pub mod go_std;
+pub mod helm_ir_ffi;
 pub mod ident;
 pub mod parse;
 pub mod path;
@@ -56,11 +59,14 @@ pub mod runtime;
 pub mod scan;
 pub mod template;
 pub mod textfmt;
-pub mod typedvalue;
 pub mod tokenize;
 pub mod trim;
 pub mod truth;
+pub mod typedvalue;
 pub mod typeutil;
 pub mod utf8scan;
-pub mod varcheck;
 pub mod valuefmt;
+pub mod varcheck;
+
+// Based on Helm engine recursionMaxNums in pkg/engine/engine.go.
+pub const HELM_INCLUDE_RECURSION_MAX_REFS: usize = 1000;
