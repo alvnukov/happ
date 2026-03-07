@@ -66,7 +66,7 @@ impl TemplateOptions {
         NativeRenderOptions {
             missing_value_mode,
             function_dispatch_mode: FunctionDispatchMode::GoStrict,
-            logic_backend: LogicBackend::GoCompat,
+            logic_backend: LogicBackend::from_env().unwrap_or_default(),
         }
     }
 }
@@ -83,8 +83,14 @@ mod tests {
             .expect("option apply must succeed");
         let native = options.to_native_render_options();
         assert_eq!(native.missing_value_mode, MissingValueMode::Error);
-        assert_eq!(native.function_dispatch_mode, FunctionDispatchMode::GoStrict);
-        assert_eq!(native.logic_backend, LogicBackend::GoCompat);
+        assert_eq!(
+            native.function_dispatch_mode,
+            FunctionDispatchMode::GoStrict
+        );
+        assert_eq!(
+            native.logic_backend,
+            LogicBackend::from_env().unwrap_or_default()
+        );
     }
 
     #[test]
@@ -94,8 +100,14 @@ mod tests {
             options.apply(raw).expect("option apply must succeed");
             let native = options.to_native_render_options();
             assert_eq!(native.missing_value_mode, MissingValueMode::GoDefault);
-            assert_eq!(native.function_dispatch_mode, FunctionDispatchMode::GoStrict);
-            assert_eq!(native.logic_backend, LogicBackend::GoCompat);
+            assert_eq!(
+                native.function_dispatch_mode,
+                FunctionDispatchMode::GoStrict
+            );
+            assert_eq!(
+                native.logic_backend,
+                LogicBackend::from_env().unwrap_or_default()
+            );
         }
     }
 
@@ -107,7 +119,13 @@ mod tests {
             .expect("option apply must succeed");
         let native = options.to_native_render_options();
         assert_eq!(native.missing_value_mode, MissingValueMode::GoZero);
-        assert_eq!(native.function_dispatch_mode, FunctionDispatchMode::GoStrict);
-        assert_eq!(native.logic_backend, LogicBackend::GoCompat);
+        assert_eq!(
+            native.function_dispatch_mode,
+            FunctionDispatchMode::GoStrict
+        );
+        assert_eq!(
+            native.logic_backend,
+            LogicBackend::from_env().unwrap_or_default()
+        );
     }
 }

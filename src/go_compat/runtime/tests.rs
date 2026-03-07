@@ -538,7 +538,9 @@ fn native_renderer_preserves_non_executable_pipeline_stage_errors_like_go_parse(
         match err {
             NativeRenderError::Parse(parse) => {
                 assert!(
-                    parse.message.contains("non executable command in pipeline stage 2"),
+                    parse
+                        .message
+                        .contains("non executable command in pipeline stage 2"),
                     "src={src} parse={parse:?}"
                 );
             }
@@ -563,10 +565,7 @@ fn native_renderer_reports_field_invocation_argument_errors_like_go() {
             "a is not a method but has arguments",
         ),
         ("{{1 | .x}}", "x is not a method but has arguments"),
-        (
-            "{{.a.b 2}}",
-            "b is not a method but has arguments",
-        ),
+        ("{{.a.b 2}}", "b is not a method but has arguments"),
         (
             "{{$m := .m}}{{1 | $m.a}}",
             "a is not a method but has arguments",
@@ -785,9 +784,8 @@ fn native_renderer_supports_range_variable_declarations() {
 #[test]
 fn native_renderer_supports_range_variable_declarations_without_spaces() {
     let data = json!({"items":["a","b"]});
-    let out =
-        render_template_native("{{range $i,$v:=.items}}{{$i}}={{$v}};{{end}}", &data)
-            .expect("must render");
+    let out = render_template_native("{{range $i,$v:=.items}}{{$i}}={{$v}};{{end}}", &data)
+        .expect("must render");
     assert_eq!(out, "0=a;1=b;");
 }
 
@@ -1033,7 +1031,10 @@ fn native_renderer_go_strict_disables_dynamic_external_function_head() {
 fn native_renderer_call_builtin_reports_go_like_non_function_errors() {
     let data = json!({"fn":"ext"});
     for (src, want) in [
-        ("{{call}}", "wrong number of args for call: want at least 1 got 0"),
+        (
+            "{{call}}",
+            "wrong number of args for call: want at least 1 got 0",
+        ),
         ("{{call ext}}", "\"ext\" is not a defined function"),
         ("{{call nil}}", "error calling call: call of nil"),
         ("{{call (nil)}}", "nil is not a command"),
@@ -1065,8 +1066,14 @@ fn native_renderer_call_builtin_reports_go_like_non_function_errors() {
             "{{call (\"x\")}}",
             "error calling call: non-function \"x\" of type string",
         ),
-        ("{{call 1}}", "error calling call: non-function 1 of type int"),
-        ("{{call (1)}}", "error calling call: non-function 1 of type int"),
+        (
+            "{{call 1}}",
+            "error calling call: non-function 1 of type int",
+        ),
+        (
+            "{{call (1)}}",
+            "error calling call: non-function 1 of type int",
+        ),
     ] {
         let err = render_template_native(src, &data).expect_err("must fail");
         match err {

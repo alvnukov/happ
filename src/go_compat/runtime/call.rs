@@ -1,3 +1,4 @@
+use super::typeutil::value_type_name_for_template;
 use super::{
     eval_command_token_value, wrong_number_of_args, EvalState, NativeFunctionResolver,
     NativeFunctionResolverError, NativeRenderError,
@@ -7,7 +8,6 @@ use crate::go_compat::externalfn::{
     external_call_failed_reason, is_call_builtin_identifier_candidate,
     is_external_function_identifier, undefined_function_reason,
 };
-use super::typeutil::value_type_name_for_template;
 use serde_json::Value;
 
 pub(super) fn eval_call_builtin(
@@ -24,15 +24,11 @@ pub(super) fn eval_call_builtin(
         return Err(wrong_number_of_args(action, "call", "at least 1", 0));
     }
 
-    let mut args = Vec::with_capacity(arg_tokens.len().saturating_sub(1) + usize::from(has_pipe_input));
+    let mut args =
+        Vec::with_capacity(arg_tokens.len().saturating_sub(1) + usize::from(has_pipe_input));
     for token in arg_tokens.iter().skip(1) {
         args.push(eval_command_token_value(
-            action,
-            token,
-            root,
-            dot,
-            state,
-            resolver,
+            action, token, root, dot, state, resolver,
         )?);
     }
 

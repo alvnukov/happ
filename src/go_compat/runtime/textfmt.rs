@@ -1,9 +1,9 @@
+#[cfg(test)]
+use crate::go_compat::textfmt::format_value_for_print as go_format_value_for_print;
 use crate::go_compat::textfmt::{
     builtin_html as go_builtin_html, builtin_js as go_builtin_js,
     builtin_print as go_builtin_print, builtin_urlquery as go_builtin_urlquery,
 };
-#[cfg(test)]
-use crate::go_compat::textfmt::format_value_for_print as go_format_value_for_print;
 use serde_json::Value;
 
 pub(super) fn builtin_print(args: &[Option<Value>], with_newline: bool) -> String {

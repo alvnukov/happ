@@ -52,8 +52,7 @@ mod tests {
         entries.insert(String::from("k"), json!("v"));
         let map = crate::gotemplates::encode_go_typed_map_value("string", Some(entries));
         let nil_slice = crate::gotemplates::encode_go_typed_slice_value("int", None);
-        let slice =
-            crate::gotemplates::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
+        let slice = crate::gotemplates::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
 
         assert!(!is_truthy(&Some(nil_map)));
         assert!(is_truthy(&Some(map)));

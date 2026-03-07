@@ -1,10 +1,10 @@
 use super::{MissingValueMode, NativeRenderError};
+#[cfg(test)]
+use crate::go_compat::path::split_variable_reference as go_split_variable_reference;
 use crate::go_compat::path::{
     resolve_simple_path as go_resolve_simple_path, PathMissingValueMode, ResolveSimplePathError,
 };
 use serde_json::Value;
-#[cfg(test)]
-use crate::go_compat::path::split_variable_reference as go_split_variable_reference;
 
 pub(super) fn resolve_simple_path(
     root: &Value,
@@ -57,13 +57,12 @@ mod tests {
     fn resolve_simple_path_handles_dot_root_and_vars() {
         let root = json!({"v":{"k":"x"}});
         let dot = json!({"a":1});
-        let val =
-            resolve_simple_path(&root, &dot, ".", MissingValueMode::GoDefault, |_| None).expect("ok");
+        let val = resolve_simple_path(&root, &dot, ".", MissingValueMode::GoDefault, |_| None)
+            .expect("ok");
         assert_eq!(val, Some(dot.clone()));
 
-        let val =
-            resolve_simple_path(&root, &dot, "$.v.k", MissingValueMode::GoDefault, |_| None)
-                .expect("ok");
+        let val = resolve_simple_path(&root, &dot, "$.v.k", MissingValueMode::GoDefault, |_| None)
+            .expect("ok");
         assert_eq!(val, Some(json!("x")));
 
         let val = resolve_simple_path(&root, &dot, "$x.k", MissingValueMode::GoDefault, |name| {
@@ -80,8 +79,10 @@ mod tests {
     #[test]
     fn resolve_simple_path_reports_slice_field_errors_like_go() {
         let root = json!({"arr":[1,2]});
-        let err = resolve_simple_path(&root, &root, ".arr.x", MissingValueMode::GoDefault, |_| None)
-            .expect_err("must fail");
+        let err = resolve_simple_path(&root, &root, ".arr.x", MissingValueMode::GoDefault, |_| {
+            None
+        })
+        .expect_err("must fail");
         match err {
             NativeRenderError::UnsupportedAction { reason, .. } => {
                 assert!(reason.contains("can't evaluate field x in type []interface {}"));
@@ -93,18 +94,22 @@ mod tests {
     #[test]
     fn resolve_simple_path_rejects_non_identifier_segments() {
         let root = json!({"a-b": 1});
-        let out =
-            resolve_simple_path(&root, &root, ".a-b", MissingValueMode::GoDefault, |_| None)
-                .expect("must evaluate");
+        let out = resolve_simple_path(&root, &root, ".a-b", MissingValueMode::GoDefault, |_| None)
+            .expect("must evaluate");
         assert_eq!(out, None);
     }
 
     #[test]
     fn resolve_simple_path_gozero_keeps_nil_pointer_interface_error() {
         let root = json!({"m":{}});
-        let err =
-            resolve_simple_path(&root, &root, ".m.missing.y", MissingValueMode::GoZero, |_| None)
-                .expect_err("must fail");
+        let err = resolve_simple_path(
+            &root,
+            &root,
+            ".m.missing.y",
+            MissingValueMode::GoZero,
+            |_| None,
+        )
+        .expect_err("must fail");
         match err {
             NativeRenderError::UnsupportedAction { reason, .. } => {
                 assert!(reason.contains("nil pointer evaluating interface {}.y"));

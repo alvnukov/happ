@@ -1,7 +1,7 @@
+use super::{wrong_number_of_args, NativeRenderError};
 use crate::go_compat::compare::{
     eq_values as go_eq_values, le_values as go_le_values, lt_values as go_lt_values, CompareError,
 };
-use super::{wrong_number_of_args, NativeRenderError};
 use serde_json::Value;
 
 const ERR_BAD_COMPARISON_TYPE: &str = "invalid type for comparison";
@@ -29,7 +29,8 @@ pub(super) fn builtin_ne(action: &str, args: &[Option<Value>]) -> Result<bool, N
     if args.len() != 2 {
         return Err(wrong_number_of_args(action, "ne", "2", args.len()));
     }
-    let equal = go_eq_values(&args[0], &args[1]).map_err(|err| cmp_call_error(action, "ne", err))?;
+    let equal =
+        go_eq_values(&args[0], &args[1]).map_err(|err| cmp_call_error(action, "ne", err))?;
     Ok(!equal)
 }
 
@@ -80,9 +81,7 @@ fn cmp_call_error(action: &str, fn_name: &str, err: CompareError) -> NativeRende
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        builtin_eq, builtin_ge, builtin_gt, builtin_le, builtin_lt, builtin_ne,
-    };
+    use super::{builtin_eq, builtin_ge, builtin_gt, builtin_le, builtin_lt, builtin_ne};
     use crate::gotemplates::{
         encode_go_bytes_value, encode_go_nil_bytes_value, encode_go_typed_map_value,
         encode_go_typed_slice_value, NativeRenderError,
@@ -182,7 +181,8 @@ mod tests {
             .expect_err("must fail");
         assert!(reason(err).contains("error calling lt: invalid type for comparison"));
 
-        let err = builtin_lt("", &[Some(Value::Bool(true)), Some(json!(1))]).expect_err("must fail");
+        let err =
+            builtin_lt("", &[Some(Value::Bool(true)), Some(json!(1))]).expect_err("must fail");
         assert!(reason(err).contains("error calling lt: incompatible types for comparison"));
     }
 

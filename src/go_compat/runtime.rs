@@ -1,79 +1,64 @@
+pub use super::backend::LogicBackend;
+use super::compat;
 use super::{
     parse::report::ParseCompatOptions,
     scan::{parse_template_tokens_strict_with_options, GoTemplateScanError, GoTemplateToken},
     HELM_INCLUDE_RECURSION_MAX_REFS,
 };
-pub use super::backend::LogicBackend;
-use super::compat;
 use serde_json::{Number, Value};
 use std::collections::BTreeMap;
+use std::env;
+use std::fs::OpenOptions;
+use std::io::Write;
 // Go parity reference: stdlib text/template/exec.go.
-#[path = "../gotemplates/executor/compare.rs"]
-mod compare;
-#[path = "../gotemplates/executor/call.rs"]
-mod call;
-#[path = "../gotemplates/executor/control.rs"]
-mod control;
-#[path = "../gotemplates/executor/commandkind.rs"]
-mod commandkind;
-#[path = "../gotemplates/executor/collections.rs"]
-mod collections;
-#[path = "../gotemplates/executor/eval.rs"]
-mod eval;
-#[path = "../gotemplates/executor/exprkind.rs"]
-mod exprkind;
-#[path = "../gotemplates/executor/externalfn.rs"]
-mod externalfn;
-#[path = "../gotemplates/executor/govaluefmt.rs"]
-mod govaluefmt;
-#[path = "../gotemplates/executor/path.rs"]
-mod path;
-#[path = "../gotemplates/executor/pipeline_decl.rs"]
-mod pipeline_decl;
-#[path = "../gotemplates/executor/actionparse.rs"]
 mod actionparse;
-#[path = "../gotemplates/executor/rangeeval.rs"]
+mod call;
+mod collections;
+mod commandkind;
+mod compare;
+mod control;
+mod eval;
+mod exprkind;
+mod externalfn;
+mod go_ffi;
+mod govaluefmt;
+mod path;
+mod pipeline_decl;
 mod rangeeval;
-#[path = "../gotemplates/executor/textfmt.rs"]
 mod textfmt;
-#[path = "../gotemplates/executor/tokenize.rs"]
 mod tokenize;
-#[path = "../gotemplates/executor/truth.rs"]
-mod truth;
-#[path = "../gotemplates/executor/typeutil.rs"]
-mod typeutil;
-#[path = "../gotemplates/executor/trim.rs"]
 mod trim;
-#[path = "../gotemplates/executor/varcheck.rs"]
+mod truth;
+mod typeutil;
 mod varcheck;
+use crate::go_compat::ident::is_identifier_name as go_is_identifier_name;
 use actionparse::parse_action_kind;
 use call::eval_call_builtin;
 use collections::{builtin_index, builtin_len, builtin_slice};
+use commandkind::{
+    command_field_like_path, is_map_like_for_field_call, is_non_executable_pipeline_head,
+    non_function_command_target,
+};
 use compare::{builtin_eq, builtin_ge, builtin_gt, builtin_le, builtin_lt, builtin_ne};
 use control::{
     eval_block_invocation, eval_if, eval_range, eval_template_invocation, eval_with,
     find_matching_end,
 };
 use eval::{eval_command_token_value, eval_expr_truthy, eval_expr_value, render_output_expr};
-use commandkind::{
-    command_field_like_path, is_map_like_for_field_call, is_non_executable_pipeline_head,
-    non_function_command_target,
-};
 use exprkind::{
     decode_string_literal, is_complex_expression, is_niladic_function_expression, is_quoted_string,
 };
 use externalfn::{try_eval_dynamic_external_function, try_eval_external_function};
-use crate::go_compat::ident::is_identifier_name as go_is_identifier_name;
 use govaluefmt::format_value_like_go;
 use path::resolve_simple_path;
 use pipeline_decl::{extract_pipeline_declaration, PipelineDeclMode, PipelineDeclaration};
 use rangeeval::{apply_range_iteration_bindings, range_items};
-use textfmt::{builtin_html, builtin_js, builtin_print, builtin_urlquery};
 #[cfg(test)]
 use textfmt::format_value_for_print;
+use textfmt::{builtin_html, builtin_js, builtin_print, builtin_urlquery};
 use tokenize::{split_command_tokens, split_pipeline_commands, strip_outer_parens};
-use truth::{builtin_and, builtin_or, is_truthy};
 use trim::apply_lexical_trims;
+use truth::{builtin_and, builtin_or, is_truthy};
 use varcheck::{
     ensure_variable_is_defined, looks_like_char_literal, looks_like_numeric_literal,
     undefined_variable_error,
@@ -106,7 +91,7 @@ impl Default for NativeRenderOptions {
         Self {
             missing_value_mode: MissingValueMode::GoDefault,
             function_dispatch_mode: FunctionDispatchMode::Extended,
-            logic_backend: LogicBackend::GoCompat,
+            logic_backend: LogicBackend::from_env().unwrap_or_default(),
         }
     }
 }
@@ -179,6 +164,93 @@ enum ActionKind {
     Continue,
 }
 
+pub trait RuntimeBackendApi {
+    fn render(
+        &self,
+        src: &str,
+        root: &Value,
+        options: NativeRenderOptions,
+        resolver: Option<&dyn NativeFunctionResolver>,
+    ) -> Result<String, NativeRenderError>;
+}
+
+struct GoCompatRuntimeBackend;
+struct GoFfiRuntimeBackend;
+struct DualRuntimeBackend;
+struct RustNativeRuntimeBackend;
+
+impl RuntimeBackendApi for GoCompatRuntimeBackend {
+    fn render(
+        &self,
+        src: &str,
+        root: &Value,
+        options: NativeRenderOptions,
+        resolver: Option<&dyn NativeFunctionResolver>,
+    ) -> Result<String, NativeRenderError> {
+        render_with_go_compat(src, root, options, resolver)
+    }
+}
+
+impl RuntimeBackendApi for GoFfiRuntimeBackend {
+    fn render(
+        &self,
+        src: &str,
+        root: &Value,
+        options: NativeRenderOptions,
+        resolver: Option<&dyn NativeFunctionResolver>,
+    ) -> Result<String, NativeRenderError> {
+        render_with_go_ffi(src, root, options, resolver)
+    }
+}
+
+impl RuntimeBackendApi for DualRuntimeBackend {
+    fn render(
+        &self,
+        src: &str,
+        root: &Value,
+        options: NativeRenderOptions,
+        resolver: Option<&dyn NativeFunctionResolver>,
+    ) -> Result<String, NativeRenderError> {
+        let primary = dual_primary_backend();
+        let secondary = dual_secondary_backend(primary);
+        let primary_options = backend_options(options, primary);
+        let secondary_options = backend_options(options, secondary);
+
+        let primary_result = render_for_backend(primary, src, root, primary_options, resolver);
+        let secondary_result =
+            render_for_backend(secondary, src, root, secondary_options, resolver);
+
+        log_dual_mismatch(src, primary, secondary, &primary_result, &secondary_result);
+        primary_result
+    }
+}
+
+impl RuntimeBackendApi for RustNativeRuntimeBackend {
+    fn render(
+        &self,
+        src: &str,
+        root: &Value,
+        options: NativeRenderOptions,
+        resolver: Option<&dyn NativeFunctionResolver>,
+    ) -> Result<String, NativeRenderError> {
+        // Interface is ready; RustNative currently follows GoCompat execution path.
+        render_with_go_compat(src, root, options, resolver)
+    }
+}
+
+fn runtime_backend(logic_backend: LogicBackend) -> &'static dyn RuntimeBackendApi {
+    static GO_COMPAT_BACKEND: GoCompatRuntimeBackend = GoCompatRuntimeBackend;
+    static GO_FFI_BACKEND: GoFfiRuntimeBackend = GoFfiRuntimeBackend;
+    static DUAL_BACKEND: DualRuntimeBackend = DualRuntimeBackend;
+    static RUST_NATIVE_BACKEND: RustNativeRuntimeBackend = RustNativeRuntimeBackend;
+    match logic_backend {
+        LogicBackend::GoFfi => &GO_FFI_BACKEND,
+        LogicBackend::GoCompat => &GO_COMPAT_BACKEND,
+        LogicBackend::Dual => &DUAL_BACKEND,
+        LogicBackend::RustNative => &RUST_NATIVE_BACKEND,
+    }
+}
+
 pub fn render_template_native(src: &str, root: &Value) -> Result<String, NativeRenderError> {
     render_template_native_with_options(src, root, NativeRenderOptions::default())
 }
@@ -197,12 +269,144 @@ pub fn render_template_native_with_resolver(
     options: NativeRenderOptions,
     resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<String, NativeRenderError> {
-    match options.logic_backend {
-        LogicBackend::GoCompat => {}
-        LogicBackend::RustNative => {
-            // Interface is ready; RustNative currently follows GoCompat execution path.
+    runtime_backend(options.logic_backend).render(src, root, options, resolver)
+}
+
+fn render_with_go_ffi(
+    src: &str,
+    root: &Value,
+    options: NativeRenderOptions,
+    resolver: Option<&dyn NativeFunctionResolver>,
+) -> Result<String, NativeRenderError> {
+    if resolver.is_some() {
+        return Err(NativeRenderError::UnsupportedAction {
+            action: "{{ ... }}".to_string(),
+            reason: "go_ffi backend does not support rust function resolver".to_string(),
+        });
+    }
+    go_ffi::render_template_via_go_ffi(src, root, options).map_err(|err| match err {
+        go_ffi::GoFfiError::Unavailable(reason) => NativeRenderError::UnsupportedAction {
+            action: "{{ ... }}".to_string(),
+            reason: format!("go_ffi unavailable: {reason}"),
+        },
+        go_ffi::GoFfiError::Render(reason) => NativeRenderError::UnsupportedAction {
+            action: "{{ ... }}".to_string(),
+            reason,
+        },
+    })
+}
+
+fn render_for_backend(
+    backend: LogicBackend,
+    src: &str,
+    root: &Value,
+    options: NativeRenderOptions,
+    resolver: Option<&dyn NativeFunctionResolver>,
+) -> Result<String, NativeRenderError> {
+    match backend {
+        LogicBackend::GoFfi => render_with_go_ffi(src, root, options, resolver),
+        LogicBackend::GoCompat | LogicBackend::RustNative | LogicBackend::Dual => {
+            render_with_go_compat(src, root, options, resolver)
         }
     }
+}
+
+fn backend_options(mut options: NativeRenderOptions, backend: LogicBackend) -> NativeRenderOptions {
+    options.logic_backend = backend;
+    options
+}
+
+fn dual_primary_backend() -> LogicBackend {
+    env::var("HAPP_TEMPLATE_DUAL_PRIMARY")
+        .ok()
+        .and_then(|raw| LogicBackend::parse(&raw))
+        .filter(|backend| !matches!(backend, LogicBackend::Dual))
+        .unwrap_or(LogicBackend::GoFfi)
+}
+
+fn dual_secondary_backend(primary: LogicBackend) -> LogicBackend {
+    match primary {
+        LogicBackend::GoFfi => LogicBackend::GoCompat,
+        LogicBackend::GoCompat | LogicBackend::RustNative | LogicBackend::Dual => {
+            LogicBackend::GoFfi
+        }
+    }
+}
+
+fn log_dual_mismatch(
+    src: &str,
+    primary: LogicBackend,
+    secondary: LogicBackend,
+    primary_result: &Result<String, NativeRenderError>,
+    secondary_result: &Result<String, NativeRenderError>,
+) {
+    if primary_result == secondary_result {
+        return;
+    }
+    let line = format!(
+        "go-template dual mismatch: primary={primary:?} secondary={secondary:?} template={} primary_result={} secondary_result={}",
+        truncate_preview(src, 220),
+        result_preview(primary_result),
+        result_preview(secondary_result)
+    );
+    emit_dual_log(&line);
+}
+
+fn emit_dual_log(line: &str) {
+    if let Ok(path) = env::var("HAPP_TEMPLATE_DUAL_LOG") {
+        let path = path.trim();
+        if !path.is_empty() {
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "{line}");
+                return;
+            }
+        }
+    }
+    eprintln!("{line}");
+}
+
+fn result_preview(result: &Result<String, NativeRenderError>) -> String {
+    match result {
+        Ok(value) => format!("ok({})", truncate_preview(value, 180)),
+        Err(NativeRenderError::Parse(err)) => format!(
+            "parse(code={}, offset={}, msg={})",
+            err.code,
+            err.offset,
+            truncate_preview(&err.message, 160)
+        ),
+        Err(NativeRenderError::UnsupportedAction { reason, .. }) => {
+            format!("unsupported({})", truncate_preview(reason, 160))
+        }
+        Err(NativeRenderError::MissingValue { path, .. }) => {
+            format!("missing(path={})", truncate_preview(path, 160))
+        }
+        Err(NativeRenderError::TemplateNotFound { name }) => {
+            format!("template_not_found({})", truncate_preview(name, 160))
+        }
+        Err(NativeRenderError::TemplateRecursionLimit { name, depth }) => {
+            format!("template_recursion_limit(name={name},depth={depth})")
+        }
+    }
+}
+
+fn truncate_preview(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, ch) in input.chars().enumerate() {
+        if count >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn render_with_go_compat(
+    src: &str,
+    root: &Value,
+    options: NativeRenderOptions,
+    resolver: Option<&dyn NativeFunctionResolver>,
+) -> Result<String, NativeRenderError> {
     let mut tokens = parse_template_tokens_strict_with_options(
         src,
         ParseCompatOptions {
@@ -620,5 +824,4 @@ fn parse_char_constant(expr: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
-#[path = "../gotemplates/executor/tests.rs"]
 mod tests;

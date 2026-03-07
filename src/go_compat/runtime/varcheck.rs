@@ -32,12 +32,12 @@ pub(super) fn undefined_variable_error(name: &str) -> NativeRenderError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        EvalState, FunctionDispatchMode, LogicBackend, MissingValueMode, NativeRenderError,
+    };
     use super::{
         ensure_variable_is_defined, looks_like_char_literal, looks_like_numeric_literal,
         undefined_variable_error,
-    };
-    use super::super::{
-        EvalState, FunctionDispatchMode, LogicBackend, MissingValueMode, NativeRenderError,
     };
 
     #[test]

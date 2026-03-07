@@ -4,10 +4,11 @@ use crate::go_compat::actionparse::{
 };
 
 pub(super) fn parse_action_kind(action: &str) -> Result<ActionKind, NativeRenderError> {
-    let parsed = go_parse_action_kind(action).map_err(|err| NativeRenderError::UnsupportedAction {
-        action: action.to_string(),
-        reason: err.reason,
-    })?;
+    let parsed =
+        go_parse_action_kind(action).map_err(|err| NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: err.reason,
+        })?;
     Ok(match parsed {
         ParsedActionKind::Noop => ActionKind::Noop,
         ParsedActionKind::Output(s) => ActionKind::Output(s),

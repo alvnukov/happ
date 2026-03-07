@@ -2,9 +2,7 @@ use super::{
     eval_command_token_value, EvalState, NativeFunctionResolver, NativeFunctionResolverError,
     NativeRenderError,
 };
-use crate::go_compat::externalfn::{
-    external_call_failed_reason, is_external_function_identifier,
-};
+use crate::go_compat::externalfn::{external_call_failed_reason, is_external_function_identifier};
 use serde_json::Value;
 
 pub(super) fn try_eval_external_function(

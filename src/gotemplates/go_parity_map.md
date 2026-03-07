@@ -8,8 +8,11 @@ Mirror namespace for upstream transfer lives at `src/go_compat/go_std/*`.
 
 Backend switch interface:
 - `NativeRenderOptions.logic_backend` controls which logic backend is used.
-- Current behavior routes both backends through Go-compatible execution while
-  we continue parity hardening; the interface is stable for future split.
+- `LogicBackend::GoFfi` is available as an explicit FFI backend (Go helper).
+- `LogicBackend::Dual` runs go_ffi + go_compat in parallel and logs mismatches.
+- `HAPP_TEMPLATE_BACKEND` can override backend selection (`go_ffi`, `go_compat`, `dual`, `rust_native`).
+- `HAPP_TEMPLATE_DUAL_PRIMARY` controls primary result source in dual mode (`go_ffi` by default).
+- `HAPP_TEMPLATE_DUAL_LOG` optionally redirects dual mismatch logs to a file (append mode).
 
 The current priority is the builtins and execution branches observed in the
 real chart corpus (`helm-apps` + integration examples). Less-used branches
@@ -105,16 +108,19 @@ target until the used surface is fully stabilized.
 - Rust: `src/go_compat/runtime.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: canonical runtime API surface and execution engine.
-- Rust: `src/gotemplates/executor/control.rs`
+- Rust: `src/go_compat/runtime/go_ffi.rs`
+  - Go reference: `src/text/template/template.go`, `src/text/template/exec.go`
+  - Scope: optional Go FFI execution backend (`go build` helper + JSON bridge).
+- Rust: `src/go_compat/runtime/control.rs`
   - Go reference: `src/text/template/exec.go`
-  - Scope: runtime submodule source (path-linked by `go_compat/runtime.rs`) for
+  - Scope: runtime submodule source for
     control-flow block execution (`if`/`with`/`range`), `else`/`end` boundary
     matching, template/block invocation.
-- Rust: `src/gotemplates/executor/eval.rs`
+- Rust: `src/go_compat/runtime/eval.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: expression evaluation, pipeline execution, command dispatch and
     non-executable command diagnostics, field-with-arguments errors.
-- Rust: `src/gotemplates/executor/externalfn.rs`
+- Rust: `src/go_compat/runtime/externalfn.rs`
   - Go reference: `src/text/template/exec.go` (`evalFunction` identifier dispatch)
   - Scope: external function dispatch boundary; `FunctionDispatchMode::GoStrict`
     keeps Go-compatible identifier-only head resolution, while
@@ -123,25 +129,25 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/exec.go` (`evalFunction` / unknown-function diagnostics)
   - Scope: shared identifier candidacy checks for external calls and canonical
     unknown/failed function reason builders reused by runtime adapters.
-- Rust: `src/gotemplates/executor/path.rs`
+- Rust: `src/go_compat/runtime/path.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: used field-path resolution for `.`, `$`, `$var` chains, map/slice
     field diagnostics and missing-value modes.
-- Rust: `src/gotemplates/executor/compare.rs`
+- Rust: `src/go_compat/runtime/compare.rs`
   - Go reference: `src/text/template/funcs.go`
   - Scope: builtin comparison semantics (`eq/ne/lt/le/gt/ge`), nil handling,
     non-comparable diagnostics and signed/unsigned integer cross-comparison.
-- Rust: `src/gotemplates/executor/collections.rs`
+- Rust: `src/go_compat/runtime/collections.rs`
   - Go reference: `src/text/template/funcs.go`
   - Scope: adapter layer mapping runtime collection builtin calls into go_compat APIs.
 - Rust: `src/go_compat/collections.rs`
   - Go reference: `src/text/template/funcs.go`
   - Scope: core collection builtins (`len/index/slice`) with Go-compatible bounds,
     map-key coercion, typed nil/zero behavior and reflect-style out-of-range diagnostics.
-- Rust: `src/gotemplates/executor/truth.rs`
+- Rust: `src/go_compat/runtime/truth.rs`
   - Go reference: `src/text/template/exec.go`, `src/text/template/funcs.go`
   - Scope: truthiness semantics and `and/or/not` short-circuit result behavior.
-- Rust: `src/gotemplates/executor/textfmt.rs`
+- Rust: `src/go_compat/runtime/textfmt.rs`
   - Go reference: `src/text/template/funcs.go`
   - Scope: adapter layer mapping runtime builtin calls into go_compat text-format APIs.
 - Rust: `src/go_compat/textfmt.rs`

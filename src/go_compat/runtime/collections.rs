@@ -1,11 +1,14 @@
+use super::NativeRenderError;
 use crate::go_compat::collections::{
     builtin_index as go_builtin_index, builtin_len as go_builtin_len,
     builtin_slice as go_builtin_slice,
 };
-use super::NativeRenderError;
 use serde_json::Value;
 
-pub(super) fn builtin_len(action: &str, args: &[Option<Value>]) -> Result<usize, NativeRenderError> {
+pub(super) fn builtin_len(
+    action: &str,
+    args: &[Option<Value>],
+) -> Result<usize, NativeRenderError> {
     go_builtin_len(args).map_err(|err| NativeRenderError::UnsupportedAction {
         action: action.to_string(),
         reason: err.reason,
@@ -83,13 +86,18 @@ mod tests {
 
     #[test]
     fn slice_respects_string_and_index_rules() {
-        let out =
-            builtin_slice("", &[Some(json!("abcd")), Some(json!(1)), Some(json!(3))]).expect("slice");
+        let out = builtin_slice("", &[Some(json!("abcd")), Some(json!(1)), Some(json!(3))])
+            .expect("slice");
         assert_eq!(out, Some(json!("bc")));
 
         let err = builtin_slice(
             "",
-            &[Some(json!("abcd")), Some(json!(1)), Some(json!(2)), Some(json!(2))],
+            &[
+                Some(json!("abcd")),
+                Some(json!(1)),
+                Some(json!(2)),
+                Some(json!(2)),
+            ],
         )
         .expect_err("must fail");
         assert!(reason(err).contains("error calling slice: cannot 3-index slice a string"));
@@ -97,12 +105,18 @@ mod tests {
 
     #[test]
     fn slice_validates_bounds_like_go() {
-        let err = builtin_slice("", &[Some(json!([1, 2, 3])), Some(json!(2)), Some(json!(1))])
-            .expect_err("must fail");
+        let err = builtin_slice(
+            "",
+            &[Some(json!([1, 2, 3])), Some(json!(2)), Some(json!(1))],
+        )
+        .expect_err("must fail");
         assert!(reason(err).contains("error calling slice: invalid slice index: 2 > 1"));
 
-        let err = builtin_slice("", &[Some(json!([1, 2, 3])), Some(json!(4)), Some(json!(5))])
-            .expect_err("must fail");
+        let err = builtin_slice(
+            "",
+            &[Some(json!([1, 2, 3])), Some(json!(4)), Some(json!(5))],
+        )
+        .expect_err("must fail");
         assert!(reason(err).contains("error calling slice: index out of range: 4"));
     }
 
