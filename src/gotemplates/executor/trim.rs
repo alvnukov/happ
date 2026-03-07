@@ -2,7 +2,7 @@ use crate::go_compat::trim::{
     has_left_trim_marker, has_right_trim_marker, trim_left_ascii_whitespace,
     trim_right_ascii_whitespace_in_place,
 };
-use crate::gotemplates::GoTemplateToken;
+use crate::go_compat::scan::GoTemplateToken;
 
 pub(super) fn apply_lexical_trims(tokens: &mut [GoTemplateToken]) {
     for i in 0..tokens.len() {
@@ -26,7 +26,7 @@ pub(super) fn apply_lexical_trims(tokens: &mut [GoTemplateToken]) {
 #[cfg(test)]
 mod tests {
     use super::apply_lexical_trims;
-    use crate::gotemplates::GoTemplateToken;
+    use crate::go_compat::scan::GoTemplateToken;
 
     #[test]
     fn lexical_trims_handle_left_and_right_markers() {

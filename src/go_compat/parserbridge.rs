@@ -6,6 +6,5 @@ pub(crate) use crate::go_compat::parse::report::{
 pub(crate) use crate::go_compat::parse::action::{
     parse_action_compat, parse_action_report_with_options,
 };
-pub(crate) use crate::gotemplates::{
-    parse_template_tokens_strict_with_options_and_delims, GoTemplateScanError, GoTemplateToken,
-};
+pub(crate) use crate::go_compat::scan::{GoTemplateScanError, GoTemplateToken};
+pub(crate) use crate::gotemplates::parse_template_tokens_strict_with_options_and_delims;

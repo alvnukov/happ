@@ -21,6 +21,7 @@ pub use functions::{
     normalize_values_global_context,
 };
 pub use crate::go_compat::parse::report::ParseCompatOptions;
+pub use crate::go_compat::scan::{GoTemplateActionSpan, GoTemplateScanError, GoTemplateToken};
 pub use planner::{plan_template_execution, CompatibilityReason, CompatibilityTier, ExecutionPlan};
 pub use scanner::{
     collect_action_spans, contains_template_markup, parse_template_tokens,
@@ -35,25 +36,6 @@ pub use typedvalue::{
     GO_TYPE_BYTES, GO_TYPE_KEY, GO_TYPE_MAP_PREFIX, GO_TYPE_SLICE_PREFIX, GO_TYPE_STRING_BYTES,
     GO_VALUE_KEY,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GoTemplateToken {
-    Literal(String),
-    Action(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GoTemplateActionSpan {
-    pub start: usize,
-    pub end: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GoTemplateScanError {
-    pub code: &'static str,
-    pub message: String,
-    pub offset: usize,
-}
 
 // Based on Helm engine recursionMaxNums in pkg/engine/engine.go.
 pub const HELM_INCLUDE_RECURSION_MAX_REFS: usize = 1000;

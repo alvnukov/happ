@@ -22,6 +22,7 @@
 // - pipeline_decl    -> go/src/text/template/parse/parse.go
 // - rangeeval        -> go/src/text/template/exec.go
 // - runtimebridge    -> internal bridge to gotemplates native render runtime
+// - scan             -> shared token/span/error model for template scanning paths
 // - template/*       -> go/src/text/template/template.go + option paths
 // - textfmt          -> go/src/text/template/funcs.go
 // - typedvalue       -> happ internal Go-typed JSON shape bridge
@@ -52,6 +53,7 @@ pub mod path;
 pub mod pipeline_decl;
 pub mod rangeeval;
 pub(crate) mod runtimebridge;
+pub mod scan;
 pub mod template;
 pub mod textfmt;
 pub mod typedvalue;

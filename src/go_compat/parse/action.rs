@@ -1,5 +1,5 @@
 use super::report::{ActionParseReport, ControlAction, ParseCompatOptions};
-use crate::gotemplates::GoTemplateScanError;
+use crate::go_compat::scan::GoTemplateScanError;
 
 pub fn parse_action_compat(
     action: &str,
