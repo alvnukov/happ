@@ -119,13 +119,8 @@ pub(super) fn split_variable_reference(expr: &str) -> Option<(&str, &str)> {
     if !expr.starts_with('$') || expr.starts_with("$.") {
         return None;
     }
-    let mut iter = expr[1..].char_indices();
-    let (_, first) = iter.next()?;
-    if !is_identifier_start_char(first) {
-        return None;
-    }
-    let mut end = 1 + first.len_utf8();
-    for (offset, ch) in iter {
+    let mut end = 1usize;
+    for (offset, ch) in expr[1..].char_indices() {
         if !is_identifier_continue_char(ch) {
             break;
         }
@@ -211,8 +206,8 @@ mod tests {
         assert_eq!(split_variable_reference("$"), Some(("$", "")));
         assert_eq!(split_variable_reference("$x"), Some(("$x", "")));
         assert_eq!(split_variable_reference("$x.y.z"), Some(("$x", "y.z")));
+        assert_eq!(split_variable_reference("$1"), Some(("$1", "")));
         assert_eq!(split_variable_reference("$.x"), None);
-        assert_eq!(split_variable_reference("$1"), None);
     }
 
     #[test]
