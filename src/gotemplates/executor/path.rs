@@ -119,8 +119,13 @@ pub(super) fn split_variable_reference(expr: &str) -> Option<(&str, &str)> {
     if !expr.starts_with('$') || expr.starts_with("$.") {
         return None;
     }
-    let mut end = 1usize;
-    for (offset, ch) in expr[1..].char_indices() {
+    let mut iter = expr[1..].char_indices();
+    let (_, first) = iter.next()?;
+    if !is_identifier_start_char(first) {
+        return None;
+    }
+    let mut end = 1 + first.len_utf8();
+    for (offset, ch) in iter {
         if !is_identifier_continue_char(ch) {
             break;
         }
@@ -191,6 +196,73 @@ fn value_type_name_for_path(v: &Value) -> String {
             } else {
                 "float64".to_string()
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_simple_path, split_variable_reference, MissingValueMode};
+    use crate::gotemplates::NativeRenderError;
+    use serde_json::json;
+
+    #[test]
+    fn split_variable_reference_supports_go_style_scope_tokens() {
+        assert_eq!(split_variable_reference("$"), Some(("$", "")));
+        assert_eq!(split_variable_reference("$x"), Some(("$x", "")));
+        assert_eq!(split_variable_reference("$x.y.z"), Some(("$x", "y.z")));
+        assert_eq!(split_variable_reference("$.x"), None);
+        assert_eq!(split_variable_reference("$1"), None);
+    }
+
+    #[test]
+    fn resolve_simple_path_handles_dot_root_and_vars() {
+        let root = json!({"v":{"k":"x"}});
+        let dot = json!({"a":1});
+        let val =
+            resolve_simple_path(&root, &dot, ".", MissingValueMode::GoDefault, |_| None).expect("ok");
+        assert_eq!(val, Some(dot.clone()));
+
+        let val =
+            resolve_simple_path(&root, &dot, "$.v.k", MissingValueMode::GoDefault, |_| None)
+                .expect("ok");
+        assert_eq!(val, Some(json!("x")));
+
+        let val = resolve_simple_path(&root, &dot, "$x.k", MissingValueMode::GoDefault, |name| {
+            if name == "$x" {
+                Some(Some(json!({"k":"v"})))
+            } else {
+                None
+            }
+        })
+        .expect("ok");
+        assert_eq!(val, Some(json!("v")));
+    }
+
+    #[test]
+    fn resolve_simple_path_reports_slice_field_errors_like_go() {
+        let root = json!({"arr":[1,2]});
+        let err = resolve_simple_path(&root, &root, ".arr.x", MissingValueMode::GoDefault, |_| None)
+            .expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("can't evaluate field x in type []interface {}"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_simple_path_gozero_keeps_nil_pointer_interface_error() {
+        let root = json!({"m":{}});
+        let err =
+            resolve_simple_path(&root, &root, ".m.missing.y", MissingValueMode::GoZero, |_| None)
+                .expect_err("must fail");
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => {
+                assert!(reason.contains("nil pointer evaluating interface {}.y"));
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 }
