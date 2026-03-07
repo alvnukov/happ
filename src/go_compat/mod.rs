@@ -13,6 +13,7 @@
 // - evaldiag         -> go/src/text/template/exec.go diagnostics
 // - expr             -> go/src/text/template/parse/parse.go
 // - externalfn       -> go/src/text/template/exec.go
+// - functions        -> go/src/text/template/funcs.go (action-level function-call analysis helpers)
 // - ident            -> go/src/text/template/parse/lex.go
 // - parse/*          -> go/src/text/template/parse/*
 // - parse/action     -> canonical parse-action API surface
@@ -20,7 +21,7 @@
 // - path             -> go/src/text/template/exec.go
 // - pipeline_decl    -> go/src/text/template/parse/parse.go
 // - rangeeval        -> go/src/text/template/exec.go
-// - runtime          -> canonical runtime API surface (delegating executor path)
+// - runtime          -> canonical runtime API surface + execution engine
 // - scan             -> token/span/error model + scanner/tokenization compatibility paths
 // - template/*       -> go/src/text/template/template.go + option paths
 // - textfmt          -> go/src/text/template/funcs.go
@@ -44,6 +45,7 @@ pub mod commandkind;
 pub mod evaldiag;
 pub mod expr;
 pub mod externalfn;
+pub mod functions;
 pub mod go_std;
 pub mod ident;
 pub mod parse;

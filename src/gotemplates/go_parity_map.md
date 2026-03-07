@@ -93,20 +93,23 @@ target until the used surface is fully stabilized.
 
 ## Builtins and Rendering
 
+- Rust: `src/go_compat/functions.rs`
+  - Go reference: `src/text/template/funcs.go`
+  - Scope: canonical action-level function-call analysis helpers reused by planner/import flow.
 - Rust: `src/gotemplates/functions.rs`
   - Go reference: `src/text/template/funcs.go`
-  - Scope: builtin function surface and semantic expectations.
+  - Scope: backward-compatible facade over canonical go_compat functions APIs.
 - Rust: `src/gotemplates/executor.rs`
   - Go reference: `src/text/template/exec.go`
-  - Scope: runtime pipeline evaluation, control flow, range/if/with behavior.
+  - Scope: backward-compatible facade over canonical go_compat runtime APIs.
 - Rust: `src/go_compat/runtime.rs`
   - Go reference: `src/text/template/exec.go`
-  - Scope: canonical runtime API surface used by go_compat template facade; current executor
-    delegation path remains gotemplates-native while parity migration proceeds.
+  - Scope: canonical runtime API surface and execution engine.
 - Rust: `src/gotemplates/executor/control.rs`
   - Go reference: `src/text/template/exec.go`
-  - Scope: control-flow block execution (`if`/`with`/`range`), `else`/`end`
-    boundary matching, template/block invocation.
+  - Scope: runtime submodule source (path-linked by `go_compat/runtime.rs`) for
+    control-flow block execution (`if`/`with`/`range`), `else`/`end` boundary
+    matching, template/block invocation.
 - Rust: `src/gotemplates/executor/eval.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: expression evaluation, pipeline execution, command dispatch and
