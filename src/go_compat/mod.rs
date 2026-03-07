@@ -15,6 +15,7 @@
 // - externalfn       -> go/src/text/template/exec.go
 // - ident            -> go/src/text/template/parse/lex.go
 // - parse/*          -> go/src/text/template/parse/*
+// - parse/action     -> canonical parse-action API surface (bridged during migration)
 // - parse/report     -> shared parse compatibility action/control report model
 // - parserbridge     -> internal bridge to gotemplates parser/runtime types during migration
 // - path             -> go/src/text/template/exec.go

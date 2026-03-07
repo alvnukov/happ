@@ -53,6 +53,9 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/parse/parse.go`, `src/text/template/exec.go`
   - Scope: action-head classification (`if/with/range/else/template/block/define`)
     with trim-marker aware delimiter handling and structured parse errors.
+- Rust: `src/go_compat/parse/action.rs`
+  - Go reference: `src/text/template/parse/parse.go`
+  - Scope: canonical parse-action API entrypoints used by planner/scanner/parse bridge.
 - Rust: `src/go_compat/path.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: variable reference splitting (`$`, `$x`, `$x.y`), path segment/token checks,
