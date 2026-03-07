@@ -1,7 +1,6 @@
 use super::{
     decode_go_string_bytes_value, decode_go_typed_map_value, decode_go_typed_slice_value,
-    encode_go_string_bytes_value, format_value_for_print, go_bytes_len, go_string_bytes_len,
-    NativeRenderError,
+    format_value_for_print, go_bytes_len, go_string_bytes_len, NativeRenderError,
 };
 use serde_json::Value;
 use std::borrow::Cow;
@@ -57,7 +56,7 @@ pub(super) fn parse_slice_like_index(
 pub(super) fn value_from_go_string_bytes(bytes: Vec<u8>) -> Value {
     match String::from_utf8(bytes) {
         Ok(s) => Value::String(s),
-        Err(err) => encode_go_string_bytes_value(&err.into_bytes()),
+        Err(err) => crate::gotemplates::encode_go_string_bytes_value(&err.into_bytes()),
     }
 }
 

@@ -5,6 +5,7 @@ use crate::gotemplates::parser::{
 };
 use std::collections::BTreeMap;
 
+// Go parity reference: stdlib text/template/parse/lex.go.
 const LEFT_DELIM: &str = "{{";
 const RIGHT_DELIM: &str = "}}";
 const LEFT_COMMENT: &str = "/*";
@@ -33,7 +34,7 @@ pub fn scan_template_actions_with_delims(
             Vec::new(),
             vec![GoTemplateScanError {
                 code: "invalid_delimiters",
-                message: "template delimiters must be non-empty",
+                message: "template delimiters must be non-empty".to_string(),
                 offset: 0,
             }],
         );
@@ -91,12 +92,12 @@ pub fn parse_template_tokens_strict_with_options_and_delims(
     if left_delim.is_empty() || right_delim.is_empty() {
         return Err(GoTemplateScanError {
             code: "invalid_delimiters",
-            message: "template delimiters must be non-empty",
+            message: "template delimiters must be non-empty".to_string(),
             offset: 0,
         });
     }
     let (spans, errors) = scan_template_actions_with_delims(src, left_delim, right_delim);
-    if let Some(err) = errors.first().copied() {
+    if let Some(err) = errors.first().cloned() {
         return Err(err);
     }
     let action_offset_delta = left_delim.len() as isize - LEFT_DELIM.len() as isize;
@@ -115,7 +116,7 @@ pub fn parse_template_tokens_strict_with_options_and_delims(
         let normalized_action = normalize_action_delimiters(action, left_delim, right_delim)
             .ok_or(GoTemplateScanError {
                 code: "invalid_delimiters",
-                message: "template action uses invalid delimiters",
+                message: "template action uses invalid delimiters".to_string(),
                 offset: span.start,
             })?;
         let visible_variables = collect_visible_variables(&var_scopes);
@@ -147,7 +148,7 @@ pub fn parse_template_tokens_strict_with_options_and_delims(
     if !stack.is_empty() {
         return Err(GoTemplateScanError {
             code: "unexpected_eof",
-            message: "unexpected EOF",
+            message: "unexpected EOF".to_string(),
             offset: src.len(),
         });
     }
@@ -197,7 +198,7 @@ fn apply_control_action(
             let Some(top) = stack.last_mut() else {
                 return Err(GoTemplateScanError {
                     code: "unexpected_else_action",
-                    message: "unexpected {{else}}",
+                    message: "unexpected {{else}}".to_string(),
                     offset,
                 });
             };
@@ -208,7 +209,7 @@ fn apply_control_action(
             {
                 return Err(GoTemplateScanError {
                     code: "unexpected_else_action",
-                    message: "unexpected {{else}}",
+                    message: "unexpected {{else}}".to_string(),
                     offset,
                 });
             }
@@ -224,7 +225,7 @@ fn apply_control_action(
                 if !allowed {
                     return Err(GoTemplateScanError {
                         code: "unexpected_token",
-                        message: "unexpected token in input",
+                        message: "unexpected token in input".to_string(),
                         offset,
                     });
                 }
@@ -237,7 +238,7 @@ fn apply_control_action(
             if *range_depth == 0 {
                 return Err(GoTemplateScanError {
                     code: "break_outside_range",
-                    message: "{{break}} outside {{range}}",
+                    message: "{{break}} outside {{range}}".to_string(),
                     offset,
                 });
             }
@@ -246,7 +247,7 @@ fn apply_control_action(
             if *range_depth == 0 {
                 return Err(GoTemplateScanError {
                     code: "continue_outside_range",
-                    message: "{{continue}} outside {{range}}",
+                    message: "{{continue}} outside {{range}}".to_string(),
                     offset,
                 });
             }
@@ -255,7 +256,7 @@ fn apply_control_action(
             let Some(frame) = stack.pop() else {
                 return Err(GoTemplateScanError {
                     code: "unexpected_end_action",
-                    message: "unexpected {{end}}",
+                    message: "unexpected {{end}}".to_string(),
                     offset,
                 });
             };
@@ -273,7 +274,7 @@ fn apply_control_action(
                     if prev_non_empty && frame.define_body_has_content {
                         return Err(GoTemplateScanError {
                             code: "multiple_template_definition",
-                            message: "multiple definition of template",
+                            message: "multiple definition of template".to_string(),
                             offset: frame.open_offset,
                         });
                     }
@@ -476,7 +477,7 @@ fn scan_action_end_with_delims(
                         if paren_depth == 0 {
                             return Err(GoTemplateScanError {
                                 code: "unexpected_right_paren",
-                                message: "unexpected right paren",
+                                message: "unexpected right paren".to_string(),
                                 offset: i,
                             });
                         }
@@ -494,7 +495,7 @@ fn scan_action_end_with_delims(
                 if bytes[i] == b'\n' {
                     return Err(GoTemplateScanError {
                         code: "unterminated_character_constant",
-                        message: "unterminated character constant",
+                        message: "unterminated character constant".to_string(),
                         offset: i,
                     });
                 }
@@ -511,7 +512,7 @@ fn scan_action_end_with_delims(
                 if bytes[i] == b'\n' {
                     return Err(GoTemplateScanError {
                         code: "unterminated_quoted_string",
-                        message: "unterminated quoted string",
+                        message: "unterminated quoted string".to_string(),
                         offset: i,
                     });
                 }
@@ -548,7 +549,7 @@ fn scan_action_end_with_delims(
 
     Err(GoTemplateScanError {
         code,
-        message,
+        message: message.to_string(),
         offset: action_start.saturating_sub(left_delim.len()),
     })
 }
@@ -567,7 +568,7 @@ fn scan_comment_action_end_with_delims(
             }
             return Err(GoTemplateScanError {
                 code: "comment_ends_before_closing_delimiter",
-                message: "comment ends before closing delimiter",
+                message: "comment ends before closing delimiter".to_string(),
                 offset: after_comment,
             });
         }
@@ -575,7 +576,7 @@ fn scan_comment_action_end_with_delims(
     }
     Err(GoTemplateScanError {
         code: "unclosed_comment",
-        message: "unclosed comment",
+        message: "unclosed comment".to_string(),
         offset: comment_start,
     })
 }

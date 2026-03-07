@@ -111,6 +111,20 @@ fn go_printf_supports_width_and_left_align_for_q() {
 }
 
 #[test]
+fn go_printf_preserves_non_ascii_literal_text() {
+    let args = vec![Some(Value::Number(Number::from(7)))];
+    assert_eq!(
+        go_printf("привет %d", &args).expect("must render"),
+        "привет 7"
+    );
+    assert_eq!(go_printf("😊%d", &args).expect("must render"), "😊7");
+    assert_eq!(
+        go_printf("до%%после %d", &args).expect("must render"),
+        "до%после 7"
+    );
+}
+
+#[test]
 fn go_printf_applies_precision_for_q_on_strings_and_bytes() {
     let s = vec![Some(Value::String(
         "abcdefghijklmnopqrstuvwxyz".to_string(),

@@ -191,6 +191,6 @@ mod tests {
     #[test]
     fn builtin_js_escapes_special_ascii_as_go_style() {
         let out = builtin_js(&[Some(Value::String("<x&'\\\"=\\n>".to_string()))]);
-        assert_eq!(out, "\\u003Cx\\u0026\\'\\\"\\u003D\\u000A\\u003E");
+        assert_eq!(out, "\\u003Cx\\u0026\\'\\\\\\\"\\u003D\\\\n\\u003E");
     }
 }

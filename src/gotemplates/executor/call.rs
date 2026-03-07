@@ -34,7 +34,9 @@ pub(super) fn eval_call_builtin(
 
     let first_token = arg_tokens.first().map(String::as_str);
     let first_value = if let Some(first) = first_token {
-        if is_identifier_name(first) {
+        // Go parity: keywords `nil`, `true`, `false` are literals, not function names,
+        // even when used as first argument of `call`.
+        if is_identifier_name(first) && !matches!(first, "nil" | "true" | "false") {
             let Some(resolver) = resolver else {
                 return Err(NativeRenderError::UnsupportedAction {
                     action: action.to_string(),
@@ -48,7 +50,7 @@ pub(super) fn eval_call_builtin(
         }
         eval_command_token_value(action, first, root, dot, state, resolver)?
     } else if has_pipe_input {
-        pipe_input
+        pipe_input.clone()
     } else {
         None
     };

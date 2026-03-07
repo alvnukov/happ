@@ -1,4 +1,5 @@
 pub mod compat;
+// Parity source map: src/gotemplates/go_parity_map.md
 mod executor;
 mod functions;
 pub mod go_compat;
@@ -45,10 +46,10 @@ pub struct GoTemplateActionSpan {
     pub end: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoTemplateScanError {
     pub code: &'static str,
-    pub message: &'static str,
+    pub message: String,
     pub offset: usize,
 }
 

@@ -1,4 +1,7 @@
 use serde_json::Value;
+// Go parity reference:
+// - stdlib fmt package (print.go, format.go)
+// This module ports formatting behavior used by template `printf`.
 mod argconv;
 mod diag;
 mod floatfmt;
@@ -114,8 +117,12 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
     let bytes = fmt.as_bytes();
     while i < bytes.len() {
         if bytes[i] != b'%' {
-            out.push(bytes[i] as char);
+            let start = i;
             i += 1;
+            while i < bytes.len() && bytes[i] != b'%' {
+                i += 1;
+            }
+            out.push_str(&fmt[start..i]);
             continue;
         }
         if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
@@ -160,6 +167,8 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
         let verb = bytes[i] as char;
         i += 1;
         let spec = parse_printf_spec_flags(spec_flags);
+        // Go parity (fmt): arg reordering, star width/precision consumption, and
+        // BADWIDTH/BADPREC/BADINDEX markers must follow the same state machine.
         if spec.no_verb {
             out.push_str("%!(NOVERB)");
             continue;

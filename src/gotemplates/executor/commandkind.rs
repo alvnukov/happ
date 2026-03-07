@@ -47,6 +47,7 @@ pub(super) fn non_function_command_target(token: &str) -> Option<String> {
 pub(super) struct FieldLikeCommandPath {
     pub(super) receiver_expr: String,
     pub(super) field_name: String,
+    pub(super) has_receiver_tail: bool,
 }
 
 pub(super) fn command_field_like_path(token: &str) -> Option<FieldLikeCommandPath> {
@@ -99,6 +100,7 @@ pub(super) fn command_field_like_path(token: &str) -> Option<FieldLikeCommandPat
     Some(FieldLikeCommandPath {
         receiver_expr,
         field_name: field_name.to_string(),
+        has_receiver_tail: !receiver_tail.is_empty(),
     })
 }
 
@@ -167,14 +169,17 @@ mod tests {
         let p = command_field_like_path(".a.b").expect("path");
         assert_eq!(p.receiver_expr, ".a");
         assert_eq!(p.field_name, "b");
+        assert!(p.has_receiver_tail);
 
         let p = command_field_like_path("$.a").expect("path");
         assert_eq!(p.receiver_expr, "$");
         assert_eq!(p.field_name, "a");
+        assert!(!p.has_receiver_tail);
 
         let p = command_field_like_path("$v.a").expect("path");
         assert_eq!(p.receiver_expr, "$v");
         assert_eq!(p.field_name, "a");
+        assert!(!p.has_receiver_tail);
     }
 
     #[test]

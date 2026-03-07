@@ -234,6 +234,52 @@ fn parser_reports_undefined_variable_name_like_go() {
 }
 
 #[test]
+fn parser_reports_undefined_root_variable_when_field_is_accessed() {
+    let err = parse_action_compat_with_options(
+        "{{ $x.value }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: true,
+            known_functions: &[],
+            check_variables: true,
+            visible_variables: &[],
+        },
+    )
+    .expect_err("must fail");
+    assert_eq!(err.code, "undefined_variable");
+    assert!(err.message.contains("undefined variable \"$x\""));
+}
+
+#[test]
+fn parser_allows_call_target_from_variable_or_field_without_func_lookup() {
+    let action = parse_action_compat_with_options(
+        "{{ call $f 1 }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: false,
+            known_functions: &[],
+            check_variables: true,
+            visible_variables: &["$f"],
+        },
+    )
+    .expect("must parse");
+    assert_eq!(action, ControlAction::None);
+
+    let action = parse_action_compat_with_options(
+        "{{ call .Func 1 }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: false,
+            known_functions: &[],
+            check_variables: false,
+            visible_variables: &[],
+        },
+    )
+    .expect("must parse");
+    assert_eq!(action, ControlAction::None);
+}
+
+#[test]
 fn parser_reports_non_executable_pipeline_stage_number_like_go() {
     let err = parse_action_compat_with_options(
         "{{ 1 | nil }}",
