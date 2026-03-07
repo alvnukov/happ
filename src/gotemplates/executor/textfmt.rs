@@ -87,6 +87,9 @@ fn render_arg_text(arg: &Option<Value>, missing: MissingValueRender) -> (String,
             },
             false,
         ),
+        Some(Value::Null) if matches!(missing, MissingValueRender::Nil) => {
+            ("<nil>".to_string(), false)
+        }
         Some(v) => (
             super::format_value_like_go(v),
             matches!(v, Value::String(_)) || go_string_bytes_len(v).is_some(),
@@ -207,6 +210,9 @@ mod tests {
     #[test]
     fn builtin_print_uses_nil_placeholder_like_go_fmt_sprint() {
         let out = builtin_print(&[None], false);
+        assert_eq!(out, "<nil>");
+
+        let out = builtin_print(&[Some(Value::Null)], false);
         assert_eq!(out, "<nil>");
     }
 
