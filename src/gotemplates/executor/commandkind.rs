@@ -125,7 +125,7 @@ fn build_field_receiver_expr(base: FieldPathBase, receiver_tail: &str) -> String
 }
 
 fn is_field_path_segment_char(ch: char) -> bool {
-    is_identifier_continue_char(ch) || ch == '-'
+    is_identifier_continue_char(ch)
 }
 
 fn is_quoted_string(expr: &str) -> bool {
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_field_like_paths() {
-        for token in [".a..b", ".a.", "$.a..b", "$v.a..b", "$v.", ".a./b"] {
+        for token in [".a..b", ".a.", "$.a..b", "$v.a..b", "$v.", ".a./b", ".a-b"] {
             assert!(command_field_like_path(token).is_none(), "token={token}");
         }
     }

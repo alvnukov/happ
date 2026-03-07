@@ -161,7 +161,7 @@ fn split_first_segment(path: &str) -> Option<(&str, &str)> {
 }
 
 fn is_path_segment_char(ch: char) -> bool {
-    is_identifier_continue_char(ch) || ch == '-'
+    is_identifier_continue_char(ch)
 }
 
 fn value_type_name_for_path(v: &Value) -> String {
@@ -245,6 +245,15 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_simple_path_rejects_non_identifier_segments() {
+        let root = json!({"a-b": 1});
+        let out =
+            resolve_simple_path(&root, &root, ".a-b", MissingValueMode::GoDefault, |_| None)
+                .expect("must evaluate");
+        assert_eq!(out, None);
     }
 
     #[test]
