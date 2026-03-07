@@ -103,18 +103,17 @@ pub(super) fn parse_printf_spec_flags(spec: &str) -> ParsedPrintfSpec {
         i += 1;
         after_index = false;
     } else {
-        let start = i;
-        while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
-            i += 1;
-        }
-        if i > start {
-            out.width = spec[start..i].parse::<usize>().ok();
-            if out.width.map_or(true, |w| w > GO_PRINTF_NUM_LIMIT) {
-                out.no_verb = true;
-            }
+        let (width, is_num, ni) = parse_ascii_num_limited(spec, i, bytes.len());
+        if is_num {
+            out.width = Some(width);
+            i = ni;
             if after_index {
                 out.bad_index = true;
             }
+        } else if ni == bytes.len() && i < bytes.len() && bytes[i].is_ascii_digit() {
+            // Go parity: overflow in width parse forces NOVERB by advancing to end.
+            out.no_verb = true;
+            i = ni;
         }
     }
 
@@ -138,17 +137,16 @@ pub(super) fn parse_printf_spec_flags(spec: &str) -> ParsedPrintfSpec {
             i += 1;
             after_index = false;
         } else {
-            let start = i;
-            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
-                i += 1;
-            }
-            if i == start {
+            let (prec, is_num, ni) = parse_ascii_num_limited(spec, i, bytes.len());
+            if is_num {
+                out.precision = Some(prec);
+                i = ni;
+            } else if ni == i {
                 out.precision = Some(0);
             } else {
-                out.precision = spec[start..i].parse::<usize>().ok();
-                if out.precision.map_or(true, |p| p > GO_PRINTF_NUM_LIMIT) {
-                    out.no_verb = true;
-                }
+                // Go parity: overflow in precision parse forces NOVERB by advancing to end.
+                out.no_verb = true;
+                i = ni;
             }
         }
     }
@@ -210,16 +208,37 @@ fn parse_printf_arg_index(spec: &str, start: usize) -> (Option<usize>, usize, bo
     let mut i = start + 1;
     while i < bytes.len() {
         if bytes[i] as char == ']' {
-            let digits = &spec[start + 1..i];
-            let raw = digits.parse::<usize>().ok();
-            if digits.is_empty() || raw.is_none() || raw == Some(0) {
+            let (num, is_num, ni) = parse_ascii_num_limited(spec, start + 1, i);
+            if !is_num || ni != i || num == 0 {
                 return (None, i + 1, false);
             }
-            return (Some(raw.unwrap_or_default() - 1), i + 1, true);
+            return (Some(num - 1), i + 1, true);
         }
         i += 1;
     }
     (None, start + 1, false)
+}
+
+fn parse_ascii_num_limited(spec: &str, start: usize, end: usize) -> (usize, bool, usize) {
+    if start >= end {
+        return (0, false, end);
+    }
+    let bytes = spec.as_bytes();
+    let mut num = 0usize;
+    let mut is_num = false;
+    let mut i = start;
+    while i < end && bytes[i].is_ascii_digit() {
+        if num > GO_PRINTF_NUM_LIMIT {
+            return (0, false, end);
+        }
+        num = num.saturating_mul(10) + usize::from(bytes[i] - b'0');
+        is_num = true;
+        i += 1;
+    }
+    if num > GO_PRINTF_NUM_LIMIT {
+        return (0, false, end);
+    }
+    (num, is_num, i)
 }
 
 #[cfg(test)]

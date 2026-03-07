@@ -164,8 +164,12 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
             break;
         }
         let spec_flags = &fmt[spec_start + 1..i];
-        let verb = bytes[i] as char;
-        i += 1;
+        let mut verb_chars = fmt[i..].chars();
+        let Some(verb) = verb_chars.next() else {
+            out.push_str("%!(NOVERB)");
+            break;
+        };
+        i += verb.len_utf8();
         let spec = parse_printf_spec_flags(spec_flags);
         // Go parity (fmt): arg reordering, star width/precision consumption, and
         // BADWIDTH/BADPREC/BADINDEX markers must follow the same state machine.

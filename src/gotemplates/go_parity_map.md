@@ -28,6 +28,10 @@ This file tracks which Go stdlib sources are the reference for the Rust
   - Go reference: `src/text/template/exec.go`
   - Scope: control-flow block execution (`if`/`with`/`range`), `else`/`end`
     boundary matching, template/block invocation.
+- Rust: `src/gotemplates/executor/eval.rs`
+  - Go reference: `src/text/template/exec.go`
+  - Scope: expression evaluation, pipeline execution, command dispatch and
+    non-executable command diagnostics.
 
 ## printf Compatibility
 
