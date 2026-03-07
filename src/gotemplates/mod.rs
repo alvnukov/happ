@@ -4,7 +4,7 @@ mod executor;
 mod functions;
 // Backward-compatible alias; canonical module is `crate::go_compat`.
 pub mod go_compat;
-mod parser;
+pub(crate) mod parser;
 mod planner;
 mod scanner;
 mod typedvalue;

@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use crate::go_compat::compat::parse_go_quoted_prefix;
-use crate::gotemplates::parser::{
+use crate::go_compat::parserbridge::{
     parse_action_report_with_options, ControlAction, ControlKind, ParseCompatOptions,
+    GoTemplateToken,
 };
-use crate::gotemplates::GoTemplateToken;
 
 use super::super::tree::ParseError;
 use super::action_inner_trimmed;

@@ -1,4 +1,5 @@
-use super::{compat, GoTemplateScanError};
+use super::GoTemplateScanError;
+use crate::go_compat::compat;
 mod lex;
 use self::lex::{is_space, lex_action_inner};
 

@@ -1,5 +1,5 @@
 use super::intfmt::GoInteger;
-use crate::gotemplates::typedvalue::{decode_go_bytes_value, decode_go_string_bytes_value};
+use crate::go_compat::typedvalue::{decode_go_bytes_value, decode_go_string_bytes_value};
 use serde_json::{Number, Value};
 
 pub(super) fn value_to_bool(v: &Option<Value>) -> Option<bool> {

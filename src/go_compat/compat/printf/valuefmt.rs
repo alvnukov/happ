@@ -1,6 +1,6 @@
 use serde_json::{Number, Value};
 
-use crate::gotemplates::typedvalue::{
+use crate::go_compat::typedvalue::{
     decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
     decode_go_typed_slice_value, go_bytes_is_nil,
 };

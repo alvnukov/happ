@@ -1,5 +1,5 @@
 use crate::go_compat::path::value_type_name_for_path;
-use crate::gotemplates::typedvalue::{
+use crate::go_compat::typedvalue::{
     decode_go_string_bytes_value, decode_go_typed_slice_value, go_bytes_len, go_string_bytes_len,
 };
 use serde_json::Value;
@@ -49,7 +49,7 @@ pub fn parse_slice_like_index(
 pub fn value_from_go_string_bytes(bytes: Vec<u8>) -> Value {
     match String::from_utf8(bytes) {
         Ok(s) => Value::String(s),
-        Err(err) => crate::gotemplates::encode_go_string_bytes_value(&err.into_bytes()),
+        Err(err) => crate::go_compat::typedvalue::encode_go_string_bytes_value(&err.into_bytes()),
     }
 }
 
@@ -147,10 +147,10 @@ mod tests {
 
     #[test]
     fn value_type_name_reports_go_typed_shapes() {
-        let b = crate::gotemplates::encode_go_bytes_value(&[1, 2]);
+        let b = crate::go_compat::typedvalue::encode_go_bytes_value(&[1, 2]);
         assert_eq!(value_type_name_for_template(&b), "[]uint8");
 
-        let t = crate::gotemplates::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
+        let t = crate::go_compat::typedvalue::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
         assert_eq!(value_type_name_for_template(&t), "[]int");
     }
 }

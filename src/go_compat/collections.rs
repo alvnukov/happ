@@ -3,7 +3,7 @@ use crate::go_compat::typeutil::{
     value_from_go_string_bytes, value_type_name_for_template, MapKeyArg, ParseSliceLikeIndexError,
     SliceLikeIndexMode,
 };
-use crate::gotemplates::typedvalue::{
+use crate::go_compat::typedvalue::{
     decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
     decode_go_typed_slice_value, encode_go_bytes_value, encode_go_nil_bytes_value,
     encode_go_typed_slice_value, go_bytes_get, go_bytes_is_nil, go_bytes_len,
@@ -453,7 +453,7 @@ mod tests {
     fn index_map_missing_key_returns_zero_value_for_typed_maps() {
         let mut entries = Map::new();
         entries.insert("a".to_string(), Value::Number(Number::from(7)));
-        let typed = crate::gotemplates::encode_go_typed_map_value("int", Some(entries));
+        let typed = crate::go_compat::typedvalue::encode_go_typed_map_value("int", Some(entries));
         let out = builtin_index(&[Some(typed), Some(json!("missing"))]).expect("index");
         assert_eq!(out, Some(Value::Number(Number::from(0))));
     }
@@ -502,7 +502,7 @@ mod tests {
     fn index_chain_after_typed_interface_zero_reports_nil_pointer() {
         let mut entries = Map::new();
         entries.insert("a".to_string(), json!({"x":1}));
-        let typed = crate::gotemplates::encode_go_typed_map_value("interface {}", Some(entries));
+        let typed = crate::go_compat::typedvalue::encode_go_typed_map_value("interface {}", Some(entries));
         let err =
             builtin_index(&[Some(typed), Some(json!("missing")), Some(json!("x"))]).expect_err("must fail");
         assert!(reason(err).contains("error calling index: index of nil pointer"));

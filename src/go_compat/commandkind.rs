@@ -2,7 +2,7 @@ use crate::go_compat::compat;
 use crate::go_compat::ident::is_identifier_continue_char;
 use crate::go_compat::path::split_variable_reference;
 use crate::go_compat::tokenize::strip_outer_parens;
-use crate::gotemplates::typedvalue::{
+use crate::go_compat::typedvalue::{
     decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_len, go_string_bytes_len,
 };
 use serde_json::Value;

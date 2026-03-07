@@ -1,7 +1,7 @@
-use crate::gotemplates::parser::{
-    parse_action_report_with_options, ControlAction, ControlKind, ParseCompatOptions,
+use crate::go_compat::parserbridge::{
+    parse_action_report_with_options, parse_template_tokens_strict_with_options_and_delims,
+    ControlAction, ControlKind, GoTemplateToken, ParseCompatOptions,
 };
-use crate::gotemplates::{parse_template_tokens_strict_with_options_and_delims, GoTemplateToken};
 use std::collections::BTreeMap;
 
 use self::tree_set::split_template_set;

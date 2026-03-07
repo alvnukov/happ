@@ -20,9 +20,11 @@
 // - rangeeval        -> go/src/text/template/exec.go
 // - template/*       -> go/src/text/template/template.go + option paths
 // - textfmt          -> go/src/text/template/funcs.go
+// - typedvalue       -> happ internal Go-typed JSON shape bridge
 // - tokenize/trim    -> go/src/text/template/parse/lex.go + parse.go
 // - truth            -> go/src/text/template/exec.go + funcs.go
 // - typeutil/valuefmt-> go/src/text/template/exec.go + funcs.go
+// - utf8scan         -> shared UTF-8 byte scanner utility
 // - varcheck         -> go/src/text/template/parse/parse.go
 //
 // Additional mirror namespace:
@@ -41,14 +43,17 @@ pub mod externalfn;
 pub mod go_std;
 pub mod ident;
 pub mod parse;
+pub(crate) mod parserbridge;
 pub mod path;
 pub mod pipeline_decl;
 pub mod rangeeval;
 pub mod template;
 pub mod textfmt;
+pub mod typedvalue;
 pub mod tokenize;
 pub mod trim;
 pub mod truth;
 pub mod typeutil;
+pub mod utf8scan;
 pub mod varcheck;
 pub mod valuefmt;

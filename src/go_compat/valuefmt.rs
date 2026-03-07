@@ -1,4 +1,4 @@
-use crate::gotemplates::typedvalue::{
+use crate::go_compat::typedvalue::{
     decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
     decode_go_typed_slice_value,
 };
@@ -98,10 +98,10 @@ mod tests {
 
     #[test]
     fn formats_go_typed_bytes_and_string_bytes() {
-        let bytes = crate::gotemplates::encode_go_bytes_value(&[1, 2, 3]);
+        let bytes = crate::go_compat::typedvalue::encode_go_bytes_value(&[1, 2, 3]);
         assert_eq!(format_value_like_go(&bytes), "[1 2 3]");
 
-        let sbytes = crate::gotemplates::encode_go_string_bytes_value(b"abc");
+        let sbytes = crate::go_compat::typedvalue::encode_go_string_bytes_value(b"abc");
         assert_eq!(format_value_like_go(&sbytes), "abc");
     }
 }

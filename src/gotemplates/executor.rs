@@ -1,5 +1,5 @@
 use super::{
-    compat, parse_template_tokens_strict_with_options,
+    parse_template_tokens_strict_with_options,
     typedvalue::{
         decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
         decode_go_typed_slice_value, encode_go_bytes_value, encode_go_nil_bytes_value,
@@ -8,6 +8,7 @@ use super::{
     },
     GoTemplateScanError, GoTemplateToken, ParseCompatOptions, HELM_INCLUDE_RECURSION_MAX_REFS,
 };
+use crate::go_compat::compat;
 use serde_json::{Number, Value};
 use std::collections::BTreeMap;
 pub use crate::go_compat::backend::LogicBackend;

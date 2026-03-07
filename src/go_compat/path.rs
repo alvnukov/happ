@@ -1,5 +1,5 @@
 use crate::go_compat::ident::is_identifier_continue_char;
-use crate::gotemplates::typedvalue::{
+use crate::go_compat::typedvalue::{
     decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_len, go_string_bytes_len,
     go_type_is_interface, go_zero_value_for_type,
 };
@@ -220,10 +220,10 @@ mod tests {
 
     #[test]
     fn value_type_name_reports_go_typed_shapes() {
-        let b = crate::gotemplates::encode_go_bytes_value(&[1, 2]);
+        let b = crate::go_compat::typedvalue::encode_go_bytes_value(&[1, 2]);
         assert_eq!(value_type_name_for_path(&b), "[]uint8");
 
-        let t = crate::gotemplates::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
+        let t = crate::go_compat::typedvalue::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
         assert_eq!(value_type_name_for_path(&t), "[]int");
     }
 

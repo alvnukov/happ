@@ -1,23 +1,23 @@
 use super::*;
 use serde_json::{Number, Value};
 fn typed_bytes(bytes: &[u8]) -> Value {
-    crate::gotemplates::encode_go_bytes_value(bytes)
+    crate::go_compat::typedvalue::encode_go_bytes_value(bytes)
 }
 
 fn typed_nil_bytes() -> Value {
-    crate::gotemplates::encode_go_nil_bytes_value()
+    crate::go_compat::typedvalue::encode_go_nil_bytes_value()
 }
 
 fn typed_string_bytes(bytes: &[u8]) -> Value {
-    crate::gotemplates::encode_go_string_bytes_value(bytes)
+    crate::go_compat::typedvalue::encode_go_string_bytes_value(bytes)
 }
 
 fn typed_map(elem_type: &str, entries: Option<serde_json::Map<String, Value>>) -> Value {
-    crate::gotemplates::encode_go_typed_map_value(elem_type, entries)
+    crate::go_compat::typedvalue::encode_go_typed_map_value(elem_type, entries)
 }
 
 fn typed_slice(elem_type: &str, items: Option<Vec<Value>>) -> Value {
-    crate::gotemplates::encode_go_typed_slice_value(elem_type, items)
+    crate::go_compat::typedvalue::encode_go_typed_slice_value(elem_type, items)
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use crate::gotemplates::utf8scan::push_utf8_char_from_bytes;
+use crate::go_compat::utf8scan::push_utf8_char_from_bytes;
 
 // Go parity reference: stdlib text/template/parse/parse.go + parse/lex.go
 // command and pipeline token boundaries.

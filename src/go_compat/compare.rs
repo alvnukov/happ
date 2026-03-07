@@ -3,7 +3,7 @@ use crate::go_compat::typeutil::{
     value_type_name_for_template,
 };
 use crate::go_compat::valuefmt::format_value_like_go;
-use crate::gotemplates::typedvalue::{
+use crate::go_compat::typedvalue::{
     decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_is_nil,
 };
 use serde_json::Value;
@@ -261,7 +261,7 @@ fn format_non_comparable_types_reason(a: &Option<Value>, b: &Option<Value>) -> S
 #[cfg(test)]
 mod tests {
     use super::{eq_values, le_values, lt_values, CompareError};
-    use crate::gotemplates::{
+    use crate::go_compat::typedvalue::{
         encode_go_bytes_value, encode_go_nil_bytes_value, encode_go_typed_map_value,
         encode_go_typed_slice_value,
     };

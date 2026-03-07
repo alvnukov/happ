@@ -315,12 +315,12 @@ mod tests {
         let mut outer = serde_json::Map::new();
         outer.insert(
             "x".to_string(),
-            crate::gotemplates::encode_go_typed_map_value("int", Some(inner)),
+            crate::go_compat::typedvalue::encode_go_typed_map_value("int", Some(inner)),
         );
         let mut root = serde_json::Map::new();
         root.insert(
             "m".to_string(),
-            crate::gotemplates::encode_go_typed_map_value("map[string]int", Some(outer)),
+            crate::go_compat::typedvalue::encode_go_typed_map_value("map[string]int", Some(outer)),
         );
 
         let out = tpl

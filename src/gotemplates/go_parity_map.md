@@ -32,6 +32,9 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/parse/parse.go`, `src/text/template/parse/lex.go`
   - Scope: reusable command/pipeline token boundaries and outer-parentheses
     handling shared by executor and function-call analysis.
+- Rust: `src/go_compat/utf8scan.rs`
+  - Go reference: utility aligned with UTF-8 traversal used by parse/lex style scanners
+  - Scope: shared UTF-8 byte scanning helper used by tokenizer paths.
 - Rust: `src/go_compat/ident.rs`
   - Go reference: `src/text/template/parse/lex.go`
   - Scope: shared Go identifier start/continue/name checks used across parser
@@ -61,6 +64,10 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/exec.go`, `src/text/template/funcs.go`
   - Scope: slice/index argument normalization, map-key coercion, string-like byte helpers
     and shared Go type-name classification used by compare/collections paths.
+- Rust: `src/go_compat/typedvalue.rs`
+  - Go reference: internal typed-shape bridge used to represent Go-typed values in JSON
+  - Scope: canonical encoding/decoding of `[]byte`, typed map/slice and zero-value helpers
+    used by executor and go_compat builtins.
 - Rust: `src/go_compat/compare.rs`
   - Go reference: `src/text/template/funcs.go`
   - Scope: core comparison semantics (`eq/lt/le`), nil/map/slice comparability

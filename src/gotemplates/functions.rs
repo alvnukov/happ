@@ -1,9 +1,10 @@
 use super::{
-    collect_action_spans, compat,
-    go_compat::{
-        ident::is_identifier_name as go_is_identifier_name,
-        tokenize::{split_command_tokens_simple, split_pipeline_commands_borrowed},
-    },
+    collect_action_spans,
+};
+use crate::go_compat::{
+    compat,
+    ident::is_identifier_name as go_is_identifier_name,
+    tokenize::{split_command_tokens_simple, split_pipeline_commands_borrowed},
 };
 
 const LEFT_DELIM: &str = "{{";
