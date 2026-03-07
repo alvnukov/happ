@@ -1,5 +1,6 @@
 pub mod actionparse;
 pub mod analyzer;
+pub mod compare;
 pub mod commandkind;
 pub mod expr;
 pub mod ident;

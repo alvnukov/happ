@@ -49,6 +49,10 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/exec.go`, `src/text/template/funcs.go`
   - Scope: slice/index argument normalization, map-key coercion, string-like byte helpers
     and shared Go type-name classification used by compare/collections paths.
+- Rust: `src/gotemplates/go_compat/compare.rs`
+  - Go reference: `src/text/template/funcs.go`
+  - Scope: core comparison semantics (`eq/lt/le`), nil/map/slice comparability
+    classes and detail reasons for non-comparable values.
 
 ## Builtins and Rendering
 
@@ -88,11 +92,11 @@ target until the used surface is fully stabilized.
   - Scope: truthiness semantics and `and/or/not` short-circuit result behavior.
 - Rust: `src/gotemplates/executor/textfmt.rs`
   - Go reference: `src/text/template/funcs.go`
-  - Scope: used text builtins (`print/println`) and shared argument rendering
-    path for `html/js/urlquery`.
+  - Scope: adapter layer mapping runtime builtin calls into go_compat text-format APIs.
 - Rust: `src/gotemplates/go_compat/textfmt.rs`
-  - Go reference: `src/text/template/funcs.go` (`JSEscape` / `jsIsSpecial`)
-  - Scope: Go-specific Unicode escape classification used by `js` builtin.
+  - Go reference: `src/text/template/funcs.go` (`print/println/html/js/urlquery`, `JSEscape` / `jsIsSpecial`)
+  - Scope: text builtin rendering (`print`, `html`, `js`, `urlquery`) + Go-specific
+    Unicode escape classification shared by `js` paths.
 - Rust: `src/gotemplates/go_compat/trim.rs`
   - Go reference: `src/text/template/parse/lex.go`
   - Scope: trim-marker and ASCII whitespace helpers for `{{-` / `-}}` handling.
