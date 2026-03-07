@@ -65,7 +65,17 @@ pub(super) fn builtin_index(
     if args.len() == 1 {
         return Ok(cur);
     }
-    for idx in args.iter().skip(1) {
+    for (hop_idx, idx) in args.iter().skip(1).enumerate() {
+        if matches!(cur, Some(Value::Null) | None) {
+            return Err(NativeRenderError::UnsupportedAction {
+                action: action.to_string(),
+                reason: if hop_idx == 0 {
+                    "error calling index: index of untyped nil".to_string()
+                } else {
+                    "error calling index: index of nil pointer".to_string()
+                },
+            });
+        }
         if let Some(ref value) = cur {
             if let Some(typed_map) = decode_go_typed_map_value(value) {
                 let next = match map_key_arg(idx) {
@@ -171,12 +181,6 @@ pub(super) fn builtin_index(
                     return Err(index_reflect_out_of_range(action, IndexTargetKind::String));
                 }
                 Some(Value::Number(Number::from(bytes[pos])))
-            }
-            Some(Value::Null) | None => {
-                return Err(NativeRenderError::UnsupportedAction {
-                    action: action.to_string(),
-                    reason: "error calling index: index of untyped nil".to_string(),
-                });
             }
             Some(ref value) => {
                 return Err(NativeRenderError::UnsupportedAction {
@@ -489,5 +493,29 @@ mod tests {
         let err = builtin_slice("", &[Some(json!([1, 2, 3])), Some(json!(4)), Some(json!(5))])
             .expect_err("must fail");
         assert!(reason(err).contains("error calling slice: index out of range: 4"));
+    }
+
+    #[test]
+    fn index_chain_after_missing_map_reports_nil_pointer_like_go() {
+        let root = Some(json!({"a":{"x":1}}));
+        let err = builtin_index("", &[root, Some(json!("missing")), Some(json!("x"))])
+            .expect_err("must fail");
+        assert!(reason(err).contains("error calling index: index of nil pointer"));
+    }
+
+    #[test]
+    fn index_root_untyped_nil_still_reports_untyped_nil() {
+        let err = builtin_index("", &[Some(Value::Null), Some(json!(1))]).expect_err("must fail");
+        assert!(reason(err).contains("error calling index: index of untyped nil"));
+    }
+
+    #[test]
+    fn index_chain_after_typed_interface_zero_reports_nil_pointer() {
+        let mut entries = Map::new();
+        entries.insert("a".to_string(), json!({"x":1}));
+        let typed = crate::gotemplates::encode_go_typed_map_value("interface {}", Some(entries));
+        let err = builtin_index("", &[Some(typed), Some(json!("missing")), Some(json!("x"))])
+            .expect_err("must fail");
+        assert!(reason(err).contains("error calling index: index of nil pointer"));
     }
 }
