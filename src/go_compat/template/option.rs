@@ -1,3 +1,4 @@
+use crate::go_compat::backend::LogicBackend;
 use crate::gotemplates::{FunctionDispatchMode, MissingValueMode, NativeRenderOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,7 @@ impl TemplateOptions {
         NativeRenderOptions {
             missing_value_mode,
             function_dispatch_mode: FunctionDispatchMode::GoStrict,
+            logic_backend: LogicBackend::GoCompat,
         }
     }
 }
@@ -82,6 +84,7 @@ mod tests {
         let native = options.to_native_render_options();
         assert_eq!(native.missing_value_mode, MissingValueMode::Error);
         assert_eq!(native.function_dispatch_mode, FunctionDispatchMode::GoStrict);
+        assert_eq!(native.logic_backend, LogicBackend::GoCompat);
     }
 
     #[test]
@@ -92,6 +95,7 @@ mod tests {
             let native = options.to_native_render_options();
             assert_eq!(native.missing_value_mode, MissingValueMode::GoDefault);
             assert_eq!(native.function_dispatch_mode, FunctionDispatchMode::GoStrict);
+            assert_eq!(native.logic_backend, LogicBackend::GoCompat);
         }
     }
 
@@ -104,5 +108,6 @@ mod tests {
         let native = options.to_native_render_options();
         assert_eq!(native.missing_value_mode, MissingValueMode::GoZero);
         assert_eq!(native.function_dispatch_mode, FunctionDispatchMode::GoStrict);
+        assert_eq!(native.logic_backend, LogicBackend::GoCompat);
     }
 }

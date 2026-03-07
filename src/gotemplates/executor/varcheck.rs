@@ -36,7 +36,9 @@ mod tests {
         ensure_variable_is_defined, looks_like_char_literal, looks_like_numeric_literal,
         undefined_variable_error,
     };
-    use super::super::{EvalState, FunctionDispatchMode, MissingValueMode, NativeRenderError};
+    use super::super::{
+        EvalState, FunctionDispatchMode, LogicBackend, MissingValueMode, NativeRenderError,
+    };
 
     #[test]
     fn literal_shape_helpers_match_expected_inputs() {
@@ -50,7 +52,11 @@ mod tests {
 
     #[test]
     fn variable_guard_reports_undefined_variable_name() {
-        let state = EvalState::new(MissingValueMode::GoDefault, FunctionDispatchMode::Extended);
+        let state = EvalState::new(
+            MissingValueMode::GoDefault,
+            FunctionDispatchMode::Extended,
+            LogicBackend::GoCompat,
+        );
         let err = ensure_variable_is_defined("$x", &state).expect_err("must fail");
         assert_eq!(err, undefined_variable_error("$x"));
         assert!(matches!(err, NativeRenderError::Parse(_)));

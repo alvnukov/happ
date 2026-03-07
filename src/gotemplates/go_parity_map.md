@@ -6,6 +6,11 @@ This file tracks which Go stdlib sources are the reference for the Rust
 All Go-related compatibility code is centralized under `src/go_compat/*`.
 Mirror namespace for upstream transfer lives at `src/go_compat/go_std/*`.
 
+Backend switch interface:
+- `NativeRenderOptions.logic_backend` controls which logic backend is used.
+- Current behavior routes both backends through Go-compatible execution while
+  we continue parity hardening; the interface is stable for future split.
+
 The current priority is the builtins and execution branches observed in the
 real chart corpus (`helm-apps` + integration examples). Less-used branches
 (`call`, html/js/urlquery edge cases) are kept but are not the primary parity

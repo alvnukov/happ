@@ -12,6 +12,7 @@ mod utf8scan;
 
 pub use executor::{
     FunctionDispatchMode,
+    LogicBackend,
     render_template_native, render_template_native_with_options,
     render_template_native_with_resolver, MissingValueMode, NativeFunctionResolver,
     NativeFunctionResolverError, NativeRenderError, NativeRenderOptions,

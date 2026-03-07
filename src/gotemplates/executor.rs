@@ -10,6 +10,7 @@ use super::{
 };
 use serde_json::{Number, Value};
 use std::collections::BTreeMap;
+pub use crate::go_compat::backend::LogicBackend;
 // Go parity reference: stdlib text/template/exec.go.
 mod compare;
 mod call;
@@ -80,6 +81,7 @@ pub enum FunctionDispatchMode {
 pub struct NativeRenderOptions {
     pub missing_value_mode: MissingValueMode,
     pub function_dispatch_mode: FunctionDispatchMode,
+    pub logic_backend: LogicBackend,
 }
 
 impl Default for NativeRenderOptions {
@@ -87,6 +89,7 @@ impl Default for NativeRenderOptions {
         Self {
             missing_value_mode: MissingValueMode::GoDefault,
             function_dispatch_mode: FunctionDispatchMode::Extended,
+            logic_backend: LogicBackend::GoCompat,
         }
     }
 }
@@ -177,6 +180,12 @@ pub fn render_template_native_with_resolver(
     options: NativeRenderOptions,
     resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<String, NativeRenderError> {
+    match options.logic_backend {
+        LogicBackend::GoCompat => {}
+        LogicBackend::RustNative => {
+            // Interface is ready; RustNative currently follows GoCompat execution path.
+        }
+    }
     let mut tokens = parse_template_tokens_strict_with_options(
         src,
         ParseCompatOptions {
@@ -190,7 +199,11 @@ pub fn render_template_native_with_resolver(
     apply_lexical_trims(&mut tokens);
     let (main_tokens, templates) = split_template_set(&tokens)?;
     let dot = root.clone();
-    let mut state = EvalState::new(options.missing_value_mode, options.function_dispatch_mode);
+    let mut state = EvalState::new(
+        options.missing_value_mode,
+        options.function_dispatch_mode,
+        options.logic_backend,
+    );
     let eval = eval_block(
         &main_tokens,
         0,
@@ -227,17 +240,20 @@ struct EvalState {
     scopes: Vec<BTreeMap<String, Option<Value>>>,
     missing_value_mode: MissingValueMode,
     function_dispatch_mode: FunctionDispatchMode,
+    logic_backend: LogicBackend,
 }
 
 impl EvalState {
     fn new(
         missing_value_mode: MissingValueMode,
         function_dispatch_mode: FunctionDispatchMode,
+        logic_backend: LogicBackend,
     ) -> Self {
         Self {
             scopes: vec![BTreeMap::new()],
             missing_value_mode,
             function_dispatch_mode,
+            logic_backend,
         }
     }
 

@@ -484,7 +484,11 @@ pub(super) fn eval_template_invocation(
         dot.clone()
     };
     let mut isolated_state =
-        EvalState::new(options.missing_value_mode, options.function_dispatch_mode);
+        EvalState::new(
+            options.missing_value_mode,
+            options.function_dispatch_mode,
+            options.logic_backend,
+        );
     let eval = eval_block(
         body,
         0,
@@ -534,7 +538,11 @@ pub(super) fn eval_block_invocation(
         .map(Vec::as_slice)
         .unwrap_or(fallback_body);
     let mut isolated_state =
-        EvalState::new(options.missing_value_mode, options.function_dispatch_mode);
+        EvalState::new(
+            options.missing_value_mode,
+            options.function_dispatch_mode,
+            options.logic_backend,
+        );
     let eval = eval_block(
         render_body,
         0,

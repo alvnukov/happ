@@ -227,7 +227,9 @@ fn eval_pipeline_command(
         return Ok(result);
     }
 
-    if matches!(state.function_dispatch_mode, FunctionDispatchMode::Extended) {
+    let allow_dynamic_external_head = matches!(state.function_dispatch_mode, FunctionDispatchMode::Extended)
+        && matches!(state.logic_backend, LogicBackend::GoCompat | LogicBackend::RustNative);
+    if allow_dynamic_external_head {
         if let Some(result) = try_eval_dynamic_external_function(
             action,
             &tokens,

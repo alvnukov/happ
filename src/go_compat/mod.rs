@@ -2,6 +2,7 @@
 // Keep all parity logic under this root to avoid behavior fragmentation.
 pub mod actionparse;
 pub mod analyzer;
+pub mod backend;
 pub mod call;
 pub mod compat;
 pub mod collections;
