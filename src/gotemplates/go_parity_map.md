@@ -34,10 +34,10 @@ target until the used surface is fully stabilized.
     declared/assigned/referenced variable spans) reused by parser/scanner and go_compat parse APIs.
 - Rust: `src/gotemplates/scanner.rs`
   - Go reference: `src/text/template/parse/lex.go`
-  - Scope: action token scanning, delimiter handling, string/comment boundaries.
+  - Scope: backward-compatible facade over canonical go_compat scan APIs.
 - Rust: `src/go_compat/scan.rs`
   - Go reference: `src/text/template/parse/lex.go` (token/error surface shape)
-  - Scope: canonical token/span/error types used by scanner and parse APIs.
+  - Scope: canonical token/span/error types plus action scanning/token parsing APIs.
 - Rust: `src/go_compat/tokenize.rs`
   - Go reference: `src/text/template/parse/parse.go`, `src/text/template/parse/lex.go`
   - Scope: reusable command/pipeline token boundaries and outer-parentheses
