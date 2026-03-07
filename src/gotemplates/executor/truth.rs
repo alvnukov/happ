@@ -83,4 +83,20 @@ mod tests {
         assert_eq!(builtin_and(&all_truthy), Some(json!(1)));
         assert_eq!(builtin_or(&all_truthy), Some(json!("x")));
     }
+
+    #[test]
+    fn truthiness_for_typed_nil_and_non_empty_collections() {
+        let nil_map = crate::gotemplates::encode_go_typed_map_value("string", None);
+        let mut entries = serde_json::Map::new();
+        entries.insert(String::from("k"), json!("v"));
+        let map = crate::gotemplates::encode_go_typed_map_value("string", Some(entries));
+        let nil_slice = crate::gotemplates::encode_go_typed_slice_value("int", None);
+        let slice =
+            crate::gotemplates::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
+
+        assert!(!is_truthy(&Some(nil_map)));
+        assert!(is_truthy(&Some(map)));
+        assert!(!is_truthy(&Some(nil_slice)));
+        assert!(is_truthy(&Some(slice)));
+    }
 }

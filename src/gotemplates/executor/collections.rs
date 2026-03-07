@@ -95,7 +95,10 @@ pub(super) fn builtin_index(
             }
             if let Some(typed_slice) = decode_go_typed_slice_value(value) {
                 let len = typed_slice.items.map_or(0, <[Value]>::len);
-                let pos = parse_slice_like_index(action, "index", idx, len)?;
+                let pos = parse_index_pos(action, idx, len)?;
+                if pos == len {
+                    return Err(index_reflect_out_of_range(action, IndexTargetKind::Slice));
+                }
                 let item = typed_slice
                     .items
                     .and_then(|items| items.get(pos))
@@ -107,7 +110,10 @@ pub(super) fn builtin_index(
                 continue;
             }
             if let Some(len) = go_bytes_len(value) {
-                let pos = parse_slice_like_index(action, "index", idx, len)?;
+                let pos = parse_index_pos(action, idx, len)?;
+                if pos == len {
+                    return Err(index_reflect_out_of_range(action, IndexTargetKind::Slice));
+                }
                 let byte = go_bytes_get(value, pos).ok_or_else(|| {
                     NativeRenderError::UnsupportedAction {
                         action: action.to_string(),
@@ -118,7 +124,10 @@ pub(super) fn builtin_index(
                 continue;
             }
             if let Some(len) = go_string_bytes_len(value) {
-                let pos = parse_slice_like_index(action, "index", idx, len)?;
+                let pos = parse_index_pos(action, idx, len)?;
+                if pos == len {
+                    return Err(index_reflect_out_of_range(action, IndexTargetKind::String));
+                }
                 let byte = go_string_bytes_get(value, pos).ok_or_else(|| {
                     NativeRenderError::UnsupportedAction {
                         action: action.to_string(),
@@ -131,7 +140,10 @@ pub(super) fn builtin_index(
         }
         let next = match cur {
             Some(Value::Array(ref items)) => {
-                let pos = parse_slice_like_index(action, "index", idx, items.len())?;
+                let pos = parse_index_pos(action, idx, items.len())?;
+                if pos == items.len() {
+                    return Err(index_reflect_out_of_range(action, IndexTargetKind::Slice));
+                }
                 Some(items[pos].clone())
             }
             Some(Value::Object(ref map)) => match map_key_arg(idx) {
@@ -154,7 +166,10 @@ pub(super) fn builtin_index(
             },
             Some(Value::String(ref s)) => {
                 let bytes = s.as_bytes();
-                let pos = parse_slice_like_index(action, "index", idx, bytes.len())?;
+                let pos = parse_index_pos(action, idx, bytes.len())?;
+                if pos == bytes.len() {
+                    return Err(index_reflect_out_of_range(action, IndexTargetKind::String));
+                }
                 Some(Value::Number(Number::from(bytes[pos])))
             }
             Some(Value::Null) | None => {
@@ -176,6 +191,36 @@ pub(super) fn builtin_index(
         cur = next;
     }
     Ok(cur)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IndexTargetKind {
+    Slice,
+    String,
+}
+
+fn parse_index_pos(
+    action: &str,
+    idx_arg: &Option<Value>,
+    len: usize,
+) -> Result<usize, NativeRenderError> {
+    // Go text/template indexArg permits `x == cap` and then the following reflect
+    // index operation raises a more specific "reflect: ... index out of range" panic.
+    // We preserve that behavior by parsing with a +1 bound and handling `x == len`
+    // at the call site.
+    let parse_cap = len.saturating_add(1);
+    parse_slice_like_index(action, "index", idx_arg, parse_cap)
+}
+
+fn index_reflect_out_of_range(action: &str, kind: IndexTargetKind) -> NativeRenderError {
+    let detail = match kind {
+        IndexTargetKind::Slice => "reflect: slice index out of range",
+        IndexTargetKind::String => "reflect: string index out of range",
+    };
+    NativeRenderError::UnsupportedAction {
+        action: action.to_string(),
+        reason: format!("error calling index: {detail}"),
+    }
 }
 
 pub(super) fn builtin_slice(
@@ -369,5 +414,34 @@ pub(super) fn builtin_slice(
                 value_type_name_for_template(item)
             ),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::builtin_index;
+    use crate::gotemplates::NativeRenderError;
+    use serde_json::json;
+
+    fn reason(err: NativeRenderError) -> String {
+        match err {
+            NativeRenderError::UnsupportedAction { reason, .. } => reason,
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_boundary_equals_len_matches_go_reflect_errors() {
+        let err = builtin_index("", &[Some(json!([1, 2])), Some(json!(2))]).expect_err("must fail");
+        assert!(reason(err).contains("error calling index: reflect: slice index out of range"));
+
+        let err = builtin_index("", &[Some(json!("ab")), Some(json!(2))]).expect_err("must fail");
+        assert!(reason(err).contains("error calling index: reflect: string index out of range"));
+    }
+
+    #[test]
+    fn index_above_len_keeps_index_out_of_range_message() {
+        let err = builtin_index("", &[Some(json!([1, 2])), Some(json!(3))]).expect_err("must fail");
+        assert!(reason(err).contains("error calling index: index out of range: 3"));
     }
 }

@@ -2,19 +2,7 @@ use crate::gotemplates::typedvalue::{decode_go_string_bytes_value, go_string_byt
 use serde_json::Value;
 
 pub(super) fn builtin_print(args: &[Option<Value>], with_newline: bool) -> String {
-    let mut out = String::new();
-    let mut prev_is_string = false;
-    for (idx, arg) in args.iter().enumerate() {
-        let piece = format_value_for_print(arg);
-        let cur_is_string = arg
-            .as_ref()
-            .is_some_and(|v| matches!(v, Value::String(_)) || go_string_bytes_len(v).is_some());
-        if idx > 0 && !prev_is_string && !cur_is_string {
-            out.push(' ');
-        }
-        out.push_str(&piece);
-        prev_is_string = cur_is_string;
-    }
+    let mut out = eval_args_text(args, MissingValueRender::Nil);
     if with_newline {
         out.push('\n');
     }
@@ -22,15 +10,15 @@ pub(super) fn builtin_print(args: &[Option<Value>], with_newline: bool) -> Strin
 }
 
 pub(super) fn builtin_urlquery(args: &[Option<Value>]) -> String {
-    query_escape_bytes(&join_text_template_args_bytes(args))
+    query_escape_bytes(&eval_args_bytes(args, MissingValueRender::NoValue))
 }
 
 pub(super) fn builtin_html(args: &[Option<Value>]) -> String {
-    html_escape(&join_text_template_args(args))
+    html_escape(&eval_args_text(args, MissingValueRender::NoValue))
 }
 
 pub(super) fn builtin_js(args: &[Option<Value>]) -> String {
-    js_escape(&join_text_template_args(args))
+    js_escape(&eval_args_text(args, MissingValueRender::NoValue))
 }
 
 pub(super) fn format_value_for_print(v: &Option<Value>) -> String {
@@ -40,17 +28,17 @@ pub(super) fn format_value_for_print(v: &Option<Value>) -> String {
     }
 }
 
-fn join_text_template_args(args: &[Option<Value>]) -> String {
+#[derive(Debug, Clone, Copy)]
+enum MissingValueRender {
+    Nil,
+    NoValue,
+}
+
+fn eval_args_text(args: &[Option<Value>], missing: MissingValueRender) -> String {
     let mut joined = String::new();
     let mut prev_is_string = false;
     for (idx, arg) in args.iter().enumerate() {
-        let piece = match arg {
-            None => "<no value>".to_string(),
-            Some(v) => super::format_value_like_go(v),
-        };
-        let cur_is_string = arg
-            .as_ref()
-            .is_some_and(|v| matches!(v, Value::String(_)) || go_string_bytes_len(v).is_some());
+        let (piece, cur_is_string) = render_arg_text(arg, missing);
         if idx > 0 && !prev_is_string && !cur_is_string {
             joined.push(' ');
         }
@@ -60,12 +48,18 @@ fn join_text_template_args(args: &[Option<Value>]) -> String {
     joined
 }
 
-fn join_text_template_args_bytes(args: &[Option<Value>]) -> Vec<u8> {
+fn eval_args_bytes(args: &[Option<Value>], missing: MissingValueRender) -> Vec<u8> {
     let mut joined = Vec::new();
     let mut prev_is_string = false;
     for (idx, arg) in args.iter().enumerate() {
         let (piece, cur_is_string) = match arg {
-            None => (b"<no value>".as_slice().to_vec(), false),
+            None => (
+                match missing {
+                    MissingValueRender::Nil => b"<nil>".as_slice().to_vec(),
+                    MissingValueRender::NoValue => b"<no value>".as_slice().to_vec(),
+                },
+                false,
+            ),
             Some(Value::String(s)) => (s.as_bytes().to_vec(), true),
             Some(v) => {
                 if let Some(bytes) = decode_go_string_bytes_value(v) {
@@ -82,6 +76,22 @@ fn join_text_template_args_bytes(args: &[Option<Value>]) -> Vec<u8> {
         prev_is_string = cur_is_string;
     }
     joined
+}
+
+fn render_arg_text(arg: &Option<Value>, missing: MissingValueRender) -> (String, bool) {
+    match arg {
+        None => (
+            match missing {
+                MissingValueRender::Nil => "<nil>".to_string(),
+                MissingValueRender::NoValue => "<no value>".to_string(),
+            },
+            false,
+        ),
+        Some(v) => (
+            super::format_value_like_go(v),
+            matches!(v, Value::String(_)) || go_string_bytes_len(v).is_some(),
+        ),
+    }
 }
 
 fn query_escape_bytes(input: &[u8]) -> String {
@@ -179,7 +189,7 @@ fn hex_upper(n: u8) -> char {
 
 #[cfg(test)]
 mod tests {
-    use super::{builtin_js, builtin_urlquery};
+    use super::{builtin_html, builtin_js, builtin_print, builtin_urlquery};
     use serde_json::Value;
 
     #[test]
@@ -192,5 +202,31 @@ mod tests {
     fn builtin_js_escapes_special_ascii_as_go_style() {
         let out = builtin_js(&[Some(Value::String("<x&'\\\"=\\n>".to_string()))]);
         assert_eq!(out, "\\u003Cx\\u0026\\'\\\\\\\"\\u003D\\\\n\\u003E");
+    }
+
+    #[test]
+    fn builtin_print_uses_nil_placeholder_like_go_fmt_sprint() {
+        let out = builtin_print(&[None], false);
+        assert_eq!(out, "<nil>");
+    }
+
+    #[test]
+    fn html_uses_no_value_placeholder_from_eval_args_path() {
+        let out = builtin_html(&[None]);
+        assert_eq!(out, "&lt;no value&gt;");
+    }
+
+    #[test]
+    fn builtin_print_matches_go_spacing_rules_for_non_strings() {
+        let out = builtin_print(
+            &[
+                Some(Value::Number(1.into())),
+                Some(Value::Number(2.into())),
+                Some(Value::String("x".to_string())),
+                Some(Value::Number(3.into())),
+            ],
+            false,
+        );
+        assert_eq!(out, "1 2x3");
     }
 }

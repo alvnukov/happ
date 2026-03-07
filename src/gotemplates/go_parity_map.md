@@ -36,6 +36,17 @@ This file tracks which Go stdlib sources are the reference for the Rust
   - Go reference: `src/text/template/funcs.go`
   - Scope: builtin comparison semantics (`eq/ne/lt/le/gt/ge`), nil handling,
     non-comparable diagnostics and signed/unsigned integer cross-comparison.
+- Rust: `src/gotemplates/executor/collections.rs`
+  - Go reference: `src/text/template/funcs.go`
+  - Scope: used collection builtins (`len/index/slice`) with Go-compatible
+    bounds, missing-key behavior and index diagnostics.
+- Rust: `src/gotemplates/executor/truth.rs`
+  - Go reference: `src/text/template/exec.go`, `src/text/template/funcs.go`
+  - Scope: truthiness semantics and `and/or/not` short-circuit result behavior.
+- Rust: `src/gotemplates/executor/textfmt.rs`
+  - Go reference: `src/text/template/funcs.go`
+  - Scope: used text builtins (`print/println`) and shared argument rendering
+    path for `html/js/urlquery`.
 
 ## printf Compatibility
 
