@@ -4,6 +4,7 @@ pub mod collections;
 pub mod compare;
 pub mod commandkind;
 pub mod expr;
+pub mod externalfn;
 pub mod ident;
 pub mod parse;
 pub mod path;

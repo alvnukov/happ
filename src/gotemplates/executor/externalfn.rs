@@ -1,6 +1,9 @@
 use super::{
-    eval_command_token_value, is_identifier_name, EvalState, NativeFunctionResolver,
-    NativeFunctionResolverError, NativeRenderError,
+    eval_command_token_value, EvalState, NativeFunctionResolver, NativeFunctionResolverError,
+    NativeRenderError,
+};
+use crate::gotemplates::go_compat::externalfn::{
+    external_call_failed_reason, is_external_function_identifier,
 };
 use serde_json::Value;
 
@@ -18,7 +21,7 @@ pub(super) fn try_eval_external_function(
     let Some(resolver) = resolver else {
         return Ok(None);
     };
-    if !is_identifier_name(name) {
+    if !is_external_function_identifier(name) {
         return Ok(None);
     }
 
@@ -43,7 +46,7 @@ pub(super) fn try_eval_external_function(
         Err(NativeFunctionResolverError::Failed { reason }) => {
             Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: format!("error calling {name}: {reason}"),
+                reason: external_call_failed_reason(name, &reason),
             })
         }
     }
@@ -62,7 +65,7 @@ pub(super) fn try_eval_dynamic_external_function(
     let Some(resolver) = resolver else {
         return Ok(None);
     };
-    if tokens.is_empty() || is_identifier_name(&tokens[0]) {
+    if tokens.is_empty() || is_external_function_identifier(&tokens[0]) {
         return Ok(None);
     }
 
@@ -71,7 +74,7 @@ pub(super) fn try_eval_dynamic_external_function(
     else {
         return Ok(None);
     };
-    if !is_identifier_name(&fn_name) {
+    if !is_external_function_identifier(&fn_name) {
         return Ok(None);
     }
 
@@ -96,7 +99,7 @@ pub(super) fn try_eval_dynamic_external_function(
         Err(NativeFunctionResolverError::Failed { reason }) => {
             Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: format!("error calling {fn_name}: {reason}"),
+                reason: external_call_failed_reason(&fn_name, &reason),
             })
         }
     }

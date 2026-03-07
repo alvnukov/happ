@@ -79,6 +79,10 @@ target until the used surface is fully stabilized.
   - Scope: external function dispatch boundary; `FunctionDispatchMode::GoStrict`
     keeps Go-compatible identifier-only head resolution, while
     `FunctionDispatchMode::Extended` enables happ dynamic-head extension.
+- Rust: `src/gotemplates/go_compat/externalfn.rs`
+  - Go reference: `src/text/template/exec.go` (`evalFunction` / unknown-function diagnostics)
+  - Scope: shared identifier candidacy checks for external calls and canonical
+    unknown/failed function reason builders reused by runtime adapters.
 - Rust: `src/gotemplates/executor/path.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: used field-path resolution for `.`, `$`, `$var` chains, map/slice

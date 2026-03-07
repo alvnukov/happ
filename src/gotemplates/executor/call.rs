@@ -1,7 +1,10 @@
 use super::{
-    eval_command_token_value, format_value_for_print, is_identifier_name, strip_outer_parens,
-    wrong_number_of_args, EvalState, NativeFunctionResolver, NativeFunctionResolverError,
-    NativeRenderError,
+    eval_command_token_value, format_value_for_print, strip_outer_parens, wrong_number_of_args,
+    EvalState, NativeFunctionResolver, NativeFunctionResolverError, NativeRenderError,
+};
+use crate::gotemplates::go_compat::externalfn::{
+    external_call_failed_reason, is_call_builtin_identifier_candidate,
+    is_external_function_identifier, undefined_function_reason,
 };
 use super::typeutil::value_type_name_for_template;
 use serde_json::Value;
@@ -36,11 +39,11 @@ pub(super) fn eval_call_builtin(
     let first_value = if let Some(first) = first_token {
         // Go parity: keywords `nil`, `true`, `false` are literals, not function names,
         // even when used as first argument of `call`.
-        if is_identifier_name(first) && !matches!(first, "nil" | "true" | "false") {
+        if is_call_builtin_identifier_candidate(first) {
             let Some(resolver) = resolver else {
                 return Err(NativeRenderError::UnsupportedAction {
                     action: action.to_string(),
-                    reason: format!("\"{first}\" is not a defined function"),
+                    reason: undefined_function_reason(first),
                 });
             };
             if has_pipe_input {
@@ -73,7 +76,7 @@ pub(super) fn eval_call_builtin(
     }
 
     if let Value::String(ref name) = value {
-        if is_identifier_name(name) {
+        if is_external_function_identifier(name) {
             if let Some(resolver) = resolver {
                 return call_named_external_function(action, name, &args, resolver);
             }
@@ -101,13 +104,13 @@ fn call_named_external_function(
         Err(NativeFunctionResolverError::UnknownFunction) => {
             Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: format!("\"{name}\" is not a defined function"),
+                reason: undefined_function_reason(name),
             })
         }
         Err(NativeFunctionResolverError::Failed { reason }) => {
             Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: format!("error calling {name}: {reason}"),
+                reason: external_call_failed_reason(name, &reason),
             })
         }
     }
