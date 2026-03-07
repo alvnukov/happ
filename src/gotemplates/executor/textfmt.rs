@@ -1,3 +1,4 @@
+use crate::gotemplates::go_compat::textfmt::js_requires_escape;
 use crate::gotemplates::typedvalue::{decode_go_string_bytes_value, go_string_bytes_len};
 use serde_json::Value;
 
@@ -166,11 +167,18 @@ fn js_escape(input: &str) -> String {
             continue;
         }
 
-        if ch.is_control() {
+        if js_requires_escape(ch) {
             let v = ch as u32;
-            let code = format!("{v:04X}");
-            out.push_str("\\u");
-            out.push_str(&code);
+            out.push('\\');
+            out.push('u');
+            if v <= 0xFFFF {
+                let code = format!("{v:04X}");
+                out.push_str(&code);
+            } else {
+                // Keep current behavior for non-BMP runes (Go writes \u%04X).
+                let code = format!("{v:X}");
+                out.push_str(&code);
+            }
         } else {
             out.push(ch);
         }
@@ -205,6 +213,17 @@ mod tests {
     fn builtin_js_escapes_special_ascii_as_go_style() {
         let out = builtin_js(&[Some(Value::String("<x&'\\\"=\\n>".to_string()))]);
         assert_eq!(out, "\\u003Cx\\u0026\\'\\\\\\\"\\u003D\\\\n\\u003E");
+    }
+
+    #[test]
+    fn builtin_js_escapes_go_non_print_unicode_runes() {
+        let out = builtin_js(&[Some(Value::String(
+            "\u{00A0}\u{200B}\u{2028}\u{2029}\u{FFFE}".to_string(),
+        ))]);
+        assert_eq!(out, "\\u00A0\\u200B\\u2028\\u2029\\uFFFE");
+
+        let out = builtin_js(&[Some(Value::String("ĀЖ🙂".to_string()))]);
+        assert_eq!(out, "ĀЖ🙂");
     }
 
     #[test]

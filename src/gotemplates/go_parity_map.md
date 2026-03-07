@@ -61,6 +61,9 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/funcs.go`
   - Scope: used text builtins (`print/println`) and shared argument rendering
     path for `html/js/urlquery`.
+- Rust: `src/gotemplates/go_compat/textfmt.rs`
+  - Go reference: `src/text/template/funcs.go` (`JSEscape` / `jsIsSpecial`)
+  - Scope: Go-specific Unicode escape classification used by `js` builtin.
 
 ## printf Compatibility
 
