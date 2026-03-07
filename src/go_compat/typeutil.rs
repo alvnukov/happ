@@ -141,7 +141,8 @@ mod tests {
 
     #[test]
     fn option_string_like_bytes_handles_plain_strings() {
-        let bytes = option_string_like_bytes(Some(&json!("ab"))).expect("bytes");
+        let s = json!("ab");
+        let bytes = option_string_like_bytes(Some(&s)).expect("bytes");
         assert_eq!(bytes.as_ref(), b"ab");
     }
 
