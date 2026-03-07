@@ -1,4 +1,4 @@
-use happ::gotemplates::go_compat::template::Template;
+use happ::go_compat::template::Template;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;

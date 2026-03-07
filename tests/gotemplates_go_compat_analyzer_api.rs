@@ -1,5 +1,5 @@
-use happ::gotemplates::go_compat::analyzer::Analyzer;
-use happ::gotemplates::go_compat::parse::NodeType;
+use happ::go_compat::analyzer::Analyzer;
+use happ::go_compat::parse::NodeType;
 
 #[test]
 fn go_compat_analyzer_api_analyze_source_reports_expected_fields() {
@@ -10,7 +10,7 @@ fn go_compat_analyzer_api_analyze_source_reports_expected_fields() {
             r#"{{define "main"}}{{template "known" .}}{{template "missing" .}}{{end}}{{define "known"}}K{{end}}"#,
             "{{",
             "}}",
-            happ::gotemplates::go_compat::parse::Mode::default(),
+            happ::go_compat::parse::Mode::default(),
             &[],
         )
         .expect("parse must succeed");
@@ -30,7 +30,7 @@ fn go_compat_analyzer_api_supports_custom_delimiters() {
             r#"<<define "main">><<template "missing" .>><<end>>"#,
             "<<",
             ">>",
-            happ::gotemplates::go_compat::parse::Mode::default(),
+            happ::go_compat::parse::Mode::default(),
             &[],
         )
         .expect("parse must succeed");

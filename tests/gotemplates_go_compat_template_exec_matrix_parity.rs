@@ -1,4 +1,4 @@
-use happ::gotemplates::go_compat::template::Template;
+use happ::go_compat::template::Template;
 use happ::gotemplates::{NativeFunctionResolverError, NativeRenderError, NativeRenderOptions};
 use serde_json::{json, Number, Value};
 use std::fs;

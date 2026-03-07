@@ -1,4 +1,4 @@
-use happ::gotemplates::compat::go_printf;
+use happ::go_compat::compat::go_printf;
 use happ::gotemplates::encode_go_bytes_value;
 use serde_json::{json, Number, Value};
 use std::fs;

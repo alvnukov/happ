@@ -1,4 +1,4 @@
-use happ::gotemplates::go_compat::parse::{parse, walk_list, Mode, Node, WalkControl};
+use happ::go_compat::parse::{parse, walk_list, Mode, Node, WalkControl};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -68,7 +68,7 @@ fn go_compat_parse_node_type_counts_match_go_subset() {
 }
 
 fn count_rust_nodes_flat(
-    trees: &BTreeMap<String, happ::gotemplates::go_compat::parse::Tree>,
+    trees: &BTreeMap<String, happ::go_compat::parse::Tree>,
 ) -> BTreeMap<String, usize> {
     let mut out: BTreeMap<String, usize> = BTreeMap::from([
         ("if".to_string(), 0),

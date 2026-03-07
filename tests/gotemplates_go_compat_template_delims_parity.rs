@@ -1,4 +1,4 @@
-use happ::gotemplates::go_compat::template::Template;
+use happ::go_compat::template::Template;
 use happ::gotemplates::NativeRenderError;
 use serde_json::json;
 use std::fs;

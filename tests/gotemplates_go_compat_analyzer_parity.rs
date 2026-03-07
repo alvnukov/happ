@@ -1,5 +1,5 @@
-use happ::gotemplates::go_compat::analyzer::analyze_trees;
-use happ::gotemplates::go_compat::parse::{parse, Mode, NodeType};
+use happ::go_compat::analyzer::analyze_trees;
+use happ::go_compat::parse::{parse, Mode, NodeType};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;

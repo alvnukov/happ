@@ -1,7 +1,7 @@
-use happ::gotemplates::go_compat::analyzer::{
+use happ::go_compat::analyzer::{
     collect_template_invocation_sites, unresolved_template_diagnostics,
 };
-use happ::gotemplates::go_compat::parse::{parse, Mode};
+use happ::go_compat::parse::{parse, Mode};
 
 #[test]
 fn go_compat_analyzer_diagnostics_report_unresolved_with_positions() {

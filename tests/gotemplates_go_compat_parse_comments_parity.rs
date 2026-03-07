@@ -1,4 +1,4 @@
-use happ::gotemplates::go_compat::parse::{parse, walk_list, Mode, Node, WalkControl};
+use happ::go_compat::parse::{parse, walk_list, Mode, Node, WalkControl};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;

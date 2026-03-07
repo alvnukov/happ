@@ -1,4 +1,4 @@
-use happ::gotemplates::go_compat::parse::{parse, Mode};
+use happ::go_compat::parse::{parse, Mode};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;

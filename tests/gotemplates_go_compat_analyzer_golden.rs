@@ -1,7 +1,7 @@
-use happ::gotemplates::go_compat::analyzer::{
+use happ::go_compat::analyzer::{
     analyze_trees, collect_template_invocation_sites, unresolved_template_diagnostics,
 };
-use happ::gotemplates::go_compat::parse::{parse, Mode};
+use happ::go_compat::parse::{parse, Mode};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
