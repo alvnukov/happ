@@ -33,7 +33,7 @@ mod varcheck;
 use actionparse::parse_action_kind;
 use call::eval_call_builtin;
 use collections::{builtin_index, builtin_len, builtin_slice};
-use compare::{builtin_cmp, builtin_eq, builtin_ne};
+use compare::{builtin_eq, builtin_ge, builtin_gt, builtin_le, builtin_lt, builtin_ne};
 use control::{
     eval_block_invocation, eval_if, eval_range, eval_template_invocation, eval_with,
     find_matching_end,
@@ -529,10 +529,10 @@ fn eval_builtin_function(
         "urlquery" => Some(Value::String(builtin_urlquery(args))),
         "eq" => Some(Value::Bool(builtin_eq(action, args)?)),
         "ne" => Some(Value::Bool(builtin_ne(action, args)?)),
-        "lt" => Some(Value::Bool(builtin_cmp(action, "lt", args, |o| o.is_lt())?)),
-        "le" => Some(Value::Bool(builtin_cmp(action, "le", args, |o| o.is_le())?)),
-        "gt" => Some(Value::Bool(builtin_cmp(action, "gt", args, |o| o.is_gt())?)),
-        "ge" => Some(Value::Bool(builtin_cmp(action, "ge", args, |o| o.is_ge())?)),
+        "lt" => Some(Value::Bool(builtin_lt(action, args)?)),
+        "le" => Some(Value::Bool(builtin_le(action, args)?)),
+        "gt" => Some(Value::Bool(builtin_gt(action, args)?)),
+        "ge" => Some(Value::Bool(builtin_ge(action, args)?)),
         _ => {
             return Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),

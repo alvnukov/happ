@@ -103,32 +103,9 @@ pub(super) fn is_map_object_option(v: &Option<Value>) -> bool {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NonComparableKind {
-    Slice,
-    Map,
-}
-
-pub(super) fn non_comparable_kind_option(v: &Option<Value>) -> Option<NonComparableKind> {
-    match v.as_ref() {
-        Some(Value::Array(_)) => Some(NonComparableKind::Slice),
-        Some(value) if go_bytes_len(value).is_some() => Some(NonComparableKind::Slice),
-        Some(value) if decode_go_typed_slice_value(value).is_some() => Some(NonComparableKind::Slice),
-        Some(value)
-            if matches!(value, Value::Object(_))
-                && go_bytes_len(value).is_none()
-                && go_string_bytes_len(value).is_none()
-                && decode_go_typed_slice_value(value).is_none() =>
-        {
-            Some(NonComparableKind::Map)
-        }
-        _ => None,
-    }
-}
-
 pub(super) fn format_non_comparable_type_reason(v: &Option<Value>) -> String {
     format!(
-        "error calling eq: non-comparable type {}: {}",
+        "non-comparable type {}: {}",
         format_value_for_print(v),
         option_type_name_for_template(v)
     )
@@ -136,7 +113,7 @@ pub(super) fn format_non_comparable_type_reason(v: &Option<Value>) -> String {
 
 pub(super) fn format_non_comparable_types_reason(a: &Option<Value>, b: &Option<Value>) -> String {
     format!(
-        "error calling eq: non-comparable types {}: {}, {}: {}",
+        "non-comparable types {}: {}, {}: {}",
         format_value_for_print(a),
         option_type_name_for_template(a),
         option_type_name_for_template(b),

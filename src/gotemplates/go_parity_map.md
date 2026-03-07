@@ -32,6 +32,10 @@ This file tracks which Go stdlib sources are the reference for the Rust
   - Go reference: `src/text/template/exec.go`
   - Scope: expression evaluation, pipeline execution, command dispatch and
     non-executable command diagnostics.
+- Rust: `src/gotemplates/executor/compare.rs`
+  - Go reference: `src/text/template/funcs.go`
+  - Scope: builtin comparison semantics (`eq/ne/lt/le/gt/ge`), nil handling,
+    non-comparable diagnostics and signed/unsigned integer cross-comparison.
 
 ## printf Compatibility
 
