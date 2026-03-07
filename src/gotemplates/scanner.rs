@@ -1,5 +1,5 @@
 use super::{GoTemplateActionSpan, GoTemplateScanError, GoTemplateToken};
-use crate::go_compat::parserbridge::{
+use crate::go_compat::parse::{
     parse_action_report_with_options, ActionParseReport, ControlAction, ControlKind,
     ParseCompatOptions,
 };
