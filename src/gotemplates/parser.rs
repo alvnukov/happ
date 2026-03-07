@@ -26,6 +26,3 @@ pub(crate) fn parse_action_report_with_options(
 ) -> Result<ActionParseReport, GoTemplateScanError> {
     crate::go_compat::parse::parse_action_report_with_options(action, action_start, options)
 }
-
-#[cfg(test)]
-mod tests;

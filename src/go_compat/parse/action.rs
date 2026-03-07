@@ -819,3 +819,6 @@ fn is_term_start(kind: TokKind) -> bool {
             | TokKind::LeftParen
     )
 }
+
+#[cfg(test)]
+mod tests;
