@@ -1,9 +1,13 @@
-use super::{collect_action_spans, compat, utf8scan::push_utf8_char_from_bytes};
+use super::{
+    collect_action_spans, compat,
+    go_compat::{
+        ident::is_identifier_name as go_is_identifier_name,
+        tokenize::{split_command_tokens_simple, split_pipeline_commands_borrowed},
+    },
+};
 
 const LEFT_DELIM: &str = "{{";
 const RIGHT_DELIM: &str = "}}";
-const LEFT_COMMENT: &str = "/*";
-const RIGHT_COMMENT: &str = "*/";
 
 pub fn normalize_values_global_context(action: &str) -> String {
     const TOKEN: &str = ".Values";
@@ -116,109 +120,7 @@ fn strip_trim_markers(inner: &str) -> &str {
 }
 
 fn split_pipeline_commands(inner: &str) -> Vec<&str> {
-    #[derive(Clone, Copy)]
-    enum State {
-        Normal,
-        SingleQuote,
-        DoubleQuote,
-        RawQuote,
-        Comment,
-    }
-
-    let bytes = inner.as_bytes();
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    let mut paren_depth: i32 = 0;
-    let mut state = State::Normal;
-
-    while i < bytes.len() {
-        match state {
-            State::Normal => {
-                if starts_with(bytes, i, LEFT_COMMENT.as_bytes()) {
-                    state = State::Comment;
-                    i += LEFT_COMMENT.len();
-                    continue;
-                }
-                match bytes[i] {
-                    b'\'' => {
-                        state = State::SingleQuote;
-                        i += 1;
-                    }
-                    b'"' => {
-                        state = State::DoubleQuote;
-                        i += 1;
-                    }
-                    b'`' => {
-                        state = State::RawQuote;
-                        i += 1;
-                    }
-                    b'(' => {
-                        paren_depth += 1;
-                        i += 1;
-                    }
-                    b')' => {
-                        if paren_depth > 0 {
-                            paren_depth -= 1;
-                        }
-                        i += 1;
-                    }
-                    b'|' if paren_depth == 0 => {
-                        let cmd = inner[start..i].trim();
-                        if !cmd.is_empty() {
-                            out.push(cmd);
-                        }
-                        start = i + 1;
-                        i += 1;
-                    }
-                    _ => i += 1,
-                }
-            }
-            State::SingleQuote => {
-                if bytes[i] == b'\\' {
-                    i = i.saturating_add(2);
-                    continue;
-                }
-                if bytes[i] == b'\'' {
-                    state = State::Normal;
-                }
-                i += 1;
-            }
-            State::DoubleQuote => {
-                if bytes[i] == b'\\' {
-                    i = i.saturating_add(2);
-                    continue;
-                }
-                if bytes[i] == b'"' {
-                    state = State::Normal;
-                }
-                i += 1;
-            }
-            State::RawQuote => {
-                if bytes[i] == b'`' {
-                    state = State::Normal;
-                }
-                i += 1;
-            }
-            State::Comment => {
-                if starts_with(bytes, i, RIGHT_COMMENT.as_bytes()) {
-                    state = State::Normal;
-                    i += RIGHT_COMMENT.len();
-                    continue;
-                }
-                i += 1;
-            }
-        }
-    }
-
-    if start <= inner.len() {
-        let cmd = inner[start..].trim();
-        if !cmd.is_empty() {
-            out.push(cmd);
-        }
-    }
-
-    out
+    split_pipeline_commands_borrowed(inner)
 }
 
 fn command_function_name(command: &str) -> Option<String> {
@@ -252,7 +154,7 @@ fn command_function_name(command: &str) -> Option<String> {
     }
     if is_non_function_token(&candidate)
         || is_go_template_keyword(&candidate)
-        || !is_identifier_name(&candidate)
+        || !go_is_identifier_name(&candidate)
     {
         return None;
     }
@@ -260,98 +162,7 @@ fn command_function_name(command: &str) -> Option<String> {
 }
 
 fn split_command_tokens(command: &str) -> Vec<String> {
-    #[derive(Clone, Copy)]
-    enum State {
-        Normal,
-        SingleQuote,
-        DoubleQuote,
-        RawQuote,
-    }
-
-    let bytes = command.as_bytes();
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut i = 0usize;
-    let mut state = State::Normal;
-
-    while i < bytes.len() {
-        match state {
-            State::Normal => {
-                if bytes[i].is_ascii_whitespace() {
-                    if !buf.is_empty() {
-                        out.push(std::mem::take(&mut buf));
-                    }
-                    i += 1;
-                    continue;
-                }
-                match bytes[i] {
-                    b'\'' => {
-                        state = State::SingleQuote;
-                        buf.push('\'');
-                        i += 1;
-                    }
-                    b'"' => {
-                        state = State::DoubleQuote;
-                        buf.push('"');
-                        i += 1;
-                    }
-                    b'`' => {
-                        state = State::RawQuote;
-                        buf.push('`');
-                        i += 1;
-                    }
-                    _ => {
-                        i = push_utf8_char_from_bytes(bytes, i, &mut buf);
-                    }
-                }
-            }
-            State::SingleQuote => {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    buf.push('\\');
-                    i += 1;
-                    i = push_utf8_char_from_bytes(bytes, i, &mut buf);
-                    continue;
-                }
-                if bytes[i] == b'\'' {
-                    buf.push('\'');
-                    state = State::Normal;
-                    i += 1;
-                    continue;
-                }
-                i = push_utf8_char_from_bytes(bytes, i, &mut buf);
-            }
-            State::DoubleQuote => {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    buf.push('\\');
-                    i += 1;
-                    i = push_utf8_char_from_bytes(bytes, i, &mut buf);
-                    continue;
-                }
-                if bytes[i] == b'"' {
-                    buf.push('"');
-                    state = State::Normal;
-                    i += 1;
-                    continue;
-                }
-                i = push_utf8_char_from_bytes(bytes, i, &mut buf);
-            }
-            State::RawQuote => {
-                if bytes[i] == b'`' {
-                    buf.push('`');
-                    state = State::Normal;
-                    i += 1;
-                    continue;
-                }
-                i = push_utf8_char_from_bytes(bytes, i, &mut buf);
-            }
-        }
-    }
-
-    if !buf.is_empty() {
-        out.push(buf);
-    }
-
-    out
+    split_command_tokens_simple(command)
 }
 
 fn is_non_function_token(token: &str) -> bool {
@@ -382,23 +193,6 @@ fn is_go_template_keyword(token: &str) -> bool {
         token,
         "if" | "else" | "end" | "range" | "with" | "define" | "block" | "template"
     )
-}
-
-fn is_identifier_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first == '_' || first.is_alphabetic()) {
-        return false;
-    }
-    chars.all(|ch| ch == '_' || ch.is_alphanumeric())
-}
-
-fn starts_with(haystack: &[u8], offset: usize, needle: &[u8]) -> bool {
-    haystack
-        .get(offset..offset.saturating_add(needle.len()))
-        .is_some_and(|chunk| chunk == needle)
 }
 
 fn is_space(b: u8) -> bool {

@@ -46,10 +46,9 @@ use exprkind::{
     decode_string_literal, is_complex_expression, is_niladic_function_expression, is_quoted_string,
 };
 use externalfn::{try_eval_dynamic_external_function, try_eval_external_function};
+use crate::gotemplates::go_compat::ident::is_identifier_name as go_is_identifier_name;
 use govaluefmt::format_value_like_go;
-use path::{
-    is_identifier_continue_char, is_identifier_start_char, resolve_simple_path,
-};
+use path::resolve_simple_path;
 use pipeline_decl::{extract_pipeline_declaration, PipelineDeclMode, PipelineDeclaration};
 use rangeeval::{apply_range_iteration_bindings, range_items};
 use textfmt::{builtin_html, builtin_js, builtin_print, builtin_urlquery, format_value_for_print};
@@ -482,14 +481,7 @@ fn split_template_set(
 }
 
 pub(super) fn is_identifier_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !is_identifier_start_char(first) {
-        return false;
-    }
-    chars.all(is_identifier_continue_char)
+    go_is_identifier_name(name)
 }
 
 fn is_builtin_function_name(name: &str) -> bool {

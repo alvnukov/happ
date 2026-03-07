@@ -1,4 +1,6 @@
-use happ::gotemplates::parse_template_tokens_strict;
+use happ::gotemplates::{
+    parse_template_tokens_strict_with_options, ParseCompatOptions,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -94,7 +96,15 @@ fn gotemplates_error_matrix_matches_go_parse_package() {
     );
 
     for (idx, (src, expected_code)) in cases.iter().enumerate() {
-        let rust_code = parse_template_tokens_strict(src)
+        let rust_code = parse_template_tokens_strict_with_options(
+            src,
+            ParseCompatOptions {
+                skip_func_check: false,
+                known_functions: &["print", "printf"],
+                check_variables: true,
+                visible_variables: &[],
+            },
+        )
             .err()
             .map(|e| e.code.to_string());
         let go_code = go_codes[idx].clone();
@@ -178,6 +188,9 @@ fn map_go_error_to_code(msg: &str) -> Option<&'static str> {
     }
     if msg.contains("undefined variable") {
         return Some("undefined_variable");
+    }
+    if msg.contains("function \"") && msg.contains("\" not defined") {
+        return Some("undefined_function");
     }
     if msg.contains("too many declarations") {
         return Some("too_many_declarations");

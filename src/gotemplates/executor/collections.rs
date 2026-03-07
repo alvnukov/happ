@@ -191,6 +191,7 @@ pub(super) fn builtin_index(
                     ),
                 });
             }
+            None => unreachable!("index cursor None is handled before match"),
         };
         cur = next;
     }

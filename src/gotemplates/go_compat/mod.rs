@@ -1,4 +1,15 @@
 pub mod analyzer;
+pub mod commandkind;
+pub mod expr;
+pub mod ident;
 pub mod parse;
+pub mod path;
+pub mod pipeline_decl;
+pub mod rangeeval;
 pub mod template;
 pub mod textfmt;
+pub mod tokenize;
+pub mod trim;
+pub mod truth;
+pub mod typeutil;
+pub mod valuefmt;

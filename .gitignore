@@ -5,6 +5,7 @@ dist/
 web/node_modules/
 web/test-results/
 web/test-artifacts/
+.tmp/
 
 # Local upstream research (do not commit)
 _upstream/

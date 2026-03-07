@@ -20,6 +20,31 @@ target until the used surface is fully stabilized.
 - Rust: `src/gotemplates/scanner.rs`
   - Go reference: `src/text/template/parse/lex.go`
   - Scope: action token scanning, delimiter handling, string/comment boundaries.
+- Rust: `src/gotemplates/go_compat/tokenize.rs`
+  - Go reference: `src/text/template/parse/parse.go`, `src/text/template/parse/lex.go`
+  - Scope: reusable command/pipeline token boundaries and outer-parentheses
+    handling shared by executor and function-call analysis.
+- Rust: `src/gotemplates/go_compat/ident.rs`
+  - Go reference: `src/text/template/parse/lex.go`
+  - Scope: shared Go identifier start/continue/name checks used across parser
+    and executor-side analyzers.
+- Rust: `src/gotemplates/go_compat/expr.rs`
+  - Go reference: `src/text/template/parse/parse.go` (expression-shape checks)
+  - Scope: quoted-string, complex-expression and niladic-identifier classifiers.
+- Rust: `src/gotemplates/go_compat/pipeline_decl.rs`
+  - Go reference: `src/text/template/parse/parse.go`
+  - Scope: extraction of pipeline declaration prefixes (`$x :=`, `$i, $v =`).
+- Rust: `src/gotemplates/go_compat/path.rs`
+  - Go reference: `src/text/template/exec.go`
+  - Scope: variable reference splitting (`$`, `$x`, `$x.y`), path segment/token checks,
+    runtime simple-path traversal and Go-style path type naming/error reasons.
+- Rust: `src/gotemplates/go_compat/commandkind.rs`
+  - Go reference: `src/text/template/exec.go` (`notAFunction` and command-kind checks)
+  - Scope: non-executable head detection, non-function targets, field-like command paths.
+- Rust: `src/gotemplates/go_compat/typeutil.rs`
+  - Go reference: `src/text/template/exec.go`, `src/text/template/funcs.go`
+  - Scope: slice/index argument normalization, map-key coercion, string-like byte helpers
+    and shared Go type-name classification used by compare/collections paths.
 
 ## Builtins and Rendering
 
@@ -64,6 +89,15 @@ target until the used surface is fully stabilized.
 - Rust: `src/gotemplates/go_compat/textfmt.rs`
   - Go reference: `src/text/template/funcs.go` (`JSEscape` / `jsIsSpecial`)
   - Scope: Go-specific Unicode escape classification used by `js` builtin.
+- Rust: `src/gotemplates/go_compat/trim.rs`
+  - Go reference: `src/text/template/parse/lex.go`
+  - Scope: trim-marker and ASCII whitespace helpers for `{{-` / `-}}` handling.
+- Rust: `src/gotemplates/go_compat/valuefmt.rs`
+  - Go reference: `src/text/template/exec.go` (`printableValue`) + Go fmt defaults
+  - Scope: Go-like formatting for rendered values, including typed map/slice/bytes.
+- Rust: `src/gotemplates/go_compat/truth.rs`
+  - Go reference: `src/text/template/exec.go`, `src/text/template/funcs.go`
+  - Scope: core truthiness + `and`/`or` short-circuit value selection semantics.
 
 ## printf Compatibility
 

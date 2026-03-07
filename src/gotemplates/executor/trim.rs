@@ -1,3 +1,7 @@
+use crate::gotemplates::go_compat::trim::{
+    has_left_trim_marker, has_right_trim_marker, trim_left_ascii_whitespace,
+    trim_right_ascii_whitespace_in_place,
+};
 use crate::gotemplates::GoTemplateToken;
 
 pub(super) fn apply_lexical_trims(tokens: &mut [GoTemplateToken]) {
@@ -17,54 +21,6 @@ pub(super) fn apply_lexical_trims(tokens: &mut [GoTemplateToken]) {
             }
         }
     }
-}
-
-fn has_left_trim_marker(action: &str) -> bool {
-    if action.len() < 4 {
-        return false;
-    }
-    let bytes = action.as_bytes();
-    bytes.get(2) == Some(&b'-') && bytes.get(3).is_some_and(u8::is_ascii_whitespace)
-}
-
-fn has_right_trim_marker(action: &str) -> bool {
-    if action.len() < 4 || !action.ends_with("}}") {
-        return false;
-    }
-    let bytes = action.as_bytes();
-    let dash = bytes.len().saturating_sub(3);
-    let prev = bytes.len().saturating_sub(4);
-    bytes.get(dash).copied() == Some(b'-')
-        && bytes
-            .get(prev)
-            .copied()
-            .is_some_and(|b| b.is_ascii_whitespace())
-}
-
-fn trim_left_ascii_whitespace(s: &str) -> &str {
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() {
-            i += 1;
-        } else {
-            break;
-        }
-    }
-    &s[i..]
-}
-
-fn trim_right_ascii_whitespace_in_place(out: &mut String) {
-    let bytes = out.as_bytes();
-    let mut end = bytes.len();
-    while end > 0 {
-        if bytes[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        } else {
-            break;
-        }
-    }
-    out.truncate(end);
 }
 
 #[cfg(test)]

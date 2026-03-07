@@ -1,49 +1,24 @@
-use super::is_identifier_name;
-use crate::gotemplates::compat;
+use crate::gotemplates::go_compat::expr::{
+    decode_string_literal as go_decode_string_literal,
+    is_complex_expression as go_is_complex_expression,
+    is_niladic_function_expression as go_is_niladic_function_expression,
+    is_quoted_string as go_is_quoted_string,
+};
 
 pub(super) fn decode_string_literal(inner: &str) -> Option<String> {
-    compat::decode_go_string_literal(inner)
+    go_decode_string_literal(inner)
 }
 
 pub(super) fn is_quoted_string(inner: &str) -> bool {
-    inner.len() >= 2
-        && ((inner.starts_with('"') && inner.ends_with('"'))
-            || (inner.starts_with('`') && inner.ends_with('`')))
+    go_is_quoted_string(inner)
 }
 
 pub(super) fn is_complex_expression(expr: &str) -> bool {
-    if expr.is_empty() {
-        return false;
-    }
-    if is_quoted_string(expr) {
-        return false;
-    }
-    if expr.contains('|')
-        || expr.contains('(')
-        || expr.contains(')')
-        || expr.contains(":=")
-        || expr.contains(',')
-    {
-        return true;
-    }
-    if expr.contains('=') && !expr.starts_with('=') {
-        return true;
-    }
-    if expr.contains(char::is_whitespace) {
-        return true;
-    }
-    false
+    go_is_complex_expression(expr)
 }
 
 pub(super) fn is_niladic_function_expression(expr: &str) -> bool {
-    let trimmed = expr.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if matches!(trimmed, "true" | "false" | "nil") {
-        return false;
-    }
-    is_identifier_name(trimmed)
+    go_is_niladic_function_expression(expr)
 }
 
 #[cfg(test)]

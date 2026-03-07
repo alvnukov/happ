@@ -1,57 +1,18 @@
-use super::{
-    decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_len, go_string_bytes_len,
+use crate::gotemplates::go_compat::truth::{
+    builtin_and as go_builtin_and, builtin_or as go_builtin_or, is_truthy as go_is_truthy,
 };
 use serde_json::Value;
 
 pub(super) fn is_truthy(v: &Option<Value>) -> bool {
-    let Some(value) = v.as_ref() else {
-        return false;
-    };
-    if let Some(len) = go_bytes_len(value).or_else(|| go_string_bytes_len(value)) {
-        return len > 0;
-    }
-    if let Some(typed_map) = decode_go_typed_map_value(value) {
-        return typed_map.entries.is_some_and(|entries| !entries.is_empty());
-    }
-    if let Some(typed_slice) = decode_go_typed_slice_value(value) {
-        return typed_slice.items.is_some_and(|items| !items.is_empty());
-    }
-    match value {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => {
-            n.as_i64().is_some_and(|i| i != 0)
-                || n.as_u64().is_some_and(|u| u != 0)
-                || n.as_f64().is_some_and(|f| f != 0.0)
-        }
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
+    go_is_truthy(v.as_ref())
 }
 
 pub(super) fn builtin_and(args: &[Option<Value>]) -> Option<Value> {
-    if args.is_empty() {
-        return None;
-    }
-    for arg in args {
-        if !is_truthy(arg) {
-            return arg.clone();
-        }
-    }
-    args.last().cloned().unwrap_or(None)
+    go_builtin_and(args)
 }
 
 pub(super) fn builtin_or(args: &[Option<Value>]) -> Option<Value> {
-    if args.is_empty() {
-        return None;
-    }
-    for arg in args {
-        if is_truthy(arg) {
-            return arg.clone();
-        }
-    }
-    args.last().cloned().unwrap_or(None)
+    go_builtin_or(args)
 }
 
 #[cfg(test)]

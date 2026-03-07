@@ -591,8 +591,13 @@ fn native_renderer_allows_field_with_args_when_dot_is_nil_like_go() {
     assert_eq!(out, "<no value>");
 
     let data = json!({});
-    let out = render_template_native("{{.x 2}}", &data).expect("must render");
-    assert_eq!(out, "<no value>");
+    let err = render_template_native("{{.x 2}}", &data).expect_err("must fail");
+    match err {
+        NativeRenderError::UnsupportedAction { reason, .. } => {
+            assert!(reason.contains("x is not a method but has arguments"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
     let out = render_template_native("{{.a.b 2}}", &data).expect("must render");
     assert_eq!(out, "<no value>");
 }

@@ -1,4 +1,7 @@
 use super::{GoTemplateScanError, Tok, TokKind};
+use crate::gotemplates::go_compat::ident::{
+    is_identifier_continue_char, is_identifier_start_char,
+};
 // Go parity reference: stdlib text/template/parse/lex.go.
 
 pub(super) fn lex_action_inner(src: &str, abs_base: usize) -> Result<Vec<Tok>, GoTemplateScanError> {
@@ -457,14 +460,6 @@ fn decode_utf8_char(bytes: &[u8], start: usize) -> Option<(char, usize)> {
     let tail = std::str::from_utf8(bytes.get(start..)?).ok()?;
     let ch = tail.chars().next()?;
     Some((ch, start + ch.len_utf8()))
-}
-
-fn is_identifier_start_char(ch: char) -> bool {
-    ch == '_' || ch.is_alphabetic()
-}
-
-fn is_identifier_continue_char(ch: char) -> bool {
-    ch == '_' || ch.is_alphanumeric()
 }
 
 fn is_number_digit(b: u8, base: u8) -> bool {

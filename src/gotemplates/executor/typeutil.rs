@@ -1,22 +1,17 @@
-use super::{
-    decode_go_string_bytes_value, decode_go_typed_map_value, decode_go_typed_slice_value,
-    format_value_for_print, go_bytes_len, go_string_bytes_len, NativeRenderError,
+use super::{format_value_for_print, NativeRenderError};
+use crate::gotemplates::go_compat::typeutil::{
+    is_go_bytes_slice as go_is_go_bytes_slice, is_map_object as go_is_map_object,
+    map_key_arg as go_map_key_arg, option_string_like_bytes as go_option_string_like_bytes,
+    option_type_name_for_template as go_option_type_name_for_template,
+    parse_slice_like_index as go_parse_slice_like_index,
+    value_from_go_string_bytes as go_value_from_go_string_bytes,
+    value_type_name_for_template as go_value_type_name_for_template, ParseSliceLikeIndexError,
+    SliceLikeIndexMode,
 };
 use serde_json::Value;
 use std::borrow::Cow;
 
-fn value_to_i64(v: &Option<Value>) -> Option<i64> {
-    match v.as_ref() {
-        Some(Value::Number(n)) => {
-            if let Some(i) = n.as_i64() {
-                Some(i)
-            } else {
-                n.as_u64().map(|u| u as i64)
-            }
-        }
-        _ => None,
-    }
-}
+pub(super) use crate::gotemplates::go_compat::typeutil::MapKeyArg;
 
 pub(super) fn parse_slice_like_index(
     action: &str,
@@ -24,83 +19,47 @@ pub(super) fn parse_slice_like_index(
     idx_arg: &Option<Value>,
     cap: usize,
 ) -> Result<usize, NativeRenderError> {
-    let raw = match idx_arg.as_ref() {
-        None | Some(Value::Null) => {
-            return Err(NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: format!("error calling {call_name}: cannot index slice/array with nil"),
-            });
-        }
-        Some(v) => value_to_i64(idx_arg).ok_or_else(|| NativeRenderError::UnsupportedAction {
+    let mode = if call_name == "index" {
+        SliceLikeIndexMode::Index
+    } else {
+        SliceLikeIndexMode::Slice
+    };
+    go_parse_slice_like_index(idx_arg.as_ref(), cap, mode).map_err(|err| match err {
+        ParseSliceLikeIndexError::Nil => NativeRenderError::UnsupportedAction {
+            action: action.to_string(),
+            reason: format!("error calling {call_name}: cannot index slice/array with nil"),
+        },
+        ParseSliceLikeIndexError::WrongType { type_name } => NativeRenderError::UnsupportedAction {
             action: action.to_string(),
             reason: format!(
-                "error calling {call_name}: cannot index slice/array with type {}",
-                value_type_name_for_template(v)
+                "error calling {call_name}: cannot index slice/array with type {type_name}"
             ),
-        })?,
-    };
-    let out_of_range = if call_name == "index" {
-        raw < 0 || raw as usize >= cap
-    } else {
-        raw < 0 || raw as usize > cap
-    };
-    if out_of_range {
-        return Err(NativeRenderError::UnsupportedAction {
+        },
+        ParseSliceLikeIndexError::OutOfRange { raw } => NativeRenderError::UnsupportedAction {
             action: action.to_string(),
             reason: format!("error calling {call_name}: index out of range: {raw}"),
-        });
-    }
-    Ok(raw as usize)
+        },
+    })
 }
 
 pub(super) fn value_from_go_string_bytes(bytes: Vec<u8>) -> Value {
-    match String::from_utf8(bytes) {
-        Ok(s) => Value::String(s),
-        Err(err) => crate::gotemplates::encode_go_string_bytes_value(&err.into_bytes()),
-    }
-}
-
-pub(super) enum MapKeyArg {
-    Key(String),
-    StringLikeNonUtf8,
-    WrongType,
+    go_value_from_go_string_bytes(bytes)
 }
 
 pub(super) fn map_key_arg(v: &Option<Value>) -> MapKeyArg {
-    match v.as_ref() {
-        Some(Value::String(s)) => MapKeyArg::Key(s.clone()),
-        Some(other) if go_string_bytes_len(other).is_some() => {
-            let Some(bytes) = decode_go_string_bytes_value(other) else {
-                return MapKeyArg::StringLikeNonUtf8;
-            };
-            match String::from_utf8(bytes) {
-                Ok(s) => MapKeyArg::Key(s),
-                Err(_) => MapKeyArg::StringLikeNonUtf8,
-            }
-        }
-        _ => MapKeyArg::WrongType,
-    }
+    go_map_key_arg(v.as_ref())
 }
 
 pub(super) fn option_string_like_bytes(v: &Option<Value>) -> Option<Cow<'_, [u8]>> {
-    match v.as_ref() {
-        Some(Value::String(s)) => Some(Cow::Borrowed(s.as_bytes())),
-        Some(other) => decode_go_string_bytes_value(other).map(Cow::Owned),
-        None => None,
-    }
+    go_option_string_like_bytes(v.as_ref())
 }
 
 pub(super) fn is_go_bytes_slice_option(v: &Option<Value>) -> bool {
-    v.as_ref().is_some_and(|value| go_bytes_len(value).is_some())
+    v.as_ref().is_some_and(go_is_go_bytes_slice)
 }
 
 pub(super) fn is_map_object_option(v: &Option<Value>) -> bool {
-    v.as_ref().is_some_and(|value| {
-        matches!(value, Value::Object(_))
-            && go_bytes_len(value).is_none()
-            && go_string_bytes_len(value).is_none()
-            && decode_go_typed_slice_value(value).is_none()
-    })
+    v.as_ref().is_some_and(go_is_map_object)
 }
 
 pub(super) fn format_non_comparable_type_reason(v: &Option<Value>) -> String {
@@ -122,41 +81,11 @@ pub(super) fn format_non_comparable_types_reason(a: &Option<Value>, b: &Option<V
 }
 
 pub(super) fn option_type_name_for_template(v: &Option<Value>) -> String {
-    match v.as_ref() {
-        Some(value) => value_type_name_for_template(value),
-        None => "<nil>".to_string(),
-    }
+    go_option_type_name_for_template(v.as_ref())
 }
 
 pub(super) fn value_type_name_for_template(v: &Value) -> String {
-    if go_bytes_len(v).is_some() {
-        return "[]uint8".to_string();
-    }
-    if go_string_bytes_len(v).is_some() {
-        return "string".to_string();
-    }
-    if let Some(typed_slice) = decode_go_typed_slice_value(v) {
-        return format!("[]{}", typed_slice.elem_type);
-    }
-    if let Some(typed_map) = decode_go_typed_map_value(v) {
-        return format!("map[string]{}", typed_map.elem_type);
-    }
-    match v {
-        Value::Null => "<nil>".to_string(),
-        Value::Bool(_) => "bool".to_string(),
-        Value::String(_) => "string".to_string(),
-        Value::Array(_) => "[]interface {}".to_string(),
-        Value::Object(_) => "map[string]interface {}".to_string(),
-        Value::Number(n) => {
-            if n.as_i64().is_some() {
-                "int".to_string()
-            } else if n.as_u64().is_some() {
-                "uint".to_string()
-            } else {
-                "float64".to_string()
-            }
-        }
-    }
+    go_value_type_name_for_template(v)
 }
 
 #[cfg(test)]
