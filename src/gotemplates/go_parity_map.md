@@ -22,6 +22,10 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/parse/parse.go`
   - Scope: pipeline parsing, command parsing, declaration handling, undefined
     function checks, undefined variable checks.
+- Rust: `src/go_compat/parse/report.rs`
+  - Go reference: `src/text/template/parse/parse.go`
+  - Scope: shared parse compatibility report model (`ParseCompatOptions`, control actions,
+    declared/assigned/referenced variable spans) reused by parser/scanner and go_compat bridge.
 - Rust: `src/gotemplates/parser/lex.rs`
   - Go reference: `src/text/template/parse/lex.go`
   - Scope: action lexing, token classification, number and identifier scanning.

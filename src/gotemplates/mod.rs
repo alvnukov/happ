@@ -20,7 +20,7 @@ pub use functions::{
     collect_function_calls_in_action, collect_function_calls_in_template, escape_template_action,
     normalize_values_global_context,
 };
-pub use parser::ParseCompatOptions;
+pub use crate::go_compat::parse::report::ParseCompatOptions;
 pub use planner::{plan_template_execution, CompatibilityReason, CompatibilityTier, ExecutionPlan};
 pub use scanner::{
     collect_action_spans, contains_template_markup, parse_template_tokens,

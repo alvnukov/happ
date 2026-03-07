@@ -1,5 +1,6 @@
 pub mod node;
 mod parser;
+pub mod report;
 pub mod tree;
 pub mod walk;
 
@@ -8,5 +9,6 @@ pub use node::{
     IfNode, ListNode, Node, NodeType, Pos, RangeNode, TemplateNode, TextNode, WithNode,
 };
 pub use parser::parse;
+pub use report::{ActionParseReport, ControlAction, ControlKind, ParseCompatOptions, VariableRef};
 pub use tree::{Mode, ParseError, Tree};
 pub use walk::{walk_list, WalkControl};

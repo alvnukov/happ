@@ -1,6 +1,6 @@
 use super::collect_action_spans;
 use super::functions::collect_function_calls_in_action;
-use super::parser::{parse_action_compat, ControlAction};
+use crate::go_compat::parserbridge::{parse_action_compat, ControlAction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatibilityTier {
