@@ -757,6 +757,13 @@ fn native_renderer_supports_variable_declarations_without_spaces() {
 }
 
 #[test]
+fn native_renderer_supports_digit_started_variable_names_like_go() {
+    let data = json!({});
+    let out = render_template_native("{{ $1 := 7 }}{{ $1 }}", &data).expect("must render");
+    assert_eq!(out, "7");
+}
+
+#[test]
 fn native_renderer_supports_range_variable_declarations() {
     let data = json!({"items":["a","b"]});
     let out = render_template_native("{{range $i, $v := .items}}{{$i}}={{$v}};{{end}}", &data)

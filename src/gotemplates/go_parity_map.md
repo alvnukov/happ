@@ -3,6 +3,11 @@
 This file tracks which Go stdlib sources are the reference for the Rust
 `gotemplates` implementation.
 
+The current priority is the builtins and execution branches observed in the
+real chart corpus (`helm-apps` + integration examples). Less-used branches
+(`call`, html/js/urlquery edge cases) are kept but are not the primary parity
+target until the used surface is fully stabilized.
+
 ## Parser and Scanner
 
 - Rust: `src/gotemplates/parser.rs`
@@ -31,7 +36,7 @@ This file tracks which Go stdlib sources are the reference for the Rust
 - Rust: `src/gotemplates/executor/eval.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: expression evaluation, pipeline execution, command dispatch and
-    non-executable command diagnostics.
+    non-executable command diagnostics, field-with-arguments errors.
 - Rust: `src/gotemplates/executor/path.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: used field-path resolution for `.`, `$`, `$var` chains, map/slice

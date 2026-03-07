@@ -263,23 +263,6 @@ fn eval_pipeline_command(
                 return Ok(None);
             }
             if is_map_like_for_field_call(&receiver) {
-                let value = eval_command_token_value(action, head, root, dot, state, resolver)?;
-                if value.is_none() || value == Some(Value::Null) {
-                    // Go parity (text/template exec): preserve `<no value>` style behavior for
-                    // top-level dot/root field misses, but keep method-arg errors for nested paths.
-                    if !field_path.has_receiver_tail
-                        && matches!(field_path.receiver_expr.as_str(), "." | "$")
-                    {
-                        return Ok(None);
-                    }
-                    return Err(NativeRenderError::UnsupportedAction {
-                        action: action.to_string(),
-                        reason: format!(
-                            "{} is not a method but has arguments",
-                            field_path.field_name
-                        ),
-                    });
-                }
                 return Err(NativeRenderError::UnsupportedAction {
                     action: action.to_string(),
                     reason: format!(
