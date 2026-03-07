@@ -14,6 +14,10 @@ const IGNORED_IMPORTED_METADATA_LABEL_KEYS: &[&str] = &[
     "app.kubernetes.io/component",
 ];
 
+// helm-apps label helpers always render these keys.
+// Keeping the same keys in imported labels produces duplicate YAML map entries.
+const HELPER_RESERVED_METADATA_LABEL_KEYS: &[&str] = &["app", "chart"];
+
 pub fn build_values(args: &ImportArgs, docs: &[Value]) -> Result<Value, String> {
     if is_helpers_strategy(&args.import_strategy) {
         return build_values_helpers_experimental(args, docs);
@@ -110,7 +114,7 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
                     push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
                 }
             }
-            "NetworkPolicy" => {
+            "NetworkPolicy" | "CiliumNetworkPolicy" => {
                 if let Some((app_key, app)) = map_network_policy_to_apps_network_policies(m) {
                     insert_group_with_dedupe(&mut apps_network_policies, &app_key, app);
                 } else {
@@ -282,19 +286,26 @@ fn convert_document_raw(args: &ImportArgs, doc: &Value, index: usize) -> Option<
         for key in IGNORED_IMPORTED_METADATA_LABEL_KEYS {
             filtered.remove(&k(key));
         }
+        if is_helpers_strategy(&args.import_strategy) {
+            for key in HELPER_RESERVED_METADATA_LABEL_KEYS {
+                filtered.remove(&k(key));
+            }
+        }
         if filtered.is_empty() {
             meta_residual.remove(&k("labels"));
         } else {
             *labels = filtered;
         }
     }
-    if let Some(s) = yaml_body_sorted(&Value::Mapping(meta_residual)) {
+    let escaped_metadata = escape_tpl_delimiters_value(&Value::Mapping(meta_residual));
+    if let Some(s) = yaml_body_sorted(&escaped_metadata) {
         app.insert(k("metadata"), Value::String(s));
     }
 
     for field in ["spec", "data", "stringData", "binaryData"] {
         if let Some(v) = top.get(&k(field)).cloned() {
-            if let Some(s) = yaml_body_sorted(&v) {
+            let escaped = escape_tpl_delimiters_value(&v);
+            if let Some(s) = yaml_body_sorted(&escaped) {
                 app.insert(k(field), Value::String(s));
             }
             top.remove(&k(field));
@@ -311,7 +322,8 @@ fn convert_document_raw(args: &ImportArgs, doc: &Value, index: usize) -> Option<
     }
 
     top.remove(&k("metadata"));
-    if let Some(s) = yaml_body_sorted(&Value::Mapping(top)) {
+    let escaped_extra = escape_tpl_delimiters_value(&Value::Mapping(top));
+    if let Some(s) = yaml_body_sorted(&escaped_extra) {
         app.insert(k("extraFields"), Value::String(s));
     }
 
@@ -580,6 +592,10 @@ fn map_service_to_apps_services(doc: &Mapping) -> Option<(String, Mapping)> {
     let mut app = Mapping::new();
     app.insert(k("enabled"), Value::Bool(true));
     app.insert(k("name"), Value::String(name.clone()));
+    let ns = metadata_namespace(doc);
+    if !ns.trim().is_empty() && ns.trim() != "default" {
+        app.insert(k("namespace"), Value::String(ns));
+    }
 
     if let Some(labels) = filter_imported_metadata_labels(metadata.get(&k("labels"))) {
         if let Some(s) = yaml_body(&labels) {
@@ -720,9 +736,27 @@ fn map_ingress_to_apps_ingresses(doc: &Mapping) -> Option<(String, Mapping)> {
 }
 
 fn map_network_policy_to_apps_network_policies(doc: &Mapping) -> Option<(String, Mapping)> {
-    if kind_of(doc) != "NetworkPolicy" {
-        return None;
-    }
+    let kind = kind_of(doc);
+    let api_version = get_str(doc, "apiVersion").unwrap_or_default();
+    let (policy_type, known_spec_keys): (&str, &[&str]) = match (kind, api_version.as_str()) {
+        ("NetworkPolicy", av) if av.starts_with("networking.k8s.io/") => {
+            ("kubernetes", &["podSelector", "policyTypes", "ingress", "egress"])
+        }
+        ("NetworkPolicy", av) if av.starts_with("projectcalico.org/") => {
+            ("calico", &["selector", "types", "ingress", "egress"])
+        }
+        ("CiliumNetworkPolicy", av) if av.starts_with("cilium.io/") => (
+            "cilium",
+            &[
+                "endpointSelector",
+                "ingress",
+                "egress",
+                "ingressDeny",
+                "egressDeny",
+            ],
+        ),
+        _ => return None,
+    };
     let name = metadata_name(doc);
     if name.is_empty() {
         return None;
@@ -734,7 +768,7 @@ fn map_network_policy_to_apps_network_policies(doc: &Mapping) -> Option<(String,
     let mut app = Mapping::new();
     app.insert(k("enabled"), Value::Bool(true));
     app.insert(k("name"), Value::String(name.clone()));
-    app.insert(k("type"), Value::String("kubernetes".to_string()));
+    app.insert(k("type"), Value::String(policy_type.to_string()));
 
     if let Some(labels) = filter_imported_metadata_labels(metadata.get(&k("labels"))) {
         if let Some(s) = yaml_body(&labels) {
@@ -747,17 +781,15 @@ fn map_network_policy_to_apps_network_policies(doc: &Mapping) -> Option<(String,
         }
     }
 
-    for key in ["podSelector", "policyTypes", "ingress", "egress"] {
+    for key in known_spec_keys {
         if let Some(v) = spec.get(&k(key)) {
             if let Some(s) = yaml_body_clean(v) {
-                app.insert(k(key), Value::String(s));
+                app.insert(k(*key), Value::String(s));
             }
         }
     }
 
-    if let Some(extra_spec) =
-        extract_by_allowed(&spec, &["podSelector", "policyTypes", "ingress", "egress"])
-    {
+    if let Some(extra_spec) = extract_by_allowed(&spec, known_spec_keys) {
         if let Some(s) = yaml_body(&Value::Mapping(extra_spec)) {
             app.insert(k("spec"), Value::String(s));
         }
@@ -1365,6 +1397,10 @@ fn map_role_doc_to_service_account_role(doc: &Mapping) -> Option<Mapping> {
     let role_name = metadata_name(doc);
     if !role_name.is_empty() {
         role.insert(k("name"), Value::String(role_name));
+    }
+    let role_ns = metadata_namespace(doc);
+    if !role_ns.trim().is_empty() && role_ns.trim() != "default" {
+        role.insert(k("namespace"), Value::String(role_ns));
     }
 
     if let Some(labels) = filter_imported_metadata_labels(metadata.get(&k("labels"))) {
@@ -2099,6 +2135,9 @@ fn filter_imported_metadata_labels(v: Option<&Value>) -> Option<Value> {
         if IGNORED_IMPORTED_METADATA_LABEL_KEYS.contains(&key.as_str()) {
             continue;
         }
+        if HELPER_RESERVED_METADATA_LABEL_KEYS.contains(&key.as_str()) {
+            continue;
+        }
         if let Some(value) = labels.get(&k(&key)).cloned() {
             out.insert(k(&key), value);
         }
@@ -2226,7 +2265,8 @@ fn yaml_body_sorted(v: &Value) -> Option<String> {
     if is_blank_container(v) {
         return None;
     }
-    let s = serde_yaml::to_string(&sort_rec(v.clone())).ok()?;
+    let sorted = sort_rec(v.clone());
+    let s = serde_yaml::to_string(&sorted).ok()?;
     let trimmed = s.trim().trim_start_matches("---").trim().to_string();
     if trimmed.is_empty() {
         None
@@ -2430,6 +2470,319 @@ spec:
         assert!(txt.contains("custom: y"));
         assert!(!txt.contains("app.kubernetes.io/name"));
     }
+
+    #[test]
+    fn helpers_experimental_drops_library_reserved_label_keys() {
+        let docs = parse_docs(
+            r#"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: demo
+  labels:
+    app: source-app
+    chart: source-chart
+    custom: keep-me
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let group = root
+            .get(&k("apps-service-accounts"))
+            .and_then(Value::as_mapping)
+            .expect("apps-service-accounts");
+        let app = group
+            .values()
+            .next()
+            .and_then(Value::as_mapping)
+            .expect("service-account app");
+        let labels_yaml = app
+            .get(&k("labels"))
+            .and_then(Value::as_str)
+            .expect("labels yaml");
+        let labels: Value = serde_yaml::from_str(labels_yaml).expect("parse labels");
+        let labels = labels.as_mapping().expect("labels map");
+        assert!(labels.contains_key(&k("custom")));
+        assert!(!labels.contains_key(&k("app")));
+        assert!(!labels.contains_key(&k("chart")));
+    }
+
+    #[test]
+    fn raw_import_keeps_non_ignored_app_label() {
+        let docs = parse_docs(
+            r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo
+  labels:
+    app: keep-app
+spec:
+  type: ClusterIP
+"#,
+        );
+        let values = build_values(&import_args("raw"), &docs).expect("values");
+        let txt = serde_yaml::to_string(&values).expect("yaml");
+        assert!(txt.contains("app: keep-app"));
+    }
+
+    #[test]
+    fn helpers_raw_fallback_drops_library_reserved_label_keys() {
+        let docs = parse_docs(
+            r#"
+apiVersion: example.com/v1
+kind: ExampleKind
+metadata:
+  name: demo
+  labels:
+    app: source-app
+    chart: source-chart
+    custom: keep-me
+spec:
+  enabled: true
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let manifests = root
+            .get(&k("apps-k8s-manifests"))
+            .and_then(Value::as_mapping)
+            .expect("apps-k8s-manifests");
+        let app = manifests
+            .values()
+            .next()
+            .and_then(Value::as_mapping)
+            .expect("manifest app");
+        let metadata_yaml = app
+            .get(&k("metadata"))
+            .and_then(Value::as_str)
+            .expect("metadata yaml");
+        let metadata: Value = serde_yaml::from_str(metadata_yaml).expect("parse metadata");
+        let labels = metadata
+            .as_mapping()
+            .and_then(|m| m.get(&k("labels")))
+            .and_then(Value::as_mapping)
+            .expect("labels map");
+        assert!(labels.contains_key(&k("custom")));
+        assert!(!labels.contains_key(&k("app")));
+        assert!(!labels.contains_key(&k("chart")));
+    }
+
+    #[test]
+    fn raw_import_escapes_go_template_markers_in_manifest_strings() {
+        let docs = parse_docs(
+            r#"
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: demo-rule
+spec:
+  groups:
+  - name: demo
+    rules:
+    - alert: Demo
+      annotations:
+        description: pod {{ $labels.pod }} is down
+      expr: up == 0
+"#,
+        );
+        let values = build_values(&import_args("raw"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let group = root
+            .get(&k("apps-k8s-manifests"))
+            .and_then(Value::as_mapping)
+            .expect("apps-k8s-manifests");
+        let app = group
+            .values()
+            .next()
+            .and_then(Value::as_mapping)
+            .expect("manifest app");
+        let spec_yaml = app
+            .get(&k("spec"))
+            .and_then(Value::as_str)
+            .expect("spec yaml");
+        assert!(spec_yaml.contains(r#"{{ "{{" }} $labels.pod {{ "}}" }}"#));
+        assert!(!spec_yaml.contains("{{ $labels.pod }}"));
+    }
+
+    #[test]
+    fn helpers_attached_role_preserves_non_default_namespace() {
+        let docs = parse_docs(
+            r#"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: demo
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leaderelection
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get","list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: leaderelection
+  namespace: kube-system
+subjects:
+  - kind: ServiceAccount
+    name: demo
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leaderelection
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let sa_group = root
+            .get(&k("apps-service-accounts"))
+            .and_then(Value::as_mapping)
+            .expect("apps-service-accounts");
+        let sa = sa_group
+            .values()
+            .next()
+            .and_then(Value::as_mapping)
+            .expect("service account");
+        let roles = sa
+            .get(&k("roles"))
+            .and_then(Value::as_mapping)
+            .expect("roles");
+        let role = roles
+            .values()
+            .next()
+            .and_then(Value::as_mapping)
+            .expect("role");
+        let namespace = role
+            .get(&k("namespace"))
+            .and_then(Value::as_str)
+            .expect("role namespace");
+        assert_eq!(namespace, "kube-system");
+    }
+
+    #[test]
+    fn helpers_service_preserves_non_default_namespace() {
+        let docs = parse_docs(
+            r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo
+  namespace: kube-system
+spec:
+  selector:
+    app: demo
+  ports:
+  - port: 80
+    targetPort: 8080
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let group = root
+            .get(&k("apps-services"))
+            .and_then(Value::as_mapping)
+            .expect("apps-services");
+        let app = group
+            .values()
+            .next()
+            .and_then(Value::as_mapping)
+            .expect("service app");
+        let ns = app
+            .get(&k("namespace"))
+            .and_then(Value::as_str)
+            .expect("service namespace");
+        assert_eq!(ns, "kube-system");
+    }
+
+    #[test]
+    fn helpers_calico_network_policy_maps_to_apps_network_policies_type_calico() {
+        let docs = parse_docs(
+            r#"
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: compat-calico-netpol
+spec:
+  selector: app == 'demo'
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let group = root
+            .get(&k("apps-network-policies"))
+            .and_then(Value::as_mapping)
+            .expect("apps-network-policies");
+        let app = group.values().next().and_then(Value::as_mapping).expect("app");
+        let ty = app
+            .get(&k("type"))
+            .and_then(Value::as_str)
+            .expect("type");
+        assert_eq!(ty, "calico");
+    }
+
+    #[test]
+    fn helpers_cilium_network_policy_maps_to_apps_network_policies_type_cilium() {
+        let docs = parse_docs(
+            r#"
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: compat-cilium-netpol
+spec:
+  endpointSelector:
+    matchLabels:
+      app: demo
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let group = root
+            .get(&k("apps-network-policies"))
+            .and_then(Value::as_mapping)
+            .expect("apps-network-policies");
+        let app = group.values().next().and_then(Value::as_mapping).expect("app");
+        let ty = app
+            .get(&k("type"))
+            .and_then(Value::as_str)
+            .expect("type");
+        assert_eq!(ty, "cilium");
+    }
+
+    #[test]
+    fn helpers_unsupported_network_policy_goes_to_raw_fallback() {
+        let docs = parse_docs(
+            r#"
+apiVersion: custom.security/v1
+kind: NetworkPolicy
+metadata:
+  name: custom-netpol
+spec:
+  selector: app == 'demo'
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        assert!(!root.contains_key(&k("apps-network-policies")));
+        let raw = root
+            .get(&k("apps-k8s-manifests"))
+            .and_then(Value::as_mapping)
+            .expect("raw fallback group");
+        let app = raw.values().next().and_then(Value::as_mapping).expect("raw app");
+        let api = app
+            .get(&k("apiVersion"))
+            .and_then(Value::as_str)
+            .expect("apiVersion");
+        assert_eq!(api, "custom.security/v1");
+    }
+
 
     #[test]
     fn helpers_experimental_maps_known_kinds_into_helper_groups() {
