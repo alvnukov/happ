@@ -45,6 +45,10 @@ target until the used surface is fully stabilized.
 - Rust: `src/gotemplates/go_compat/commandkind.rs`
   - Go reference: `src/text/template/exec.go` (`notAFunction` and command-kind checks)
   - Scope: non-executable head detection, non-function targets, field-like command paths.
+- Rust: `src/gotemplates/go_compat/call.rs`
+  - Go reference: `src/text/template/exec.go` (`evalCall` target rendering path)
+  - Scope: call-target display normalization (outer-paren stripping and fallback
+    value rendering) reused by runtime call diagnostics.
 - Rust: `src/gotemplates/go_compat/typeutil.rs`
   - Go reference: `src/text/template/exec.go`, `src/text/template/funcs.go`
   - Scope: slice/index argument normalization, map-key coercion, string-like byte helpers

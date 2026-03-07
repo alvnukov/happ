@@ -1,7 +1,8 @@
 use super::{
-    eval_command_token_value, format_value_for_print, strip_outer_parens, wrong_number_of_args,
-    EvalState, NativeFunctionResolver, NativeFunctionResolverError, NativeRenderError,
+    eval_command_token_value, wrong_number_of_args, EvalState, NativeFunctionResolver,
+    NativeFunctionResolverError, NativeRenderError,
 };
+use crate::gotemplates::go_compat::call::call_target_display;
 use crate::gotemplates::go_compat::externalfn::{
     external_call_failed_reason, is_call_builtin_identifier_candidate,
     is_external_function_identifier, undefined_function_reason,
@@ -114,15 +115,4 @@ fn call_named_external_function(
             })
         }
     }
-}
-
-fn call_target_display(token: Option<&str>, value: &Value) -> String {
-    if let Some(raw) = token {
-        let trimmed = raw.trim();
-        if let Some(inner) = strip_outer_parens(trimmed) {
-            return inner.trim().to_string();
-        }
-        return trimmed.to_string();
-    }
-    format_value_for_print(&Some(value.clone()))
 }
