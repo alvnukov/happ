@@ -17,7 +17,6 @@
 // - parse/*          -> go/src/text/template/parse/*
 // - parse/action     -> canonical parse-action API surface (bridged during migration)
 // - parse/report     -> shared parse compatibility action/control report model
-// - parserbridge     -> internal bridge to gotemplates parser/runtime types during migration
 // - path             -> go/src/text/template/exec.go
 // - pipeline_decl    -> go/src/text/template/parse/parse.go
 // - rangeeval        -> go/src/text/template/exec.go
@@ -48,7 +47,6 @@ pub mod externalfn;
 pub mod go_std;
 pub mod ident;
 pub mod parse;
-pub(crate) mod parserbridge;
 pub mod path;
 pub mod pipeline_decl;
 pub mod rangeeval;

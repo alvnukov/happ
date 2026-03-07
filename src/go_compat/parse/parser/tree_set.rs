@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
 use crate::go_compat::compat::parse_go_quoted_prefix;
-use crate::go_compat::parserbridge::{
+use crate::go_compat::parse::{
     parse_action_report_with_options, ControlAction, ControlKind, ParseCompatOptions,
+};
+use crate::go_compat::scan::{
     GoTemplateToken,
 };
 

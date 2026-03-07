@@ -1,6 +1,8 @@
-use crate::go_compat::parserbridge::{
-    parse_action_report_with_options, parse_template_tokens_strict_with_options_and_delims,
-    ControlAction, ControlKind, GoTemplateToken, ParseCompatOptions,
+use crate::go_compat::parse::{
+    parse_action_report_with_options, ControlAction, ControlKind, ParseCompatOptions,
+};
+use crate::go_compat::scan::{
+    parse_template_tokens_strict_with_options_and_delims, GoTemplateToken,
 };
 use std::collections::BTreeMap;
 

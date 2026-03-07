@@ -1,4 +1,4 @@
-use crate::go_compat::parserbridge::GoTemplateScanError;
+use crate::go_compat::scan::GoTemplateScanError;
 
 use super::node::ListNode;
 
