@@ -4,5 +4,5 @@ pub(crate) use crate::gotemplates::parser::{
     parse_action_report_with_options, ControlAction, ControlKind, ParseCompatOptions,
 };
 pub(crate) use crate::gotemplates::{
-    parse_template_tokens_strict_with_options_and_delims, GoTemplateToken,
+    parse_template_tokens_strict_with_options_and_delims, GoTemplateScanError, GoTemplateToken,
 };
