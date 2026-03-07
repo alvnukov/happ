@@ -19,6 +19,12 @@ fn parser_reports_unexpected_dot_in_operand() {
 }
 
 #[test]
+fn parser_rejects_dash_in_field_identifier_like_go() {
+    let err = parse_action_compat("{{ .a-b }}", 0).expect_err("must fail");
+    assert_eq!(err.code, "bad_character");
+}
+
+#[test]
 fn parser_accepts_control_define_end_actions() {
     assert_eq!(
         parse_action_compat("{{ define \"a\" }}", 0).expect("must parse"),

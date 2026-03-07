@@ -809,6 +809,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_template_tokens_strict_rejects_dash_in_field_identifier() {
+        let src = "{{ .a-b }}";
+        let err = parse_template_tokens_strict(src).expect_err("must fail");
+        assert_eq!(err.code, "bad_character");
+    }
+
+    #[test]
     fn parse_template_tokens_strict_rejects_break_outside_range() {
         let err = parse_template_tokens_strict("{{ break }}").expect_err("must fail");
         assert_eq!(err.code, "break_outside_range");
