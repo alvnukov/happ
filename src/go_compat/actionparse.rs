@@ -1,4 +1,4 @@
-use crate::gotemplates::compat;
+use crate::go_compat::compat;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedElseClause {

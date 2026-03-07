@@ -1,4 +1,4 @@
-use crate::gotemplates::compat;
+use crate::go_compat::compat;
 use crate::go_compat::ident::is_identifier_continue_char;
 use crate::go_compat::path::split_variable_reference;
 use crate::go_compat::tokenize::strip_outer_parens;

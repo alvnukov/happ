@@ -3,11 +3,14 @@
 pub mod actionparse;
 pub mod analyzer;
 pub mod call;
+pub mod compat;
 pub mod collections;
 pub mod compare;
 pub mod commandkind;
+pub mod evaldiag;
 pub mod expr;
 pub mod externalfn;
+pub mod go_std;
 pub mod ident;
 pub mod parse;
 pub mod path;

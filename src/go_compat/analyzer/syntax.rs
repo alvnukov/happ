@@ -1,4 +1,4 @@
-use crate::gotemplates::compat::parse_go_quoted_prefix;
+use crate::go_compat::compat::parse_go_quoted_prefix;
 
 pub(crate) fn extract_template_name(action: &str, keyword: &str) -> Option<String> {
     let inner = action_inner_trimmed(action)?;

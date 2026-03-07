@@ -1,4 +1,11 @@
 use super::*;
+use crate::go_compat::evaldiag::{
+    cannot_give_argument_to_non_function_reason, empty_command_in_pipeline_reason,
+    empty_pipeline_reason, field_not_method_has_arguments_reason, illegal_number_syntax_reason,
+    invalid_syntax_reason, is_nil_command, multi_variable_decl_in_non_range_reason,
+    nil_is_not_a_command_reason, non_executable_pipeline_stage_reason,
+};
+use crate::go_compat::externalfn::undefined_function_reason;
 
 // Go parity reference: stdlib text/template/exec.go expression and pipeline evaluation.
 pub(super) fn eval_expr_truthy(
@@ -32,7 +39,7 @@ fn eval_expr_value_result(
 ) -> Result<Option<Value>, NativeRenderError> {
     // Go parity (text/template exec): bare `nil` is parsed via pipeline path and
     // later surfaced as "nil is not a command" in output contexts.
-    if expr.trim() == "nil" {
+    if is_nil_command(expr) {
         return eval_pipeline_expr(action, expr, root, dot, state, resolver);
     }
     if is_complex_expression(expr) || is_niladic_function_expression(expr) {
@@ -82,10 +89,10 @@ pub(super) fn render_output_expr(
 ) -> Result<String, NativeRenderError> {
     let has_decl = extract_pipeline_declaration(expr).0.is_some();
     // Go parity (text/template exec): action `{{ nil }}` is rejected as command.
-    if !has_decl && expr.trim() == "nil" {
+    if !has_decl && is_nil_command(expr) {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: "nil is not a command".to_string(),
+            reason: nil_is_not_a_command_reason(),
         });
     }
     let value = eval_expr_value_result(action, expr, root, dot, state, resolver)?;
@@ -116,14 +123,14 @@ fn eval_pipeline_expr(
     if decl.as_ref().is_some_and(|d| d.names.len() > 1) {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: "multi-variable declarations are only supported in range pipelines".to_string(),
+            reason: multi_variable_decl_in_non_range_reason(),
         });
     }
     let commands = split_pipeline_commands(&runtime_expr);
     if commands.is_empty() {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: "empty pipeline".to_string(),
+            reason: empty_pipeline_reason(),
         });
     }
     let mut pipe: Option<Value> = None;
@@ -161,7 +168,7 @@ fn eval_pipeline_command(
     if tokens.is_empty() {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: "empty command in pipeline".to_string(),
+            reason: empty_command_in_pipeline_reason(),
         });
     }
 
@@ -238,7 +245,7 @@ fn eval_pipeline_command(
     if has_pipe_input && is_non_executable_pipeline_head(head) {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: format!("non executable command in pipeline stage {pipeline_stage}"),
+            reason: non_executable_pipeline_stage_reason(pipeline_stage),
         });
     }
 
@@ -246,7 +253,7 @@ fn eval_pipeline_command(
         if let Some(target) = non_function_command_target(head) {
             return Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: format!("can't give argument to non-function {target}"),
+                reason: cannot_give_argument_to_non_function_reason(&target),
             });
         }
         if let Some(field_path) = command_field_like_path(head) {
@@ -267,19 +274,13 @@ fn eval_pipeline_command(
             if is_map_like_for_field_call(&receiver) {
                 return Err(NativeRenderError::UnsupportedAction {
                     action: action.to_string(),
-                    reason: format!(
-                        "{} is not a method but has arguments",
-                        field_path.field_name
-                    ),
+                    reason: field_not_method_has_arguments_reason(&field_path.field_name),
                 });
             }
             let _ = eval_command_token_value(action, head, root, dot, state, resolver)?;
             return Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: format!(
-                    "{} is not a method but has arguments",
-                    field_path.field_name
-                ),
+                reason: field_not_method_has_arguments_reason(&field_path.field_name),
             });
         }
     }
@@ -288,20 +289,20 @@ fn eval_pipeline_command(
         if is_identifier_name(head) {
             return Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: format!("\"{head}\" is not a defined function"),
+                reason: undefined_function_reason(head),
             });
         }
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: format!("non executable command in pipeline stage {pipeline_stage}"),
+            reason: non_executable_pipeline_stage_reason(pipeline_stage),
         });
     }
 
     if tokens.len() == 1 {
-        if tokens[0].trim() == "nil" {
+        if is_nil_command(&tokens[0]) {
             return Err(NativeRenderError::UnsupportedAction {
                 action: action.to_string(),
-                reason: "nil is not a command".to_string(),
+                reason: nil_is_not_a_command_reason(),
             });
         }
         return eval_command_token_value(action, &tokens[0], root, dot, state, resolver);
@@ -309,7 +310,7 @@ fn eval_pipeline_command(
 
     Err(NativeRenderError::UnsupportedAction {
         action: action.to_string(),
-        reason: format!("\"{head}\" is not a defined function"),
+        reason: undefined_function_reason(head),
     })
 }
 
@@ -369,13 +370,13 @@ pub(super) fn eval_command_token_value(
     if looks_like_char_literal(token) && parse_char_constant(token).is_none() {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: format!("invalid syntax: {token}"),
+            reason: invalid_syntax_reason(token),
         });
     }
     if looks_like_numeric_literal(token) && parse_number_value(token).is_none() {
         return Err(NativeRenderError::UnsupportedAction {
             action: action.to_string(),
-            reason: format!("illegal number syntax: {token}"),
+            reason: illegal_number_syntax_reason(token),
         });
     }
     ensure_variable_is_defined(token, state)?;

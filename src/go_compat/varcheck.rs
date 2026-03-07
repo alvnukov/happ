@@ -1,4 +1,4 @@
-use crate::gotemplates::compat;
+use crate::go_compat::compat;
 use crate::go_compat::path::split_variable_reference;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

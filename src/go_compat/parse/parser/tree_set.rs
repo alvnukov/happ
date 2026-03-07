@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::gotemplates::compat::parse_go_quoted_prefix;
+use crate::go_compat::compat::parse_go_quoted_prefix;
 use crate::gotemplates::parser::{
     parse_action_report_with_options, ControlAction, ControlKind, ParseCompatOptions,
 };

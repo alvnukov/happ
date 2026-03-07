@@ -1,4 +1,4 @@
-use crate::gotemplates::compat;
+use crate::go_compat::compat;
 use crate::go_compat::ident::is_identifier_name;
 
 pub fn decode_string_literal(inner: &str) -> Option<String> {

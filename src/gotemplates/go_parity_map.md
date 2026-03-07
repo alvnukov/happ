@@ -4,6 +4,7 @@ This file tracks which Go stdlib sources are the reference for the Rust
 `gotemplates` implementation.
 
 All Go-related compatibility code is centralized under `src/go_compat/*`.
+Mirror namespace for upstream transfer lives at `src/go_compat/go_std/*`.
 
 The current priority is the builtins and execution branches observed in the
 real chart corpus (`helm-apps` + integration examples). Less-used branches
@@ -63,6 +64,10 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/parse/parse.go`
   - Scope: variable-visibility guard (`$var`), numeric/char literal shape checks
     and canonical undefined-variable diagnostic message builder.
+- Rust: `src/go_compat/evaldiag.rs`
+  - Go reference: `src/text/template/exec.go`
+  - Scope: canonical runtime diagnostic strings and nil-command classification
+    reused across evaluator branches to avoid duplicated message logic.
 
 ## Builtins and Rendering
 
@@ -126,7 +131,7 @@ target until the used surface is fully stabilized.
 
 ## printf Compatibility
 
-- Rust: `src/gotemplates/compat/printf.rs` and `src/gotemplates/compat/printf/*`
+- Rust: `src/go_compat/compat.rs`, `src/go_compat/compat/printf.rs` and `src/go_compat/compat/printf/*`
   - Go reference: `src/fmt/print.go`, `src/fmt/format.go`
   - Scope: `%` verb parsing, argument indexing (`%[n]`), `*` width/precision
     semantics, mismatch diagnostics and output layout.
