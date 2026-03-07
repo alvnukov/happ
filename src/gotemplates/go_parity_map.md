@@ -53,6 +53,10 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/funcs.go`
   - Scope: core comparison semantics (`eq/lt/le`), nil/map/slice comparability
     classes and detail reasons for non-comparable values.
+- Rust: `src/gotemplates/go_compat/varcheck.rs`
+  - Go reference: `src/text/template/parse/parse.go`
+  - Scope: variable-visibility guard (`$var`), numeric/char literal shape checks
+    and canonical undefined-variable diagnostic message builder.
 
 ## Builtins and Rendering
 

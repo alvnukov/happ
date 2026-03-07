@@ -15,4 +15,5 @@ pub mod tokenize;
 pub mod trim;
 pub mod truth;
 pub mod typeutil;
+pub mod varcheck;
 pub mod valuefmt;

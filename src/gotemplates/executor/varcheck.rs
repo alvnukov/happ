@@ -1,31 +1,31 @@
-use super::path::split_variable_reference;
 use super::{EvalState, GoTemplateScanError, NativeRenderError};
-use crate::gotemplates::compat;
+use crate::gotemplates::go_compat::varcheck::{
+    ensure_variable_is_defined as go_ensure_variable_is_defined,
+    looks_like_char_literal as go_looks_like_char_literal,
+    looks_like_numeric_literal as go_looks_like_numeric_literal,
+    undefined_variable_message as go_undefined_variable_message,
+};
 
 pub(super) fn looks_like_numeric_literal(expr: &str) -> bool {
-    compat::looks_like_numeric_literal(expr)
+    go_looks_like_numeric_literal(expr)
 }
 
 pub(super) fn looks_like_char_literal(expr: &str) -> bool {
-    compat::looks_like_char_literal(expr)
+    go_looks_like_char_literal(expr)
 }
 
 pub(super) fn ensure_variable_is_defined(
     expr: &str,
     state: &EvalState,
 ) -> Result<(), NativeRenderError> {
-    if let Some((name, _)) = split_variable_reference(expr) {
-        if name != "$" && state.lookup_var(name).is_none() {
-            return Err(undefined_variable_error(name));
-        }
-    }
-    Ok(())
+    go_ensure_variable_is_defined(expr, |name| state.lookup_var(name).is_some())
+        .map_err(|err| undefined_variable_error(&err.name))
 }
 
 pub(super) fn undefined_variable_error(name: &str) -> NativeRenderError {
     NativeRenderError::Parse(GoTemplateScanError {
         code: "undefined_variable",
-        message: format!("undefined variable \"{name}\""),
+        message: go_undefined_variable_message(name),
         offset: 0,
     })
 }
