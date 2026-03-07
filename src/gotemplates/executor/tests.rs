@@ -23,6 +23,7 @@ fn native_renderer_go_zero_mode_keeps_leaf_missing_as_no_value() {
         &data,
         NativeRenderOptions {
             missing_value_mode: MissingValueMode::GoZero,
+            ..NativeRenderOptions::default()
         },
     )
     .expect("must render");
@@ -37,6 +38,7 @@ fn native_renderer_go_zero_mode_errors_on_nested_missing_after_nil_interface() {
         &data,
         NativeRenderOptions {
             missing_value_mode: MissingValueMode::GoZero,
+            ..NativeRenderOptions::default()
         },
     )
     .expect_err("must fail");
@@ -244,6 +246,7 @@ fn native_renderer_go_zero_mode_returns_typed_map_zero_values() {
         &root,
         NativeRenderOptions {
             missing_value_mode: MissingValueMode::GoZero,
+            ..NativeRenderOptions::default()
         },
     )
     .expect("must render");
@@ -282,6 +285,7 @@ fn native_renderer_handles_nested_typed_map_missing_like_go() {
         &root,
         NativeRenderOptions {
             missing_value_mode: MissingValueMode::GoZero,
+            ..NativeRenderOptions::default()
         },
     )
     .expect("must render");
@@ -292,6 +296,7 @@ fn native_renderer_handles_nested_typed_map_missing_like_go() {
         &root,
         NativeRenderOptions {
             missing_value_mode: MissingValueMode::GoDefault,
+            ..NativeRenderOptions::default()
         },
     )
     .expect("must render");
@@ -322,6 +327,7 @@ fn native_renderer_typed_map_interface_zero_mode_matches_go() {
         &root,
         NativeRenderOptions {
             missing_value_mode: MissingValueMode::GoZero,
+            ..NativeRenderOptions::default()
         },
     )
     .expect_err("must fail");
@@ -973,6 +979,49 @@ fn native_renderer_supports_call_builtin_via_resolver() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn native_renderer_go_strict_disables_dynamic_external_function_head() {
+    let data = json!({"fn":"ext"});
+    let resolver = |name: &str, args: &[Option<Value>]| {
+        if name != "ext" {
+            return Err(NativeFunctionResolverError::UnknownFunction);
+        }
+        Ok(Some(Value::String(format!(
+            "called:{}",
+            format_value_for_print(&args[0])
+        ))))
+    };
+
+    let err = render_template_native_with_resolver(
+        "{{.fn \"z\"}}",
+        &data,
+        NativeRenderOptions {
+            function_dispatch_mode: FunctionDispatchMode::GoStrict,
+            ..NativeRenderOptions::default()
+        },
+        Some(&resolver),
+    )
+    .expect_err("must fail");
+    match err {
+        NativeRenderError::UnsupportedAction { reason, .. } => {
+            assert!(reason.contains("fn is not a method but has arguments"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let out = render_template_native_with_resolver(
+        "{{call .fn \"z\"}}",
+        &data,
+        NativeRenderOptions {
+            function_dispatch_mode: FunctionDispatchMode::GoStrict,
+            ..NativeRenderOptions::default()
+        },
+        Some(&resolver),
+    )
+    .expect("must render");
+    assert_eq!(out, "called:z");
 }
 
 #[test]

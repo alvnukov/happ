@@ -37,6 +37,11 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/exec.go`
   - Scope: expression evaluation, pipeline execution, command dispatch and
     non-executable command diagnostics, field-with-arguments errors.
+- Rust: `src/gotemplates/executor/externalfn.rs`
+  - Go reference: `src/text/template/exec.go` (`evalFunction` identifier dispatch)
+  - Scope: external function dispatch boundary; `FunctionDispatchMode::GoStrict`
+    keeps Go-compatible identifier-only head resolution, while
+    `FunctionDispatchMode::Extended` enables happ dynamic-head extension.
 - Rust: `src/gotemplates/executor/path.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: used field-path resolution for `.`, `$`, `$var` chains, map/slice

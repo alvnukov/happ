@@ -69,14 +69,24 @@ pub enum MissingValueMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionDispatchMode {
+    // Go parity mode: no dynamic external function head resolution.
+    GoStrict,
+    // Happ extension mode: allow dynamic external function head resolution.
+    Extended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeRenderOptions {
     pub missing_value_mode: MissingValueMode,
+    pub function_dispatch_mode: FunctionDispatchMode,
 }
 
 impl Default for NativeRenderOptions {
     fn default() -> Self {
         Self {
             missing_value_mode: MissingValueMode::GoDefault,
+            function_dispatch_mode: FunctionDispatchMode::Extended,
         }
     }
 }
@@ -180,7 +190,7 @@ pub fn render_template_native_with_resolver(
     apply_lexical_trims(&mut tokens);
     let (main_tokens, templates) = split_template_set(&tokens)?;
     let dot = root.clone();
-    let mut state = EvalState::new(options.missing_value_mode);
+    let mut state = EvalState::new(options.missing_value_mode, options.function_dispatch_mode);
     let eval = eval_block(
         &main_tokens,
         0,
@@ -216,13 +226,18 @@ struct BlockEval {
 struct EvalState {
     scopes: Vec<BTreeMap<String, Option<Value>>>,
     missing_value_mode: MissingValueMode,
+    function_dispatch_mode: FunctionDispatchMode,
 }
 
 impl EvalState {
-    fn new(missing_value_mode: MissingValueMode) -> Self {
+    fn new(
+        missing_value_mode: MissingValueMode,
+        function_dispatch_mode: FunctionDispatchMode,
+    ) -> Self {
         Self {
             scopes: vec![BTreeMap::new()],
             missing_value_mode,
+            function_dispatch_mode,
         }
     }
 

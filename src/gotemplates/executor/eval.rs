@@ -220,17 +220,19 @@ fn eval_pipeline_command(
         return Ok(result);
     }
 
-    if let Some(result) = try_eval_dynamic_external_function(
-        action,
-        &tokens,
-        root,
-        dot,
-        has_pipe_input,
-        pipe_input.clone(),
-        state,
-        resolver,
-    )? {
-        return Ok(result);
+    if matches!(state.function_dispatch_mode, FunctionDispatchMode::Extended) {
+        if let Some(result) = try_eval_dynamic_external_function(
+            action,
+            &tokens,
+            root,
+            dot,
+            has_pipe_input,
+            pipe_input.clone(),
+            state,
+            resolver,
+        )? {
+            return Ok(result);
+        }
     }
 
     if has_pipe_input && is_non_executable_pipeline_head(head) {

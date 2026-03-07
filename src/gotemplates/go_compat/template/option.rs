@@ -1,4 +1,4 @@
-use crate::gotemplates::{MissingValueMode, NativeRenderOptions};
+use crate::gotemplates::{FunctionDispatchMode, MissingValueMode, NativeRenderOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingKeyOption {
@@ -62,7 +62,10 @@ impl TemplateOptions {
             MissingKeyOption::Zero => MissingValueMode::GoZero,
             MissingKeyOption::Default | MissingKeyOption::Invalid => MissingValueMode::GoDefault,
         };
-        NativeRenderOptions { missing_value_mode }
+        NativeRenderOptions {
+            missing_value_mode,
+            function_dispatch_mode: FunctionDispatchMode::GoStrict,
+        }
     }
 }
 
@@ -78,6 +81,7 @@ mod tests {
             .expect("option apply must succeed");
         let native = options.to_native_render_options();
         assert_eq!(native.missing_value_mode, MissingValueMode::Error);
+        assert_eq!(native.function_dispatch_mode, FunctionDispatchMode::GoStrict);
     }
 
     #[test]
@@ -87,6 +91,7 @@ mod tests {
             options.apply(raw).expect("option apply must succeed");
             let native = options.to_native_render_options();
             assert_eq!(native.missing_value_mode, MissingValueMode::GoDefault);
+            assert_eq!(native.function_dispatch_mode, FunctionDispatchMode::GoStrict);
         }
     }
 
@@ -98,5 +103,6 @@ mod tests {
             .expect("option apply must succeed");
         let native = options.to_native_render_options();
         assert_eq!(native.missing_value_mode, MissingValueMode::GoZero);
+        assert_eq!(native.function_dispatch_mode, FunctionDispatchMode::GoStrict);
     }
 }
