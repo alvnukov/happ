@@ -1,5 +1,5 @@
 use crate::go_compat::backend::LogicBackend;
-use crate::go_compat::runtimebridge::{FunctionDispatchMode, MissingValueMode, NativeRenderOptions};
+use crate::go_compat::runtime::{FunctionDispatchMode, MissingValueMode, NativeRenderOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingKeyOption {

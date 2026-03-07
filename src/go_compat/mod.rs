@@ -20,7 +20,7 @@
 // - path             -> go/src/text/template/exec.go
 // - pipeline_decl    -> go/src/text/template/parse/parse.go
 // - rangeeval        -> go/src/text/template/exec.go
-// - runtimebridge    -> internal bridge to gotemplates native render runtime
+// - runtime          -> canonical runtime API surface (delegating executor path)
 // - scan             -> token/span/error model + scanner/tokenization compatibility paths
 // - template/*       -> go/src/text/template/template.go + option paths
 // - textfmt          -> go/src/text/template/funcs.go
@@ -50,7 +50,7 @@ pub mod parse;
 pub mod path;
 pub mod pipeline_decl;
 pub mod rangeeval;
-pub(crate) mod runtimebridge;
+pub mod runtime;
 pub mod scan;
 pub mod template;
 pub mod textfmt;

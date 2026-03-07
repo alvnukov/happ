@@ -99,6 +99,10 @@ target until the used surface is fully stabilized.
 - Rust: `src/gotemplates/executor.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: runtime pipeline evaluation, control flow, range/if/with behavior.
+- Rust: `src/go_compat/runtime.rs`
+  - Go reference: `src/text/template/exec.go`
+  - Scope: canonical runtime API surface used by go_compat template facade; current executor
+    delegation path remains gotemplates-native while parity migration proceeds.
 - Rust: `src/gotemplates/executor/control.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: control-flow block execution (`if`/`with`/`range`), `else`/`end`

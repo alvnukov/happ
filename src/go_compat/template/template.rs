@@ -1,5 +1,5 @@
 use crate::go_compat::parse::{self, Mode, ParseError, Tree};
-use crate::go_compat::runtimebridge::{
+use crate::go_compat::runtime::{
     render_template_native_with_resolver, NativeFunctionResolver, NativeRenderError,
     NativeRenderOptions,
 };
