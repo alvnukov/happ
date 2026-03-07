@@ -34,6 +34,10 @@ target until the used surface is fully stabilized.
 - Rust: `src/gotemplates/go_compat/pipeline_decl.rs`
   - Go reference: `src/text/template/parse/parse.go`
   - Scope: extraction of pipeline declaration prefixes (`$x :=`, `$i, $v =`).
+- Rust: `src/gotemplates/go_compat/actionparse.rs`
+  - Go reference: `src/text/template/parse/parse.go`, `src/text/template/exec.go`
+  - Scope: action-head classification (`if/with/range/else/template/block/define`)
+    with trim-marker aware delimiter handling and structured parse errors.
 - Rust: `src/gotemplates/go_compat/path.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: variable reference splitting (`$`, `$x`, `$x.y`), path segment/token checks,

@@ -1,3 +1,4 @@
+pub mod actionparse;
 pub mod analyzer;
 pub mod commandkind;
 pub mod expr;

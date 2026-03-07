@@ -1,131 +1,35 @@
 use super::{ActionKind, ElseClause, NativeRenderError};
-use crate::gotemplates::compat;
+use crate::gotemplates::go_compat::actionparse::{
+    parse_action_kind as go_parse_action_kind, ParsedActionKind, ParsedElseClause,
+};
 
 pub(super) fn parse_action_kind(action: &str) -> Result<ActionKind, NativeRenderError> {
-    let Some(inner) = action_inner(action) else {
-        return Err(NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "invalid action delimiters".to_string(),
-        });
-    };
-    if inner.is_empty() || inner.starts_with("/*") {
-        return Ok(ActionKind::Noop);
-    }
-
-    if inner == "end" {
-        return Ok(ActionKind::End);
-    }
-    if inner == "else" {
-        return Ok(ActionKind::Else(ElseClause::Plain));
-    }
-    if let Some(expr) = inner.strip_prefix("else if ") {
-        return Ok(ActionKind::Else(ElseClause::If(expr.trim().to_string())));
-    }
-    if let Some(expr) = inner.strip_prefix("else with ") {
-        return Ok(ActionKind::Else(ElseClause::With(expr.trim().to_string())));
-    }
-    if let Some(expr) = inner.strip_prefix("if ") {
-        return Ok(ActionKind::If(expr.trim().to_string()));
-    }
-    if let Some(expr) = inner.strip_prefix("with ") {
-        return Ok(ActionKind::With(expr.trim().to_string()));
-    }
-    if let Some(expr) = inner.strip_prefix("range ") {
-        return Ok(ActionKind::Range(expr.trim().to_string()));
-    }
-    if let Some(rest) = inner.strip_prefix("define ") {
-        let name = parse_quoted_name(rest).ok_or_else(|| NativeRenderError::UnsupportedAction {
-            action: action.to_string(),
-            reason: "define name must be a quoted string".to_string(),
-        })?;
-        return Ok(ActionKind::Define { name });
-    }
-    if let Some(rest) = inner.strip_prefix("block ") {
-        let (name, arg) = parse_block_invocation_clause(rest).ok_or_else(|| {
-            NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: "block clause must be: block \"name\" arg".to_string(),
-            }
-        })?;
-        return Ok(ActionKind::Block { name, arg });
-    }
-    if let Some(rest) = inner.strip_prefix("template ") {
-        let (name, arg) = parse_template_invocation_clause(rest).ok_or_else(|| {
-            NativeRenderError::UnsupportedAction {
-                action: action.to_string(),
-                reason: "template clause must be: template \"name\" [arg]".to_string(),
-            }
-        })?;
-        return Ok(ActionKind::Template { name, arg });
-    }
-    if inner == "break" {
-        return Ok(ActionKind::Break);
-    }
-    if inner == "continue" {
-        return Ok(ActionKind::Continue);
-    }
-    Ok(ActionKind::Output(inner.to_string()))
-}
-
-fn parse_quoted_name(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    compat::decode_go_string_literal(trimmed)
-}
-
-fn parse_template_invocation_clause(raw: &str) -> Option<(String, Option<String>)> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let (name, tail) = compat::parse_go_quoted_prefix(trimmed)?;
-    let tail = tail.trim();
-    let arg = if tail.is_empty() {
-        None
-    } else {
-        Some(tail.to_string())
-    };
-    Some((name, arg))
-}
-
-fn parse_block_invocation_clause(raw: &str) -> Option<(String, String)> {
-    let (name, arg) = parse_template_invocation_clause(raw)?;
-    Some((name, arg?.trim().to_string()))
-}
-
-fn action_inner(action: &str) -> Option<&str> {
-    if !(action.starts_with("{{") && action.ends_with("}}")) || action.len() < 4 {
-        return None;
-    }
-    let inner = &action[2..action.len() - 2];
-    let bytes = inner.as_bytes();
-    let mut start = 0usize;
-    let mut end = inner.len();
-
-    if bytes.len() >= 2 && bytes[0] == b'-' && bytes[1].is_ascii_whitespace() {
-        start = 1;
-    }
-    while start < end && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    while start < end && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    if end > start && bytes[end - 1] == b'-' {
-        end -= 1;
-        while start < end && bytes[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        }
-    }
-    Some(&inner[start..end])
+    let parsed = go_parse_action_kind(action).map_err(|err| NativeRenderError::UnsupportedAction {
+        action: action.to_string(),
+        reason: err.reason,
+    })?;
+    Ok(match parsed {
+        ParsedActionKind::Noop => ActionKind::Noop,
+        ParsedActionKind::Output(s) => ActionKind::Output(s),
+        ParsedActionKind::If(s) => ActionKind::If(s),
+        ParsedActionKind::With(s) => ActionKind::With(s),
+        ParsedActionKind::Range(s) => ActionKind::Range(s),
+        ParsedActionKind::Else(ParsedElseClause::Plain) => ActionKind::Else(ElseClause::Plain),
+        ParsedActionKind::Else(ParsedElseClause::If(s)) => ActionKind::Else(ElseClause::If(s)),
+        ParsedActionKind::Else(ParsedElseClause::With(s)) => ActionKind::Else(ElseClause::With(s)),
+        ParsedActionKind::End => ActionKind::End,
+        ParsedActionKind::Define { name } => ActionKind::Define { name },
+        ParsedActionKind::Block { name, arg } => ActionKind::Block { name, arg },
+        ParsedActionKind::Template { name, arg } => ActionKind::Template { name, arg },
+        ParsedActionKind::Break => ActionKind::Break,
+        ParsedActionKind::Continue => ActionKind::Continue,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_action_kind;
     use super::super::{ActionKind, ElseClause, NativeRenderError};
+    use super::parse_action_kind;
 
     #[test]
     fn parses_template_and_block_actions() {
