@@ -1,7 +1,8 @@
-use super::{GoTemplateScanError, Tok, TokKind};
+use super::{Tok, TokKind};
 use crate::go_compat::ident::{
     is_identifier_continue_char, is_identifier_start_char,
 };
+use crate::go_compat::scan::GoTemplateScanError;
 // Go parity reference: stdlib text/template/parse/lex.go.
 
 pub(super) fn lex_action_inner(src: &str, abs_base: usize) -> Result<Vec<Tok>, GoTemplateScanError> {

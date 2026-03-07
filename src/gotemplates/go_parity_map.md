@@ -18,23 +18,26 @@ target until the used surface is fully stabilized.
 
 ## Parser and Scanner
 
-- Rust: `src/gotemplates/parser.rs`
+- Rust: `src/go_compat/parse/action.rs`
   - Go reference: `src/text/template/parse/parse.go`
   - Scope: pipeline parsing, command parsing, declaration handling, undefined
     function checks, undefined variable checks.
+- Rust: `src/go_compat/parse/action/lex.rs`
+  - Go reference: `src/text/template/parse/lex.go`
+  - Scope: action lexing, token classification, number and identifier scanning.
+- Rust: `src/gotemplates/parser.rs`
+  - Go reference: `src/text/template/parse/parse.go`
+  - Scope: backward-compatible facade over canonical go_compat parse action APIs.
 - Rust: `src/go_compat/parse/report.rs`
   - Go reference: `src/text/template/parse/parse.go`
   - Scope: shared parse compatibility report model (`ParseCompatOptions`, control actions,
-    declared/assigned/referenced variable spans) reused by parser/scanner and go_compat bridge.
-- Rust: `src/gotemplates/parser/lex.rs`
-  - Go reference: `src/text/template/parse/lex.go`
-  - Scope: action lexing, token classification, number and identifier scanning.
+    declared/assigned/referenced variable spans) reused by parser/scanner and go_compat parse APIs.
 - Rust: `src/gotemplates/scanner.rs`
   - Go reference: `src/text/template/parse/lex.go`
   - Scope: action token scanning, delimiter handling, string/comment boundaries.
 - Rust: `src/go_compat/scan.rs`
   - Go reference: `src/text/template/parse/lex.go` (token/error surface shape)
-  - Scope: canonical token/span/error types used by scanner, parser and bridge APIs.
+  - Scope: canonical token/span/error types used by scanner and parse APIs.
 - Rust: `src/go_compat/tokenize.rs`
   - Go reference: `src/text/template/parse/parse.go`, `src/text/template/parse/lex.go`
   - Scope: reusable command/pipeline token boundaries and outer-parentheses
@@ -56,9 +59,6 @@ target until the used surface is fully stabilized.
   - Go reference: `src/text/template/parse/parse.go`, `src/text/template/exec.go`
   - Scope: action-head classification (`if/with/range/else/template/block/define`)
     with trim-marker aware delimiter handling and structured parse errors.
-- Rust: `src/go_compat/parse/action.rs`
-  - Go reference: `src/text/template/parse/parse.go`
-  - Scope: canonical parse-action API entrypoints used by planner/scanner/parse bridge.
 - Rust: `src/go_compat/path.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: variable reference splitting (`$`, `$x`, `$x.y`), path segment/token checks,

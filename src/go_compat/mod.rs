@@ -15,7 +15,7 @@
 // - externalfn       -> go/src/text/template/exec.go
 // - ident            -> go/src/text/template/parse/lex.go
 // - parse/*          -> go/src/text/template/parse/*
-// - parse/action     -> canonical parse-action API surface (bridged during migration)
+// - parse/action     -> canonical parse-action API surface
 // - parse/report     -> shared parse compatibility action/control report model
 // - path             -> go/src/text/template/exec.go
 // - pipeline_decl    -> go/src/text/template/parse/parse.go
