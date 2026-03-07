@@ -8,7 +8,6 @@ pub(crate) mod parser;
 mod planner;
 mod scanner;
 mod typedvalue;
-mod utf8scan;
 
 pub use executor::{
     FunctionDispatchMode,

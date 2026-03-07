@@ -1,10 +1,10 @@
 use super::{MissingValueMode, NativeRenderError};
 use crate::go_compat::path::{
-    resolve_simple_path as go_resolve_simple_path,
-    split_variable_reference as go_split_variable_reference, PathMissingValueMode,
-    ResolveSimplePathError,
+    resolve_simple_path as go_resolve_simple_path, PathMissingValueMode, ResolveSimplePathError,
 };
 use serde_json::Value;
+#[cfg(test)]
+use crate::go_compat::path::split_variable_reference as go_split_variable_reference;
 
 pub(super) fn resolve_simple_path(
     root: &Value,
@@ -33,6 +33,7 @@ pub(super) fn resolve_simple_path(
     })
 }
 
+#[cfg(test)]
 pub(super) fn split_variable_reference(expr: &str) -> Option<(&str, &str)> {
     go_split_variable_reference(expr)
 }

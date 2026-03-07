@@ -1,12 +1,6 @@
 use super::{
-    parse_template_tokens_strict_with_options,
-    typedvalue::{
-        decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
-        decode_go_typed_slice_value, encode_go_bytes_value, encode_go_nil_bytes_value,
-        encode_go_typed_slice_value, go_bytes_get, go_bytes_is_nil, go_bytes_len,
-        go_string_bytes_get, go_string_bytes_len, go_zero_value_for_type,
-    },
-    GoTemplateScanError, GoTemplateToken, ParseCompatOptions, HELM_INCLUDE_RECURSION_MAX_REFS,
+    parse_template_tokens_strict_with_options, GoTemplateScanError, GoTemplateToken,
+    ParseCompatOptions, HELM_INCLUDE_RECURSION_MAX_REFS,
 };
 use crate::go_compat::compat;
 use serde_json::{Number, Value};
@@ -54,7 +48,9 @@ use govaluefmt::format_value_like_go;
 use path::resolve_simple_path;
 use pipeline_decl::{extract_pipeline_declaration, PipelineDeclMode, PipelineDeclaration};
 use rangeeval::{apply_range_iteration_bindings, range_items};
-use textfmt::{builtin_html, builtin_js, builtin_print, builtin_urlquery, format_value_for_print};
+use textfmt::{builtin_html, builtin_js, builtin_print, builtin_urlquery};
+#[cfg(test)]
+use textfmt::format_value_for_print;
 use tokenize::{split_command_tokens, split_pipeline_commands, strip_outer_parens};
 use truth::{builtin_and, builtin_or, is_truthy};
 use trim::apply_lexical_trims;

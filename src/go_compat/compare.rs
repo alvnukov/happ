@@ -1,6 +1,5 @@
 use crate::go_compat::typeutil::{
     is_go_bytes_slice, is_map_object, option_string_like_bytes, option_type_name_for_template,
-    value_type_name_for_template,
 };
 use crate::go_compat::valuefmt::format_value_like_go;
 use crate::go_compat::typedvalue::{
