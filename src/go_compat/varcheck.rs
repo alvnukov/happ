@@ -1,5 +1,5 @@
 use crate::gotemplates::compat;
-use crate::gotemplates::go_compat::path::split_variable_reference;
+use crate::go_compat::path::split_variable_reference;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndefinedVariableError {

@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::valuefmt::format_value_like_go as go_format_value_like_go;
+use crate::go_compat::valuefmt::format_value_like_go as go_format_value_like_go;
 use serde_json::Value;
 
 pub(super) fn format_value_like_go(v: &Value) -> String {

@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::parse::NodeType;
+use crate::go_compat::parse::NodeType;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

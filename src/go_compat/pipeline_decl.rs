@@ -1,5 +1,5 @@
-use crate::gotemplates::go_compat::ident::is_identifier_continue_char;
-use crate::gotemplates::go_compat::tokenize::split_pipeline_commands_owned;
+use crate::go_compat::ident::is_identifier_continue_char;
+use crate::go_compat::tokenize::split_pipeline_commands_owned;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineDeclMode {

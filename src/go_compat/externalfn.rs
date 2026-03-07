@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::ident::is_identifier_name;
+use crate::go_compat::ident::is_identifier_name;
 
 pub fn is_external_function_identifier(name: &str) -> bool {
     is_identifier_name(name)

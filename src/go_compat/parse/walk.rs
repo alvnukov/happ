@@ -67,7 +67,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gotemplates::go_compat::parse::{parse, Mode};
+    use crate::go_compat::parse::{parse, Mode};
 
     #[test]
     fn walk_list_visits_nested_nodes_in_preorder() {
@@ -88,7 +88,7 @@ mod tests {
             WalkControl::Continue
         });
 
-        use crate::gotemplates::go_compat::parse::NodeType;
+        use crate::go_compat::parse::NodeType;
         assert_eq!(kinds.first().copied(), Some(NodeType::If));
         assert!(kinds.contains(&NodeType::Range));
         assert!(kinds.contains(&NodeType::Continue));

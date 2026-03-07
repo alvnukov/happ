@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::path::value_type_name_for_path;
+use crate::go_compat::path::value_type_name_for_path;
 use crate::gotemplates::typedvalue::{
     decode_go_string_bytes_value, decode_go_typed_slice_value, go_bytes_len, go_string_bytes_len,
 };

@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::parse::{self, Mode, ParseError, Tree};
+use crate::go_compat::parse::{self, Mode, ParseError, Tree};
 use crate::gotemplates::{
     render_template_native_with_resolver, NativeFunctionResolver, NativeRenderError,
     NativeRenderOptions,

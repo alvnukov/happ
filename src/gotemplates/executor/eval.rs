@@ -313,16 +313,6 @@ fn eval_pipeline_command(
     })
 }
 
-fn is_map_like_for_field_call(v: &Value) -> bool {
-    if go_bytes_len(v).is_some()
-        || go_string_bytes_len(v).is_some()
-        || decode_go_typed_slice_value(v).is_some()
-    {
-        return false;
-    }
-    decode_go_typed_map_value(v).is_some() || matches!(v, Value::Object(_))
-}
-
 fn eval_short_circuit_builtin(
     action: &str,
     name: &str,

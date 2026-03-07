@@ -4,6 +4,7 @@ mod composeimport;
 mod composeinspect;
 mod convert;
 mod dyfflike;
+pub mod go_compat;
 pub mod gotemplates;
 mod inspectweb;
 mod lsp;

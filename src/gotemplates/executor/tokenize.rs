@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::tokenize::{
+use crate::go_compat::tokenize::{
     split_command_tokens_exec, split_pipeline_commands_owned,
     strip_outer_parens as go_strip_outer_parens,
 };

@@ -3,6 +3,8 @@
 This file tracks which Go stdlib sources are the reference for the Rust
 `gotemplates` implementation.
 
+All Go-related compatibility code is centralized under `src/go_compat/*`.
+
 The current priority is the builtins and execution branches observed in the
 real chart corpus (`helm-apps` + integration examples). Less-used branches
 (`call`, html/js/urlquery edge cases) are kept but are not the primary parity
@@ -20,44 +22,44 @@ target until the used surface is fully stabilized.
 - Rust: `src/gotemplates/scanner.rs`
   - Go reference: `src/text/template/parse/lex.go`
   - Scope: action token scanning, delimiter handling, string/comment boundaries.
-- Rust: `src/gotemplates/go_compat/tokenize.rs`
+- Rust: `src/go_compat/tokenize.rs`
   - Go reference: `src/text/template/parse/parse.go`, `src/text/template/parse/lex.go`
   - Scope: reusable command/pipeline token boundaries and outer-parentheses
     handling shared by executor and function-call analysis.
-- Rust: `src/gotemplates/go_compat/ident.rs`
+- Rust: `src/go_compat/ident.rs`
   - Go reference: `src/text/template/parse/lex.go`
   - Scope: shared Go identifier start/continue/name checks used across parser
     and executor-side analyzers.
-- Rust: `src/gotemplates/go_compat/expr.rs`
+- Rust: `src/go_compat/expr.rs`
   - Go reference: `src/text/template/parse/parse.go` (expression-shape checks)
   - Scope: quoted-string, complex-expression and niladic-identifier classifiers.
-- Rust: `src/gotemplates/go_compat/pipeline_decl.rs`
+- Rust: `src/go_compat/pipeline_decl.rs`
   - Go reference: `src/text/template/parse/parse.go`
   - Scope: extraction of pipeline declaration prefixes (`$x :=`, `$i, $v =`).
-- Rust: `src/gotemplates/go_compat/actionparse.rs`
+- Rust: `src/go_compat/actionparse.rs`
   - Go reference: `src/text/template/parse/parse.go`, `src/text/template/exec.go`
   - Scope: action-head classification (`if/with/range/else/template/block/define`)
     with trim-marker aware delimiter handling and structured parse errors.
-- Rust: `src/gotemplates/go_compat/path.rs`
+- Rust: `src/go_compat/path.rs`
   - Go reference: `src/text/template/exec.go`
   - Scope: variable reference splitting (`$`, `$x`, `$x.y`), path segment/token checks,
     runtime simple-path traversal and Go-style path type naming/error reasons.
-- Rust: `src/gotemplates/go_compat/commandkind.rs`
+- Rust: `src/go_compat/commandkind.rs`
   - Go reference: `src/text/template/exec.go` (`notAFunction` and command-kind checks)
   - Scope: non-executable head detection, non-function targets, field-like command paths.
-- Rust: `src/gotemplates/go_compat/call.rs`
+- Rust: `src/go_compat/call.rs`
   - Go reference: `src/text/template/exec.go` (`evalCall` target rendering path)
   - Scope: call-target display normalization (outer-paren stripping and fallback
     value rendering) reused by runtime call diagnostics.
-- Rust: `src/gotemplates/go_compat/typeutil.rs`
+- Rust: `src/go_compat/typeutil.rs`
   - Go reference: `src/text/template/exec.go`, `src/text/template/funcs.go`
   - Scope: slice/index argument normalization, map-key coercion, string-like byte helpers
     and shared Go type-name classification used by compare/collections paths.
-- Rust: `src/gotemplates/go_compat/compare.rs`
+- Rust: `src/go_compat/compare.rs`
   - Go reference: `src/text/template/funcs.go`
   - Scope: core comparison semantics (`eq/lt/le`), nil/map/slice comparability
     classes and detail reasons for non-comparable values.
-- Rust: `src/gotemplates/go_compat/varcheck.rs`
+- Rust: `src/go_compat/varcheck.rs`
   - Go reference: `src/text/template/parse/parse.go`
   - Scope: variable-visibility guard (`$var`), numeric/char literal shape checks
     and canonical undefined-variable diagnostic message builder.
@@ -83,7 +85,7 @@ target until the used surface is fully stabilized.
   - Scope: external function dispatch boundary; `FunctionDispatchMode::GoStrict`
     keeps Go-compatible identifier-only head resolution, while
     `FunctionDispatchMode::Extended` enables happ dynamic-head extension.
-- Rust: `src/gotemplates/go_compat/externalfn.rs`
+- Rust: `src/go_compat/externalfn.rs`
   - Go reference: `src/text/template/exec.go` (`evalFunction` / unknown-function diagnostics)
   - Scope: shared identifier candidacy checks for external calls and canonical
     unknown/failed function reason builders reused by runtime adapters.
@@ -98,7 +100,7 @@ target until the used surface is fully stabilized.
 - Rust: `src/gotemplates/executor/collections.rs`
   - Go reference: `src/text/template/funcs.go`
   - Scope: adapter layer mapping runtime collection builtin calls into go_compat APIs.
-- Rust: `src/gotemplates/go_compat/collections.rs`
+- Rust: `src/go_compat/collections.rs`
   - Go reference: `src/text/template/funcs.go`
   - Scope: core collection builtins (`len/index/slice`) with Go-compatible bounds,
     map-key coercion, typed nil/zero behavior and reflect-style out-of-range diagnostics.
@@ -108,17 +110,17 @@ target until the used surface is fully stabilized.
 - Rust: `src/gotemplates/executor/textfmt.rs`
   - Go reference: `src/text/template/funcs.go`
   - Scope: adapter layer mapping runtime builtin calls into go_compat text-format APIs.
-- Rust: `src/gotemplates/go_compat/textfmt.rs`
+- Rust: `src/go_compat/textfmt.rs`
   - Go reference: `src/text/template/funcs.go` (`print/println/html/js/urlquery`, `JSEscape` / `jsIsSpecial`)
   - Scope: text builtin rendering (`print`, `html`, `js`, `urlquery`) + Go-specific
     Unicode escape classification shared by `js` paths.
-- Rust: `src/gotemplates/go_compat/trim.rs`
+- Rust: `src/go_compat/trim.rs`
   - Go reference: `src/text/template/parse/lex.go`
   - Scope: trim-marker and ASCII whitespace helpers for `{{-` / `-}}` handling.
-- Rust: `src/gotemplates/go_compat/valuefmt.rs`
+- Rust: `src/go_compat/valuefmt.rs`
   - Go reference: `src/text/template/exec.go` (`printableValue`) + Go fmt defaults
   - Scope: Go-like formatting for rendered values, including typed map/slice/bytes.
-- Rust: `src/gotemplates/go_compat/truth.rs`
+- Rust: `src/go_compat/truth.rs`
   - Go reference: `src/text/template/exec.go`, `src/text/template/funcs.go`
   - Scope: core truthiness + `and`/`or` short-circuit value selection semantics.
 

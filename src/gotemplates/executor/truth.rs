@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::truth::{
+use crate::go_compat::truth::{
     builtin_and as go_builtin_and, builtin_or as go_builtin_or, is_truthy as go_is_truthy,
 };
 use serde_json::Value;

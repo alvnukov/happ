@@ -1,5 +1,5 @@
-use crate::gotemplates::go_compat::textfmt::format_value_for_print;
-use crate::gotemplates::go_compat::tokenize::strip_outer_parens;
+use crate::go_compat::textfmt::format_value_for_print;
+use crate::go_compat::tokenize::strip_outer_parens;
 use serde_json::Value;
 
 pub fn call_target_display(token: Option<&str>, value: &Value) -> String {

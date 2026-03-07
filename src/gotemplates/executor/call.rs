@@ -2,8 +2,8 @@ use super::{
     eval_command_token_value, wrong_number_of_args, EvalState, NativeFunctionResolver,
     NativeFunctionResolverError, NativeRenderError,
 };
-use crate::gotemplates::go_compat::call::call_target_display;
-use crate::gotemplates::go_compat::externalfn::{
+use crate::go_compat::call::call_target_display;
+use crate::go_compat::externalfn::{
     external_call_failed_reason, is_call_builtin_identifier_candidate,
     is_external_function_identifier, undefined_function_reason,
 };

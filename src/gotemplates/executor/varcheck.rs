@@ -1,5 +1,5 @@
 use super::{EvalState, GoTemplateScanError, NativeRenderError};
-use crate::gotemplates::go_compat::varcheck::{
+use crate::go_compat::varcheck::{
     ensure_variable_is_defined as go_ensure_variable_is_defined,
     looks_like_char_literal as go_looks_like_char_literal,
     looks_like_numeric_literal as go_looks_like_numeric_literal,

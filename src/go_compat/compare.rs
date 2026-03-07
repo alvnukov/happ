@@ -1,8 +1,8 @@
-use crate::gotemplates::go_compat::typeutil::{
+use crate::go_compat::typeutil::{
     is_go_bytes_slice, is_map_object, option_string_like_bytes, option_type_name_for_template,
     value_type_name_for_template,
 };
-use crate::gotemplates::go_compat::valuefmt::format_value_like_go;
+use crate::go_compat::valuefmt::format_value_like_go;
 use crate::gotemplates::typedvalue::{
     decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_is_nil,
 };

@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::ident::is_identifier_continue_char;
+use crate::go_compat::ident::is_identifier_continue_char;
 use crate::gotemplates::typedvalue::{
     decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_len, go_string_bytes_len,
     go_type_is_interface, go_zero_value_for_type,

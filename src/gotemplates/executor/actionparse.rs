@@ -1,5 +1,5 @@
 use super::{ActionKind, ElseClause, NativeRenderError};
-use crate::gotemplates::go_compat::actionparse::{
+use crate::go_compat::actionparse::{
     parse_action_kind as go_parse_action_kind, ParsedActionKind, ParsedElseClause,
 };
 

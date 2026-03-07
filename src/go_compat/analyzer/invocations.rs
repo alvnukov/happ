@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::parse::{ListNode, Node, Tree};
+use crate::go_compat::parse::{ListNode, Node, Tree};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::syntax::{extract_template_name, offset_to_line_col};
@@ -121,7 +121,7 @@ fn collect_template_invocations_in_list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gotemplates::go_compat::parse::{parse, Mode};
+    use crate::go_compat::parse::{parse, Mode};
 
     #[test]
     fn collect_template_invocation_sites_reports_positions_and_kinds() {

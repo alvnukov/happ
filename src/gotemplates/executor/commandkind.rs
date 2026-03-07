@@ -1,9 +1,11 @@
-use crate::gotemplates::go_compat::commandkind::{
+use crate::go_compat::commandkind::{
     command_field_like_path as go_command_field_like_path,
+    is_map_like_for_field_call as go_is_map_like_for_field_call,
     is_non_executable_pipeline_head as go_is_non_executable_pipeline_head,
     non_function_command_target as go_non_function_command_target,
     FieldLikeCommandPath as GoFieldLikeCommandPath,
 };
+use serde_json::Value;
 
 pub(super) type FieldLikeCommandPath = GoFieldLikeCommandPath;
 
@@ -19,11 +21,17 @@ pub(super) fn command_field_like_path(token: &str) -> Option<FieldLikeCommandPat
     go_command_field_like_path(token)
 }
 
+pub(super) fn is_map_like_for_field_call(v: &Value) -> bool {
+    go_is_map_like_for_field_call(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        command_field_like_path, is_non_executable_pipeline_head, non_function_command_target,
+        command_field_like_path, is_map_like_for_field_call, is_non_executable_pipeline_head,
+        non_function_command_target,
     };
+    use serde_json::json;
 
     #[test]
     fn detects_non_executable_pipeline_heads() {
@@ -64,5 +72,12 @@ mod tests {
         for token in [".a..b", ".a.", "$.a..b", "$v.a..b", "$v.", ".a./b", ".a-b"] {
             assert!(command_field_like_path(token).is_none(), "token={token}");
         }
+    }
+
+    #[test]
+    fn map_like_for_field_call_excludes_string_and_slice_like_values() {
+        assert!(is_map_like_for_field_call(&json!({"k":"v"})));
+        assert!(!is_map_like_for_field_call(&json!([1, 2])));
+        assert!(!is_map_like_for_field_call(&json!("abc")));
     }
 }

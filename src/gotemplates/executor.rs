@@ -40,13 +40,14 @@ use control::{
 };
 use eval::{eval_command_token_value, eval_expr_truthy, eval_expr_value, render_output_expr};
 use commandkind::{
-    command_field_like_path, is_non_executable_pipeline_head, non_function_command_target,
+    command_field_like_path, is_map_like_for_field_call, is_non_executable_pipeline_head,
+    non_function_command_target,
 };
 use exprkind::{
     decode_string_literal, is_complex_expression, is_niladic_function_expression, is_quoted_string,
 };
 use externalfn::{try_eval_dynamic_external_function, try_eval_external_function};
-use crate::gotemplates::go_compat::ident::is_identifier_name as go_is_identifier_name;
+use crate::go_compat::ident::is_identifier_name as go_is_identifier_name;
 use govaluefmt::format_value_like_go;
 use path::resolve_simple_path;
 use pipeline_decl::{extract_pipeline_declaration, PipelineDeclMode, PipelineDeclaration};

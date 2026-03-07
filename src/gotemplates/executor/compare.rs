@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::compare::{
+use crate::go_compat::compare::{
     eq_values as go_eq_values, le_values as go_le_values, lt_values as go_lt_values, CompareError,
 };
 use super::{wrong_number_of_args, NativeRenderError};

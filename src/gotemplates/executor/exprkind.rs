@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::expr::{
+use crate::go_compat::expr::{
     decode_string_literal as go_decode_string_literal,
     is_complex_expression as go_is_complex_expression,
     is_niladic_function_expression as go_is_niladic_function_expression,

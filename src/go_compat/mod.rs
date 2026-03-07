@@ -1,3 +1,5 @@
+// Unified Go-compat layer for all behavior parity domains used by happ.
+// Keep all parity logic under this root to avoid behavior fragmentation.
 pub mod actionparse;
 pub mod analyzer;
 pub mod call;

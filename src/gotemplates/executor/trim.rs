@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::trim::{
+use crate::go_compat::trim::{
     has_left_trim_marker, has_right_trim_marker, trim_left_ascii_whitespace,
     trim_right_ascii_whitespace_in_place,
 };

@@ -2,6 +2,7 @@ pub mod compat;
 // Parity source map: src/gotemplates/go_parity_map.md
 mod executor;
 mod functions;
+// Backward-compatible alias; canonical module is `crate::go_compat`.
 pub mod go_compat;
 mod parser;
 mod planner;

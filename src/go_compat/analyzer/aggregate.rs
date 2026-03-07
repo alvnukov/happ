@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::parse::{ListNode, Node, NodeType, Tree};
+use crate::go_compat::parse::{ListNode, Node, NodeType, Tree};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::invocations::unresolved_template_diagnostics;
@@ -142,8 +142,8 @@ fn analyze_list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gotemplates::go_compat::parse::parse;
-    use crate::gotemplates::go_compat::parse::Mode;
+    use crate::go_compat::parse::parse;
+    use crate::go_compat::parse::Mode;
 
     #[test]
     fn analyze_trees_collects_counts_depth_and_template_calls() {

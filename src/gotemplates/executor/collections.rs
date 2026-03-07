@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::collections::{
+use crate::go_compat::collections::{
     builtin_index as go_builtin_index, builtin_len as go_builtin_len,
     builtin_slice as go_builtin_slice,
 };

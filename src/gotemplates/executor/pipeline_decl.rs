@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::pipeline_decl::{
+use crate::go_compat::pipeline_decl::{
     extract_pipeline_declaration as go_extract_pipeline_declaration,
     PipelineDeclMode as GoPipelineDeclMode, PipelineDeclaration as GoPipelineDeclaration,
 };

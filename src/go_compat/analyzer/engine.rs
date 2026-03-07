@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::parse::{parse, Mode, ParseError, Tree};
+use crate::go_compat::parse::{parse, Mode, ParseError, Tree};
 use std::collections::BTreeMap;
 
 use super::aggregate::{analyze_trees, unresolved_template_invocations};
@@ -94,7 +94,7 @@ mod tests {
         assert_eq!(
             result
                 .analysis
-                .count(crate::gotemplates::go_compat::parse::NodeType::Template),
+                .count(crate::go_compat::parse::NodeType::Template),
             2
         );
         assert_eq!(result.unresolved.len(), 1);

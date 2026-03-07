@@ -1,7 +1,11 @@
 use crate::gotemplates::compat;
-use crate::gotemplates::go_compat::ident::is_identifier_continue_char;
-use crate::gotemplates::go_compat::path::split_variable_reference;
-use crate::gotemplates::go_compat::tokenize::strip_outer_parens;
+use crate::go_compat::ident::is_identifier_continue_char;
+use crate::go_compat::path::split_variable_reference;
+use crate::go_compat::tokenize::strip_outer_parens;
+use crate::gotemplates::typedvalue::{
+    decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_len, go_string_bytes_len,
+};
+use serde_json::Value;
 
 pub fn is_non_executable_pipeline_head(token: &str) -> bool {
     let trimmed = token.trim();
@@ -103,6 +107,16 @@ pub fn command_field_like_path(token: &str) -> Option<FieldLikeCommandPath> {
     })
 }
 
+pub fn is_map_like_for_field_call(v: &Value) -> bool {
+    if go_bytes_len(v).is_some()
+        || go_string_bytes_len(v).is_some()
+        || decode_go_typed_slice_value(v).is_some()
+    {
+        return false;
+    }
+    decode_go_typed_map_value(v).is_some() || matches!(v, Value::Object(_))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FieldPathBase {
     Dot,
@@ -138,8 +152,10 @@ fn is_quoted_string(expr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_field_like_path, is_non_executable_pipeline_head, non_function_command_target,
+        command_field_like_path, is_map_like_for_field_call, is_non_executable_pipeline_head,
+        non_function_command_target,
     };
+    use serde_json::json;
 
     #[test]
     fn detects_non_executable_pipeline_heads() {
@@ -180,5 +196,12 @@ mod tests {
         for token in [".a..b", ".a.", "$.a..b", "$v.a..b", "$v.", ".a./b", ".a-b"] {
             assert!(command_field_like_path(token).is_none(), "token={token}");
         }
+    }
+
+    #[test]
+    fn map_like_for_field_call_excludes_string_and_slice_like_values() {
+        assert!(is_map_like_for_field_call(&json!({"k":"v"})));
+        assert!(!is_map_like_for_field_call(&json!([1, 2])));
+        assert!(!is_map_like_for_field_call(&json!("abc")));
     }
 }

@@ -1,7 +1,7 @@
 use super::{
     undefined_variable_error, EvalState, NativeRenderError, PipelineDeclMode, PipelineDeclaration,
 };
-use crate::gotemplates::go_compat::rangeeval::{
+use crate::go_compat::rangeeval::{
     range_items as go_range_items, RangeItemsError,
 };
 use serde_json::Value;

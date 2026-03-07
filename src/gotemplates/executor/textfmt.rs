@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::textfmt::{
+use crate::go_compat::textfmt::{
     builtin_html as go_builtin_html, builtin_js as go_builtin_js,
     builtin_print as go_builtin_print, builtin_urlquery as go_builtin_urlquery,
     format_value_for_print as go_format_value_for_print,

@@ -1,5 +1,5 @@
 use super::{MissingValueMode, NativeRenderError};
-use crate::gotemplates::go_compat::path::{
+use crate::go_compat::path::{
     resolve_simple_path as go_resolve_simple_path,
     split_variable_reference as go_split_variable_reference, PathMissingValueMode,
     ResolveSimplePathError,

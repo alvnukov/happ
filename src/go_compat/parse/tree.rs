@@ -85,7 +85,7 @@ impl Tree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gotemplates::go_compat::parse::node::{Node, TextNode};
+    use crate::go_compat::parse::node::{Node, TextNode};
 
     #[test]
     fn tree_copy_preserves_content() {

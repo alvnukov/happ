@@ -1,5 +1,5 @@
 use super::{GoTemplateScanError, Tok, TokKind};
-use crate::gotemplates::go_compat::ident::{
+use crate::go_compat::ident::{
     is_identifier_continue_char, is_identifier_start_char,
 };
 // Go parity reference: stdlib text/template/parse/lex.go.

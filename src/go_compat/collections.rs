@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::typeutil::{
+use crate::go_compat::typeutil::{
     map_key_arg, option_type_name_for_template, parse_slice_like_index,
     value_from_go_string_bytes, value_type_name_for_template, MapKeyArg, ParseSliceLikeIndexError,
     SliceLikeIndexMode,

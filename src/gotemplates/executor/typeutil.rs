@@ -1,5 +1,5 @@
 use super::{format_value_for_print, NativeRenderError};
-use crate::gotemplates::go_compat::typeutil::{
+use crate::go_compat::typeutil::{
     is_go_bytes_slice as go_is_go_bytes_slice, is_map_object as go_is_map_object,
     map_key_arg as go_map_key_arg, option_string_like_bytes as go_option_string_like_bytes,
     option_type_name_for_template as go_option_type_name_for_template,
@@ -11,7 +11,7 @@ use crate::gotemplates::go_compat::typeutil::{
 use serde_json::Value;
 use std::borrow::Cow;
 
-pub(super) use crate::gotemplates::go_compat::typeutil::MapKeyArg;
+pub(super) use crate::go_compat::typeutil::MapKeyArg;
 
 pub(super) fn parse_slice_like_index(
     action: &str,

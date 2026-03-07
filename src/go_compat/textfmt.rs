@@ -1,4 +1,4 @@
-use crate::gotemplates::go_compat::valuefmt::format_value_like_go;
+use crate::go_compat::valuefmt::format_value_like_go;
 use crate::gotemplates::typedvalue::{decode_go_string_bytes_value, go_string_bytes_len};
 use serde_json::Value;
 
