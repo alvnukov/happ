@@ -172,6 +172,35 @@ fn parser_accepts_unicode_function_and_variable_names() {
 }
 
 #[test]
+fn parser_accepts_digit_started_variable_names_like_go() {
+    let action = parse_action_compat_with_options(
+        "{{ $1 := 7 }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: true,
+            known_functions: &[],
+            check_variables: true,
+            visible_variables: &[],
+        },
+    )
+    .expect("must parse");
+    assert_eq!(action, ControlAction::None);
+
+    let action = parse_action_compat_with_options(
+        "{{ $1 }}",
+        0,
+        ParseCompatOptions {
+            skip_func_check: true,
+            known_functions: &[],
+            check_variables: true,
+            visible_variables: &["$1"],
+        },
+    )
+    .expect("must parse");
+    assert_eq!(action, ControlAction::None);
+}
+
+#[test]
 fn parser_rejects_multi_decl_outside_range() {
     let err = parse_action_compat_with_options(
         "{{ with $v, $u := 3 }}",

@@ -865,6 +865,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_template_tokens_strict_accepts_digit_started_variables_like_go() {
+        let src = "{{ $1 := 7 }}{{ $1 }}";
+        parse_template_tokens_strict_with_options(
+            src,
+            ParseCompatOptions {
+                skip_func_check: true,
+                known_functions: &[],
+                check_variables: true,
+                visible_variables: &[],
+            },
+        )
+        .expect("must parse");
+    }
+
+    #[test]
     fn parse_template_tokens_strict_variable_scope_ends_on_end_action() {
         let src = "{{ with $x := 4 }}{{ end }}{{ $x }}";
         let err = parse_template_tokens_strict_with_options(
