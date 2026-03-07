@@ -85,8 +85,11 @@ target until the used surface is fully stabilized.
     non-comparable diagnostics and signed/unsigned integer cross-comparison.
 - Rust: `src/gotemplates/executor/collections.rs`
   - Go reference: `src/text/template/funcs.go`
-  - Scope: used collection builtins (`len/index/slice`) with Go-compatible
-    bounds, missing-key behavior and index diagnostics.
+  - Scope: adapter layer mapping runtime collection builtin calls into go_compat APIs.
+- Rust: `src/gotemplates/go_compat/collections.rs`
+  - Go reference: `src/text/template/funcs.go`
+  - Scope: core collection builtins (`len/index/slice`) with Go-compatible bounds,
+    map-key coercion, typed nil/zero behavior and reflect-style out-of-range diagnostics.
 - Rust: `src/gotemplates/executor/truth.rs`
   - Go reference: `src/text/template/exec.go`, `src/text/template/funcs.go`
   - Scope: truthiness semantics and `and/or/not` short-circuit result behavior.
