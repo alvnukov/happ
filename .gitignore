@@ -1,4 +1,6 @@
 target/
+!src/go_compat/helm_ir_ffi_helper/vendor/sigs.k8s.io/kustomize/api/internal/target/
+!src/go_compat/helm_ir_ffi_helper/vendor/sigs.k8s.io/kustomize/api/internal/target/**
 dist/
 .DS_Store
 
