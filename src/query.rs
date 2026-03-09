@@ -42,13 +42,8 @@ pub fn run_query_stream(
     query: &str,
     input_stream: Vec<JsonValue>,
 ) -> Result<Vec<JsonValue>, Error> {
-    zq::run_jq_stream_with_paths_options(
-        query,
-        input_stream,
-        &[],
-        zq::EngineRunOptions::default(),
-    )
-    .map_err(map_engine_error)
+    zq::run_jq_stream_with_paths_options(query, input_stream, &[], zq::EngineRunOptions::default())
+        .map_err(map_engine_error)
 }
 
 pub fn parse_input_docs_prefer_json(input: &str) -> Result<Vec<JsonValue>, Error> {

@@ -197,7 +197,10 @@ fn handle_connection(
             .get("yamlAnchors")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let pretty = payload.get("pretty").and_then(|v| v.as_bool()).unwrap_or(true);
+        let pretty = payload
+            .get("pretty")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let (ok, output) = match convert_payload_with_options(
             mode,
             input,
@@ -1594,7 +1597,8 @@ fn render_structured_output(
                 )
                 .map_err(|e| format!("YAML format error: {e}"))
             } else {
-                zq::format_output_yaml_documents(values).map_err(|e| format!("YAML format error: {e}"))
+                zq::format_output_yaml_documents(values)
+                    .map_err(|e| format!("YAML format error: {e}"))
             }
         }
         StructuredFormat::Toml => render_toml_output_json(values, pretty),
@@ -1768,7 +1772,9 @@ fn render_toml_output_json(values: &[serde_json::Value], pretty: bool) -> Result
 
 fn json_to_toml_value(value: &serde_json::Value) -> Result<toml::Value, String> {
     match value {
-        serde_json::Value::Null => Err("encode toml: null is not supported in TOML output".to_string()),
+        serde_json::Value::Null => {
+            Err("encode toml: null is not supported in TOML output".to_string())
+        }
         serde_json::Value::Bool(v) => Ok(toml::Value::Boolean(*v)),
         serde_json::Value::Number(v) => {
             if let Some(i) = v.as_i64() {
@@ -1843,9 +1849,10 @@ fn render_csv_output_json(values: &[serde_json::Value]) -> Result<String, String
                 .max(1);
             for value in values {
                 let mut row = match value {
-                    serde_json::Value::Array(items) => {
-                        items.iter().map(json_to_csv_cell).collect::<Result<Vec<_>, _>>()?
-                    }
+                    serde_json::Value::Array(items) => items
+                        .iter()
+                        .map(json_to_csv_cell)
+                        .collect::<Result<Vec<_>, _>>()?,
                     other => vec![json_to_csv_cell(other)?],
                 };
                 if row.len() < width {
@@ -2011,7 +2018,9 @@ fn write_xml_element_json(
             out.push_str("/>");
             Ok(())
         }
-        serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::String(_) => {
+        serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {
             out.push('<');
             out.push_str(name);
             out.push('>');
@@ -2368,10 +2377,12 @@ fn join_semantic_diff_key(base: &str, key: &str) -> String {
         let mut chars = key.chars();
         match chars.next() {
             Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
-            _ => return format!(
-                "{base}[{}]",
-                serde_json::to_string(key).unwrap_or_else(|_| "\"<invalid>\"".to_string())
-            ),
+            _ => {
+                return format!(
+                    "{base}[{}]",
+                    serde_json::to_string(key).unwrap_or_else(|_| "\"<invalid>\"".to_string())
+                )
+            }
         }
         chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
     };
@@ -8778,8 +8789,8 @@ text: |-
 
     #[test]
     fn convert_payload_rejects_bad_mode() {
-        let err = convert_payload("bad", "a: 1", "all", None, "yaml", "json", false)
-            .expect_err("error");
+        let err =
+            convert_payload("bad", "a: 1", "all", None, "yaml", "json", false).expect_err("error");
         assert!(err.contains("unsupported mode"));
     }
 
@@ -8879,16 +8890,9 @@ text: |-
   "app3":{"cfg":{"name":"svc","ports":[80,443],"labels":{"tier":"web","team":"core"}}},
   "app4":{"cfg":{"name":"svc","ports":[80,443],"labels":{"tier":"web","team":"core"}}}
 }"#;
-        let with_anchors = convert_payload(
-            "structured-convert",
-            src,
-            "all",
-            None,
-            "json",
-            "yaml",
-            true,
-        )
-        .expect("json->yaml with anchors");
+        let with_anchors =
+            convert_payload("structured-convert", src, "all", None, "json", "yaml", true)
+                .expect("json->yaml with anchors");
         let without_anchors = convert_payload(
             "structured-convert",
             src,
@@ -9008,12 +9012,7 @@ text: |-
     fn format_web_query_error_adds_input_context_and_hint() {
         let input = "a: 1\nb: [\n";
         let parse_err = crate::query::parse_input_docs_prefer_yaml(input).expect_err("must fail");
-        let err = format_web_query_error(
-            "jq",
-            ".",
-            input,
-            &parse_err,
-        );
+        let err = format_web_query_error("jq", ".", input, &parse_err);
         assert!(err.contains("jq: yaml:"));
         assert!(err.contains("input context:"));
         assert!(err.contains("| b: ["));
@@ -9021,18 +9020,16 @@ text: |-
 
     #[test]
     fn semantic_diff_payload_finds_changes() {
-        let out =
-            semantic_diff_payload("a: 1\n", "a: 2\n", "yaml", "yaml", "diff", false, false)
-                .expect("diff");
+        let out = semantic_diff_payload("a: 1\n", "a: 2\n", "yaml", "yaml", "diff", false, false)
+            .expect("diff");
         assert!(out.contains("changed:"));
         assert!(out.contains("$.a"));
     }
 
     #[test]
     fn semantic_diff_payload_no_differences() {
-        let out =
-            semantic_diff_payload("a: 1\n", "a: 1\n", "yaml", "yaml", "diff", false, false)
-                .expect("diff");
+        let out = semantic_diff_payload("a: 1\n", "a: 1\n", "yaml", "yaml", "diff", false, false)
+            .expect("diff");
         assert_eq!(out, "No semantic differences");
     }
 
@@ -9050,16 +9047,9 @@ text: |-
         .expect("summary");
         assert!(summary.contains("equal=true"));
 
-        let json_out = semantic_diff_payload(
-            "a: 1\n",
-            r#"{"a":2}"#,
-            "yaml",
-            "json",
-            "json",
-            false,
-            false,
-        )
-        .expect("json");
+        let json_out =
+            semantic_diff_payload("a: 1\n", r#"{"a":2}"#, "yaml", "json", "json", false, false)
+                .expect("json");
         let payload: serde_json::Value = serde_json::from_str(&json_out).expect("json parse");
         assert_eq!(payload["equal"], false);
         assert!(payload["summary"]["total"].as_u64().unwrap_or(0) >= 1);

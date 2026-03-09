@@ -847,8 +847,14 @@ apps-k8s-manifests:
         )
         .expect("parse values");
 
-        generate_consumer_chart(out.to_str().expect("path"), Some("demo"), &values, None, false)
-            .expect("generate");
+        generate_consumer_chart(
+            out.to_str().expect("path"),
+            Some("demo"),
+            &values,
+            None,
+            false,
+        )
+        .expect("generate");
 
         let saved = fs::read_to_string(out.join("values.yaml")).expect("read values");
         assert!(saved.contains(r#"include "foo.bar" $"#));

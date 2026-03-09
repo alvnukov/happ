@@ -20,6 +20,11 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
       - name: Setup Node.js (for web UI tests)
         uses: actions/setup-node@v4
         with:
@@ -84,6 +89,11 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -161,6 +171,11 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
       - name: Setup musl toolchain (Linux static build)
         if: ${{ matrix.rust_target != '' }}
         shell: bash
@@ -214,6 +229,11 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
 
       - name: Install packaging tools
         run: |
