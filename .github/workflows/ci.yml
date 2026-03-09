@@ -23,7 +23,7 @@ jobs:
       - name: Setup Go toolchain
         uses: actions/setup-go@v5
         with:
-          go-version: "stable"
+          go-version: "1.25.7"
 
       - name: Setup Node.js (for web UI tests)
         uses: actions/setup-node@v4
@@ -93,7 +93,7 @@ jobs:
       - name: Setup Go toolchain
         uses: actions/setup-go@v5
         with:
-          go-version: "stable"
+          go-version: "1.25.7"
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -174,7 +174,7 @@ jobs:
       - name: Setup Go toolchain
         uses: actions/setup-go@v5
         with:
-          go-version: "stable"
+          go-version: "1.25.7"
 
       - name: Setup musl toolchain (Linux static build)
         if: ${{ matrix.rust_target != '' }}
@@ -233,7 +233,7 @@ jobs:
       - name: Setup Go toolchain
         uses: actions/setup-go@v5
         with:
-          go-version: "stable"
+          go-version: "1.25.7"
 
       - name: Install packaging tools
         run: |

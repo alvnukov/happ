@@ -5,7 +5,7 @@
       "Main Import",
       "Converters",
       "jq Playground",
-      "dyff Compare"
+      "Semantic Diff"
     ],
     "minWidths": {
       "mainImport": 1100,

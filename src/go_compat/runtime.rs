@@ -295,42 +295,59 @@ fn render_with_go_ffi(
             reason: "go_ffi-only mode: resolver callbacks are not supported".to_string(),
         });
     }
-    go_ffi::render_template_via_go_ffi(src, root, options).map_err(|err| match err {
-        go_ffi::GoFfiError::Unavailable(reason) => NativeRenderError::UnsupportedAction {
-            action: "{{ ... }}".to_string(),
-            reason: format!("go_ffi unavailable: {reason}"),
+    match go_ffi::render_template_via_go_ffi(src, root, options) {
+        Ok(rendered) => Ok(rendered),
+        Err(err) => match err {
+            go_ffi::GoFfiError::Unavailable(reason) => Err(NativeRenderError::UnsupportedAction {
+                action: "{{ ... }}".to_string(),
+                reason: format!("go_ffi unavailable: {reason}"),
+            }),
+            go_ffi::GoFfiError::Parse(reason) => {
+                if reason.contains("is not a defined function")
+                    || reason.starts_with("illegal number syntax:")
+                    || reason.starts_with("invalid syntax")
+                {
+                    Err(NativeRenderError::UnsupportedAction {
+                        action: "{{ ... }}".to_string(),
+                        reason,
+                    })
+                } else {
+                    Err(NativeRenderError::Parse(GoTemplateScanError {
+                        code: go_ffi::parse_error_code(&reason),
+                        message: reason,
+                        offset: 0,
+                    }))
+                }
+            }
+            go_ffi::GoFfiError::Execute(reason) => {
+                if should_retry_with_go_compat_for_execute_error(&reason) {
+                    let mut compat_options = options;
+                    compat_options.logic_backend = LogicBackend::GoCompat;
+                    if let Ok(rendered) = render_with_go_compat(src, root, compat_options, resolver)
+                    {
+                        return Ok(rendered);
+                    }
+                }
+                if let Some(path) = extract_missing_value_path_from_reason(&reason) {
+                    Err(NativeRenderError::MissingValue {
+                        action: "{{ ... }}".to_string(),
+                        path,
+                    })
+                } else {
+                    Err(NativeRenderError::UnsupportedAction {
+                        action: "{{ ... }}".to_string(),
+                        reason,
+                    })
+                }
+            }
         },
-        go_ffi::GoFfiError::Parse(reason) => {
-            if reason.contains("is not a defined function")
-                || reason.starts_with("illegal number syntax:")
-                || reason.starts_with("invalid syntax")
-            {
-                NativeRenderError::UnsupportedAction {
-                    action: "{{ ... }}".to_string(),
-                    reason,
-                }
-            } else {
-                NativeRenderError::Parse(GoTemplateScanError {
-                    code: go_ffi::parse_error_code(&reason),
-                    message: reason,
-                    offset: 0,
-                })
-            }
-        }
-        go_ffi::GoFfiError::Execute(reason) => {
-            if let Some(path) = extract_missing_value_path_from_reason(&reason) {
-                NativeRenderError::MissingValue {
-                    action: "{{ ... }}".to_string(),
-                    path,
-                }
-            } else {
-                NativeRenderError::UnsupportedAction {
-                    action: "{{ ... }}".to_string(),
-                    reason,
-                }
-            }
-        }
-    })
+    }
+}
+
+fn should_retry_with_go_compat_for_execute_error(reason: &str) -> bool {
+    // Some Go releases used by CI/packaging runners do not support integer
+    // `range` in text/template yet. GoCompat does, so we retry there.
+    reason.starts_with("range can't iterate over ")
 }
 
 fn extract_missing_value_path_from_reason(reason: &str) -> Option<String> {

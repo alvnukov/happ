@@ -24,6 +24,7 @@ const GO_FFI_POLL_INTERVAL_MS: u64 = 5;
 const DEFAULT_GO_FFI_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_GO_FFI_MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_GO_FFI_MAX_STDERR_BYTES: usize = 512 * 1024;
+const DEFAULT_GO_FFI_TOOLCHAIN: &str = "go1.25.7";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum GoFfiError {
@@ -304,6 +305,7 @@ fn build_helper_binary() -> Result<PathBuf, String> {
         return Err("disabled via HAPP_GO_FFI_DISABLE".to_string());
     }
     let go_bin = env::var("HAPP_GO_BIN").unwrap_or_else(|_| "go".to_string());
+    let go_toolchain = go_ffi_toolchain();
     let cache_dir = helper_cache_dir();
     fs::create_dir_all(&cache_dir).map_err(|err| {
         format!(
@@ -333,20 +335,24 @@ fn build_helper_binary() -> Result<PathBuf, String> {
     })?;
 
     let output = Command::new(&go_bin)
+        .env("GOTOOLCHAIN", &go_toolchain)
         .arg("build")
         .arg("-trimpath")
         .arg("-o")
         .arg(&bin_path)
         .arg(&src_path)
         .output()
-        .map_err(|err| format!("failed to run {go_bin} build: {err}"))?;
+        .map_err(|err| format!("failed to run {go_bin} build (toolchain={go_toolchain}): {err}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
             format!("go build failed with status {}", output.status)
         } else {
-            format!("go build failed with status {}: {stderr}", output.status)
+            format!(
+                "go build failed with status {} (toolchain={}): {stderr}",
+                output.status, go_toolchain
+            )
         });
     }
 
@@ -375,11 +381,16 @@ fn helper_stamp_path(cache_dir: &Path) -> PathBuf {
 fn helper_stamp_payload() -> String {
     // Stamp lets us reuse the helper across happ process restarts and rebuild only on source change.
     format!(
-        "helper_hash={:016x}\nos={}\narch={}\n",
+        "helper_hash={:016x}\nos={}\narch={}\ntoolchain={}\n",
         fnv1a64(GO_FFI_HELPER_SOURCE.as_bytes()),
         std::env::consts::OS,
-        std::env::consts::ARCH
+        std::env::consts::ARCH,
+        go_ffi_toolchain()
     )
+}
+
+fn go_ffi_toolchain() -> String {
+    env::var("HAPP_GO_TOOLCHAIN").unwrap_or_else(|_| DEFAULT_GO_FFI_TOOLCHAIN.to_string())
 }
 
 fn missing_key_option(mode: MissingValueMode) -> &'static str {

@@ -1,9 +1,12 @@
 use happ::gotemplates::{render_template_native, NativeRenderError};
 use serde_json::json;
+use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
+
+const DEFAULT_GO_TEST_TOOLCHAIN: &str = "go1.25.7";
 
 #[test]
 fn native_executor_matches_go_std_exec_success_subset() {
@@ -357,7 +360,7 @@ fn source_like_data() -> serde_json::Value {
 }
 
 fn has_go_toolchain() -> bool {
-    Command::new("go")
+    go_command()
         .arg("version")
         .output()
         .is_ok_and(|out| out.status.success())
@@ -398,6 +401,7 @@ impl GoExecRunner {
         let encoded_data = base64_encode(data_json.as_bytes());
 
         let output = Command::new("go")
+            .env("GOTOOLCHAIN", go_toolchain())
             .arg("run")
             .arg(&self.program)
             .arg(encoded_templates)
@@ -416,6 +420,16 @@ impl GoExecRunner {
         serde_json::from_slice::<Vec<GoBatchResult>>(&output.stdout)
             .map_err(|e| format!("decode go results: {e}"))
     }
+}
+
+fn go_command() -> Command {
+    let mut cmd = Command::new("go");
+    cmd.env("GOTOOLCHAIN", go_toolchain());
+    cmd
+}
+
+fn go_toolchain() -> String {
+    env::var("HAPP_GO_TEST_TOOLCHAIN").unwrap_or_else(|_| DEFAULT_GO_TEST_TOOLCHAIN.to_string())
 }
 
 fn base64_encode(input: &[u8]) -> String {
