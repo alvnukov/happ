@@ -76,9 +76,10 @@ pub fn parse_action_kind(action: &str) -> Result<ParsedActionKind, ActionParseEr
         return Ok(ParsedActionKind::Block { name, arg });
     }
     if let Some(rest) = inner.strip_prefix("template ") {
-        let (name, arg) = parse_template_invocation_clause(rest).ok_or_else(|| ActionParseError {
-            reason: "template clause must be: template \"name\" [arg]".to_string(),
-        })?;
+        let (name, arg) =
+            parse_template_invocation_clause(rest).ok_or_else(|| ActionParseError {
+                reason: "template clause must be: template \"name\" [arg]".to_string(),
+            })?;
         return Ok(ParsedActionKind::Template { name, arg });
     }
     if inner == "break" {

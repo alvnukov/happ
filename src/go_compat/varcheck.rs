@@ -58,6 +58,9 @@ mod tests {
                 name: "$x".to_string(),
             }
         );
-        assert_eq!(undefined_variable_message(&err.name), "undefined variable \"$x\"");
+        assert_eq!(
+            undefined_variable_message(&err.name),
+            "undefined variable \"$x\""
+        );
     }
 }

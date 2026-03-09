@@ -25,10 +25,15 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Test happ (Rust)
+      - name: Lint happ (Rust)
         run: |
           set -euo pipefail
           cargo fmt --check
+          cargo clippy --workspace --all-targets --locked
+
+      - name: Test happ (Rust)
+        run: |
+          set -euo pipefail
           cargo test --locked
 
       - name: Parity matrix (happ CLI contracts)
@@ -41,6 +46,17 @@ jobs:
           set -euo pipefail
           cd web
           npm ci
+
+      - name: Lint web assets
+        run: |
+          set -euo pipefail
+          cd web
+          npm run lint
+
+      - name: Install Chromium (Playwright)
+        run: |
+          set -euo pipefail
+          cd web
           npx playwright install --with-deps chromium
 
       - name: Build happ for web UI tests
@@ -176,6 +192,61 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: dist/${{ matrix.asset_name }}
 
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build happ Windows binary
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --locked
+          if (!(Test-Path "target/release/happ.exe")) {
+            throw "target/release/happ.exe is missing after build"
+          }
+
+      - name: Install NSIS
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install nsis --no-progress -y
+
+      - name: Build Windows installer (.exe)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $versionLine = (Get-Content Cargo.toml | Select-String '^version = ' | Select-Object -First 1)
+          if (-not $versionLine) {
+            throw "Unable to detect version in Cargo.toml"
+          }
+          $version = ($versionLine.ToString().Split('"'))[1]
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $makensis = Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"
+          if (!(Test-Path $makensis)) {
+            throw "makensis is not found at $makensis"
+          }
+          & $makensis `
+            /DVERSION=$version `
+            /DINPUT_BIN=target\release\happ.exe `
+            /DOUTPUT_EXE=dist\happ_windows_amd64_installer.exe `
+            packaging\windows\happ_installer.nsi
+          if (!(Test-Path "dist/happ_windows_amd64_installer.exe")) {
+            throw "Windows installer was not produced"
+          }
+
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: happ_windows_amd64_installer
+          path: dist/happ_windows_amd64_installer.exe
+
   linux-packages:
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -245,6 +316,7 @@ jobs:
       - test
       - coverage
       - platform-build
+      - windows-installer
       - linux-packages
     runs-on: ubuntu-latest
     permissions:
@@ -265,6 +337,7 @@ jobs:
           test -s dist/happ_darwin_amd64
           test -s dist/happ_darwin_arm64
           test -s dist/happ_windows_amd64.exe
+          test -s dist/happ_windows_amd64_installer.exe
           compgen -G "dist/happ_*_amd64.deb" > /dev/null
           compgen -G "dist/happ_*_arm64.deb" > /dev/null
           compgen -G "dist/happ-*-1.x86_64.rpm" > /dev/null
@@ -280,6 +353,7 @@ jobs:
             dist/happ_darwin_amd64
             dist/happ_darwin_arm64
             dist/happ_windows_amd64.exe
+            dist/happ_windows_amd64_installer.exe
             dist/happ_*_amd64.deb
             dist/happ_*_arm64.deb
             dist/happ-*-1.x86_64.rpm

@@ -1,5 +1,5 @@
-use crate::go_compat::valuefmt::format_value_like_go;
 use crate::go_compat::typedvalue::{decode_go_string_bytes_value, go_string_bytes_len};
+use crate::go_compat::valuefmt::format_value_like_go;
 use serde_json::Value;
 
 // Go parity reference: stdlib text/template/funcs.go.

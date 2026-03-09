@@ -9,6 +9,13 @@ const VUE_GLOBAL_PROD_JS: &str = include_str!("../assets/vue.global.prod.js");
 const CODEMIRROR_BUNDLE_JS: &str = include_str!("../assets/codemirror.bundle.js");
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#5a81e6"/><stop offset="100%" stop-color="#6ed1bb"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="14" fill="#1a1d22" stroke="url(#g)" stroke-width="3"/><path d="M19 19h8v10h10V19h8v26h-8V35H27v10h-8z" fill="#e9edf7"/></svg>"##;
 const MAX_HTTP_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_UPLOAD_FILES: usize = 2_048;
+const DEFAULT_MAX_UPLOAD_FILE_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_UPLOAD_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_UPLOAD_PATH_BYTES: usize = 1_024;
+const DEFAULT_MAX_UPLOAD_PATH_DEPTH: usize = 24;
+const DEFAULT_MAX_FS_LIST_ENTRIES: usize = 20_000;
+const DEFAULT_MAX_CHART_VALUES_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn serve(
     addr: &str,
@@ -170,6 +177,14 @@ fn handle_connection(
             .get("input")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        let input_format = payload
+            .get("inputFormat")
+            .and_then(|v| v.as_str())
+            .unwrap_or("yaml");
+        let output_format = payload
+            .get("outputFormat")
+            .and_then(|v| v.as_str())
+            .unwrap_or("json");
         let doc_mode = payload
             .get("docMode")
             .and_then(|v| v.as_str())
@@ -178,7 +193,21 @@ fn handle_connection(
             .get("docIndex")
             .and_then(|v| v.as_u64())
             .map(|x| x as usize);
-        let (ok, output) = match convert_payload(mode, input, doc_mode, doc_index) {
+        let yaml_anchors = payload
+            .get("yamlAnchors")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let pretty = payload.get("pretty").and_then(|v| v.as_bool()).unwrap_or(true);
+        let (ok, output) = match convert_payload_with_options(
+            mode,
+            input,
+            doc_mode,
+            doc_index,
+            input_format,
+            output_format,
+            yaml_anchors,
+            pretty,
+        ) {
             Ok(v) => (true, v),
             Err(e) => (false, e),
         };
@@ -229,7 +258,7 @@ fn handle_connection(
         )
         .map_err(|e| e.to_string());
     }
-    if route_path == "/api/dyff" && method == "POST" {
+    if (route_path == "/api/dyff" || route_path == "/api/semantic-diff") && method == "POST" {
         let payload: serde_json::Value =
             serde_json::from_str(body).map_err(|e| format!("invalid JSON request: {e}"))?;
         let from = payload
@@ -240,6 +269,18 @@ fn handle_connection(
             .get("to")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        let from_format = payload
+            .get("fromFormat")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto");
+        let to_format = payload
+            .get("toFormat")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto");
+        let output_format = payload
+            .get("outputFormat")
+            .and_then(|v| v.as_str())
+            .unwrap_or("diff");
         let ignore_order = payload
             .get("ignoreOrder")
             .and_then(|v| v.as_bool())
@@ -248,7 +289,15 @@ fn handle_connection(
             .get("ignoreWhitespace")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let (ok, output) = match dyff_payload(from, to, ignore_order, ignore_whitespace) {
+        let (ok, output) = match semantic_diff_payload(
+            from,
+            to,
+            from_format,
+            to_format,
+            output_format,
+            ignore_order,
+            ignore_whitespace,
+        ) {
             Ok(v) => (true, v),
             Err(e) => (false, e),
         };
@@ -397,6 +446,10 @@ fn handle_connection(
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .filter(|x| !x.trim().is_empty());
+        let yaml_anchors = payload
+            .get("yamlAnchors")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let (ok, values_yaml, message, source_count) = match import_payload(
             source_type,
             path,
@@ -419,6 +472,7 @@ fn handle_connection(
             allow_template_includes,
             unsupported_template_mode,
             chart_values_yaml,
+            yaml_anchors,
         ) {
             Ok((values, msg, cnt)) => (true, values, msg, cnt),
             Err(e) => (false, String::new(), e, 0usize),
@@ -601,6 +655,10 @@ fn handle_connection(
             .get("valuesYaml")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        let yaml_anchors = payload
+            .get("yamlAnchors")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let (ok, message) = match save_chart_payload(
             source_type,
@@ -609,6 +667,7 @@ fn handle_connection(
             chart_name.as_deref(),
             library_chart_path.as_deref(),
             values_yaml,
+            yaml_anchors,
         ) {
             Ok(msg) => (true, msg),
             Err(e) => (false, e),
@@ -714,6 +773,10 @@ fn handle_connection(
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .filter(|x| !x.trim().is_empty());
+        let yaml_anchors = payload
+            .get("yamlAnchors")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let files = payload
             .get("files")
@@ -751,6 +814,7 @@ fn handle_connection(
             allow_template_includes,
             unsupported_template_mode,
             chart_values_yaml,
+            yaml_anchors,
         ) {
             Ok((values, msg, cnt)) => (true, values, msg, cnt),
             Err(e) => (false, String::new(), e, 0usize),
@@ -833,6 +897,12 @@ fn read_http_request(stream: &mut TcpStream) -> Result<String, String> {
             if let Some(h_end) = header_end {
                 let header = String::from_utf8_lossy(&data[..h_end]);
                 content_length = parse_content_length(&header);
+                if content_length > MAX_HTTP_REQUEST_BYTES {
+                    return Err(format!(
+                        "request too large: Content-Length={} exceeds max {}",
+                        content_length, MAX_HTTP_REQUEST_BYTES
+                    ));
+                }
             }
         }
         if let Some(h_end) = header_end {
@@ -897,14 +967,31 @@ fn create_upload_temp_dir() -> Result<PathBuf, String> {
 }
 
 fn sanitize_relative_path(p: &str) -> Result<PathBuf, String> {
+    if p.len() > max_upload_path_bytes() {
+        return Err(format!(
+            "upload path is too long ({} bytes, max {})",
+            p.len(),
+            max_upload_path_bytes()
+        ));
+    }
     let path = Path::new(p);
     if path.is_absolute() {
         return Err(format!("absolute path is not allowed in upload: {p}"));
     }
     let mut out = PathBuf::new();
+    let mut depth = 0usize;
     for c in path.components() {
         match c {
-            std::path::Component::Normal(v) => out.push(v),
+            std::path::Component::Normal(v) => {
+                depth += 1;
+                if depth > max_upload_path_depth() {
+                    return Err(format!(
+                        "upload path is too deep (max {} segments): {p}",
+                        max_upload_path_depth()
+                    ));
+                }
+                out.push(v);
+            }
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 return Err(format!("parent path '..' is not allowed in upload: {p}"));
@@ -940,6 +1027,12 @@ fn list_fs_entries(input_path: &str) -> Result<(String, String, Vec<serde_json::
     for ent in
         std::fs::read_dir(&current).map_err(|e| format!("read_dir '{}': {e}", current.display()))?
     {
+        if entries.len() >= max_fs_list_entries() {
+            return Err(format!(
+                "directory has too many entries (max {}). Narrow the path.",
+                max_fs_list_entries()
+            ));
+        }
         let ent = ent.map_err(|e| format!("read_dir entry '{}': {e}", current.display()))?;
         let path = ent.path();
         let name = ent.file_name().to_string_lossy().to_string();
@@ -979,6 +1072,16 @@ fn load_chart_values_from_path(chart_path: &str) -> Result<String, String> {
         ));
     }
     let values_path = root.join("values.yaml");
+    let meta = std::fs::metadata(&values_path)
+        .map_err(|e| format!("stat '{}': {e}", values_path.display()))?;
+    let bytes = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+    if bytes > max_chart_values_bytes() {
+        return Err(format!(
+            "values.yaml is too large: {} bytes (max {})",
+            bytes,
+            max_chart_values_bytes()
+        ));
+    }
     let content = std::fs::read_to_string(&values_path)
         .map_err(|e| format!("read '{}': {e}", values_path.display()))?;
     Ok(content)
@@ -992,6 +1095,14 @@ fn write_uploaded_files(
     if files.is_empty() {
         return Err("no files selected".to_string());
     }
+    if files.len() > max_upload_files() {
+        return Err(format!(
+            "too many uploaded files: {} (max {})",
+            files.len(),
+            max_upload_files()
+        ));
+    }
+    let mut total_bytes = 0usize;
     let mut compose_file: Option<PathBuf> = None;
     for item in files {
         let rel = item
@@ -1008,8 +1119,39 @@ fn write_uploaded_files(
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create upload parent dir: {e}"))?;
         }
+        let estimated = estimate_base64_decoded_bytes(b64);
+        if estimated > max_upload_file_bytes() {
+            return Err(format!(
+                "uploaded file '{}' is too large (estimated {} bytes, max {})",
+                rel,
+                estimated,
+                max_upload_file_bytes()
+            ));
+        }
+        if total_bytes.saturating_add(estimated) > max_upload_total_bytes() {
+            return Err(format!(
+                "total upload is too large (estimated > {} bytes)",
+                max_upload_total_bytes()
+            ));
+        }
         let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
             .map_err(|e| format!("base64 decode for '{rel}': {e}"))?;
+        if bytes.len() > max_upload_file_bytes() {
+            return Err(format!(
+                "uploaded file '{}' is too large: {} bytes (max {})",
+                rel,
+                bytes.len(),
+                max_upload_file_bytes()
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > max_upload_total_bytes() {
+            return Err(format!(
+                "total upload is too large: {} bytes (max {})",
+                total_bytes,
+                max_upload_total_bytes()
+            ));
+        }
         std::fs::write(&full, bytes).map_err(|e| format!("write upload file '{rel}': {e}"))?;
         if source_type.eq_ignore_ascii_case("compose") {
             let name = rel.to_ascii_lowercase();
@@ -1026,6 +1168,62 @@ fn write_uploaded_files(
     } else {
         Ok(tmp_root.to_path_buf())
     }
+}
+
+fn estimate_base64_decoded_bytes(input: &str) -> usize {
+    // Upper bound, safe for pre-checks.
+    input.len().saturating_add(3) / 4 * 3
+}
+
+fn max_upload_files() -> usize {
+    env_usize_or("HAPP_WEB_MAX_UPLOAD_FILES", DEFAULT_MAX_UPLOAD_FILES)
+}
+
+fn max_upload_file_bytes() -> usize {
+    env_usize_or(
+        "HAPP_WEB_MAX_UPLOAD_FILE_BYTES",
+        DEFAULT_MAX_UPLOAD_FILE_BYTES,
+    )
+}
+
+fn max_upload_total_bytes() -> usize {
+    env_usize_or(
+        "HAPP_WEB_MAX_UPLOAD_TOTAL_BYTES",
+        DEFAULT_MAX_UPLOAD_TOTAL_BYTES,
+    )
+}
+
+fn max_upload_path_bytes() -> usize {
+    env_usize_or(
+        "HAPP_WEB_MAX_UPLOAD_PATH_BYTES",
+        DEFAULT_MAX_UPLOAD_PATH_BYTES,
+    )
+}
+
+fn max_upload_path_depth() -> usize {
+    env_usize_or(
+        "HAPP_WEB_MAX_UPLOAD_PATH_DEPTH",
+        DEFAULT_MAX_UPLOAD_PATH_DEPTH,
+    )
+}
+
+fn max_fs_list_entries() -> usize {
+    env_usize_or("HAPP_WEB_MAX_FS_LIST_ENTRIES", DEFAULT_MAX_FS_LIST_ENTRIES)
+}
+
+fn max_chart_values_bytes() -> usize {
+    env_usize_or("HAPP_WEB_MAX_VALUES_BYTES", DEFAULT_MAX_CHART_VALUES_BYTES)
+}
+
+fn env_usize_or(name: &str, default: usize) -> usize {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1051,6 +1249,7 @@ fn import_payload(
     allow_template_includes: Vec<String>,
     unsupported_template_mode: &str,
     chart_values_yaml: Option<String>,
+    yaml_anchors: bool,
 ) -> Result<(String, String, usize), String> {
     if path.trim().is_empty() {
         return Err("path is required".to_string());
@@ -1093,11 +1292,11 @@ fn import_payload(
     };
     let result = match source_type.trim().to_ascii_lowercase().as_str() {
         "chart" => {
-            let docs = crate::source::load_documents_for_chart(&args)
-                .map_err(|e| format!("chart load error: {e}"))?;
-            let values = crate::convert::build_values(&args, &docs)
-                .map_err(|e| format!("convert error: {e}"))?;
-            let out = crate::output::values_yaml(&values)
+            let analyzed = crate::chart_analyzer::analyze_chart(&args)
+                .map_err(|e| format!("chart analyze error: {e}"))?;
+            let docs = analyzed.documents;
+            let values = analyzed.values;
+            let out = crate::output::values_yaml_with_yaml_anchors(&values, yaml_anchors)
                 .map_err(|e| format!("values encode error: {e}"))?;
             Ok((
                 out,
@@ -1149,6 +1348,7 @@ fn save_chart_payload(
     chart_name: Option<&str>,
     library_chart_path: Option<&str>,
     values_yaml: &str,
+    yaml_anchors: bool,
 ) -> Result<String, String> {
     if out_chart_dir.trim().is_empty() {
         return Err("outChartDir is required".to_string());
@@ -1158,8 +1358,14 @@ fn save_chart_payload(
     }
     let values: serde_yaml::Value =
         serde_yaml::from_str(values_yaml).map_err(|e| format!("values yaml parse error: {e}"))?;
-    crate::output::generate_consumer_chart(out_chart_dir, chart_name, &values, library_chart_path)
-        .map_err(|e| format!("save chart error: {e}"))?;
+    crate::output::generate_consumer_chart(
+        out_chart_dir,
+        chart_name,
+        &values,
+        library_chart_path,
+        yaml_anchors,
+    )
+    .map_err(|e| format!("save chart error: {e}"))?;
     let mut notes = Vec::new();
     if source_type.trim().eq_ignore_ascii_case("chart") && !source_path.trim().is_empty() {
         match crate::output::sync_imported_include_helpers_from_source_chart(
@@ -1302,6 +1508,7 @@ fn compare_render_payload(
         Some("imported-chart"),
         &generated_values,
         library_chart_path,
+        false,
     )
     .map_err(|e| format!("generate chart for compare error: {e}"))?;
     let _ = crate::output::copy_chart_crds_if_any(path, &generated_chart_dir_text)
@@ -1328,64 +1535,584 @@ fn compare_render_payload(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredFormat {
+    Json,
+    Yaml,
+    Toml,
+    Csv,
+    Xml,
+}
+
+impl StructuredFormat {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "json" => Ok(Self::Json),
+            "yaml" => Ok(Self::Yaml),
+            "toml" => Ok(Self::Toml),
+            "csv" => Ok(Self::Csv),
+            "xml" => Ok(Self::Xml),
+            other => Err(format!(
+                "unsupported structured format '{other}' (expected json|yaml|toml|csv|xml)"
+            )),
+        }
+    }
+
+    fn as_native_input_format(self) -> zq::NativeInputFormat {
+        match self {
+            Self::Json => zq::NativeInputFormat::Json,
+            Self::Yaml => zq::NativeInputFormat::Yaml,
+            Self::Toml => zq::NativeInputFormat::Toml,
+            Self::Csv => zq::NativeInputFormat::Csv,
+            Self::Xml => zq::NativeInputFormat::Xml,
+        }
+    }
+}
+
+fn parse_structured_input_values(
+    input: &str,
+    input_format: StructuredFormat,
+) -> Result<Vec<serde_json::Value>, crate::query::Error> {
+    zq::parse_native_input_values_with_format(input, input_format.as_native_input_format())
+        .map(|parsed| parsed.values)
+}
+
+fn render_structured_output(
+    values: &[serde_json::Value],
+    output_format: StructuredFormat,
+    yaml_anchors: bool,
+    pretty: bool,
+) -> Result<String, String> {
+    match output_format {
+        StructuredFormat::Json => crate::query::format_output_json_lines(values, !pretty, false)
+            .map_err(|e| format!("JSON format error: {e}")),
+        StructuredFormat::Yaml => {
+            if yaml_anchors {
+                zq::format_output_yaml_documents_with_options(
+                    values,
+                    zq::YamlFormatOptions::default().with_yaml_anchors(true),
+                )
+                .map_err(|e| format!("YAML format error: {e}"))
+            } else {
+                zq::format_output_yaml_documents(values).map_err(|e| format!("YAML format error: {e}"))
+            }
+        }
+        StructuredFormat::Toml => render_toml_output_json(values, pretty),
+        StructuredFormat::Csv => render_csv_output_json(values),
+        StructuredFormat::Xml => render_xml_output_json(values, pretty),
+    }
+}
+
+fn convert_structured_payload(
+    input: &str,
+    input_format: StructuredFormat,
+    output_format: StructuredFormat,
+    doc_mode: &str,
+    doc_index: Option<usize>,
+    yaml_anchors: bool,
+    pretty: bool,
+) -> Result<String, String> {
+    let values = parse_structured_input_values(input, input_format)
+        .map_err(|e| crate::query::format_query_error("convert", "", input, &e))?;
+    let selected = if matches!(input_format, StructuredFormat::Yaml) {
+        select_docs_for_web(values, doc_mode, doc_index, "convert")?
+    } else {
+        values
+    };
+    render_structured_output(&selected, output_format, yaml_anchors, pretty)
+}
+
+fn convert_payload_with_options(
+    mode: &str,
+    input: &str,
+    doc_mode: &str,
+    doc_index: Option<usize>,
+    input_format: &str,
+    output_format: &str,
+    yaml_anchors: bool,
+    pretty: bool,
+) -> Result<String, String> {
+    match mode {
+        "structured-convert" => {
+            let in_fmt = StructuredFormat::parse(input_format)?;
+            let out_fmt = StructuredFormat::parse(output_format)?;
+            convert_structured_payload(
+                input,
+                in_fmt,
+                out_fmt,
+                doc_mode,
+                doc_index,
+                yaml_anchors,
+                pretty,
+            )
+        }
+        "yaml-to-json" => convert_structured_payload(
+            input,
+            StructuredFormat::Yaml,
+            StructuredFormat::Json,
+            doc_mode,
+            doc_index,
+            false,
+            pretty,
+        ),
+        "json-to-yaml" => convert_structured_payload(
+            input,
+            StructuredFormat::Json,
+            StructuredFormat::Yaml,
+            doc_mode,
+            doc_index,
+            yaml_anchors,
+            pretty,
+        ),
+        "toml-to-json" => convert_structured_payload(
+            input,
+            StructuredFormat::Toml,
+            StructuredFormat::Json,
+            doc_mode,
+            doc_index,
+            false,
+            pretty,
+        ),
+        "json-to-toml" => convert_structured_payload(
+            input,
+            StructuredFormat::Json,
+            StructuredFormat::Toml,
+            doc_mode,
+            doc_index,
+            false,
+            pretty,
+        ),
+        "csv-to-json" => convert_structured_payload(
+            input,
+            StructuredFormat::Csv,
+            StructuredFormat::Json,
+            doc_mode,
+            doc_index,
+            false,
+            pretty,
+        ),
+        "json-to-csv" => convert_structured_payload(
+            input,
+            StructuredFormat::Json,
+            StructuredFormat::Csv,
+            doc_mode,
+            doc_index,
+            false,
+            pretty,
+        ),
+        "xml-to-json" => convert_structured_payload(
+            input,
+            StructuredFormat::Xml,
+            StructuredFormat::Json,
+            doc_mode,
+            doc_index,
+            false,
+            pretty,
+        ),
+        "json-to-xml" => convert_structured_payload(
+            input,
+            StructuredFormat::Json,
+            StructuredFormat::Xml,
+            doc_mode,
+            doc_index,
+            false,
+            pretty,
+        ),
+        _ => Err("unsupported mode".to_string()),
+    }
+}
+
+#[cfg(test)]
 fn convert_payload(
     mode: &str,
     input: &str,
     doc_mode: &str,
     doc_index: Option<usize>,
+    input_format: &str,
+    output_format: &str,
+    yaml_anchors: bool,
 ) -> Result<String, String> {
-    match mode {
-        "yaml-to-json" => {
-            let docs = crate::yamlmerge::normalize_documents(input)
-                .map_err(|e| format!("YAML parse error: {e}"))?;
-            let json_docs: Vec<serde_json::Value> = docs
-                .into_iter()
-                .map(|y| {
-                    serde_json::to_value(y).map_err(|e| format!("YAML->JSON conversion error: {e}"))
+    convert_payload_with_options(
+        mode,
+        input,
+        doc_mode,
+        doc_index,
+        input_format,
+        output_format,
+        yaml_anchors,
+        true,
+    )
+}
+
+fn render_toml_output_json(values: &[serde_json::Value], pretty: bool) -> Result<String, String> {
+    if values.is_empty() {
+        return Ok(String::new());
+    }
+    let mut docs = Vec::with_capacity(values.len());
+    for value in values {
+        let mut toml_value = json_to_toml_value(value)?;
+        if !matches!(toml_value, toml::Value::Table(_)) {
+            let mut wrapped = toml::map::Map::new();
+            wrapped.insert("value".to_string(), toml_value);
+            toml_value = toml::Value::Table(wrapped);
+        }
+        let rendered = if pretty {
+            toml::to_string_pretty(&toml_value).map_err(|e| format!("TOML format error: {e}"))?
+        } else {
+            toml::to_string(&toml_value).map_err(|e| format!("TOML format error: {e}"))?
+        };
+        docs.push(rendered);
+    }
+    Ok(docs.join("\n"))
+}
+
+fn json_to_toml_value(value: &serde_json::Value) -> Result<toml::Value, String> {
+    match value {
+        serde_json::Value::Null => Err("encode toml: null is not supported in TOML output".to_string()),
+        serde_json::Value::Bool(v) => Ok(toml::Value::Boolean(*v)),
+        serde_json::Value::Number(v) => {
+            if let Some(i) = v.as_i64() {
+                return Ok(toml::Value::Integer(i));
+            }
+            if let Some(u) = v.as_u64() {
+                if let Ok(i) = i64::try_from(u) {
+                    return Ok(toml::Value::Integer(i));
+                }
+            }
+            if let Some(f) = v.as_f64() {
+                return Ok(toml::Value::Float(f));
+            }
+            Err(format!("encode toml: unsupported number `{v}`"))
+        }
+        serde_json::Value::String(v) => Ok(toml::Value::String(v.clone())),
+        serde_json::Value::Array(values) => {
+            let converted = values
+                .iter()
+                .map(json_to_toml_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(toml::Value::Array(converted))
+        }
+        serde_json::Value::Object(fields) => {
+            let mut table = toml::map::Map::new();
+            for (key, value) in fields {
+                table.insert(key.clone(), json_to_toml_value(value)?);
+            }
+            Ok(toml::Value::Table(table))
+        }
+    }
+}
+
+fn render_csv_output_json(values: &[serde_json::Value]) -> Result<String, String> {
+    let mut out = Vec::new();
+    {
+        let mut writer = csv::WriterBuilder::new().from_writer(&mut out);
+        if values
+            .iter()
+            .all(|value| matches!(value, serde_json::Value::Object(_)))
+        {
+            let headers = collect_csv_headers_json(values);
+            writer
+                .write_record(headers.iter())
+                .map_err(|e| format!("CSV format error: {e}"))?;
+            for value in values {
+                let serde_json::Value::Object(obj) = value else {
+                    continue;
+                };
+                let row = headers
+                    .iter()
+                    .map(|header| {
+                        obj.get(header)
+                            .map(json_to_csv_cell)
+                            .transpose()
+                            .map(|cell| cell.unwrap_or_default())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                writer
+                    .write_record(row.iter())
+                    .map_err(|e| format!("CSV format error: {e}"))?;
+            }
+        } else {
+            let width = values
+                .iter()
+                .map(|value| match value {
+                    serde_json::Value::Array(items) => items.len(),
+                    _ => 1,
                 })
-                .collect::<Result<_, _>>()?;
-            match doc_mode.trim().to_ascii_lowercase().as_str() {
-                "all" | "" => serde_json::to_string_pretty(&serde_json::Value::Array(json_docs))
-                    .map_err(|e| format!("JSON format error: {e}")),
-                "first" => {
-                    let first = json_docs
-                        .into_iter()
-                        .next()
-                        .unwrap_or(serde_json::Value::Null);
-                    serde_json::to_string_pretty(&first)
-                        .map_err(|e| format!("JSON format error: {e}"))
-                }
-                "index" => {
-                    let idx = doc_index
-                        .ok_or_else(|| "doc index is required for doc mode 'index'".to_string())?;
-                    if idx >= json_docs.len() {
-                        return Err(format!(
-                            "doc index {} is out of range for {} document(s)",
-                            idx,
-                            json_docs.len()
-                        ));
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            for value in values {
+                let mut row = match value {
+                    serde_json::Value::Array(items) => {
+                        items.iter().map(json_to_csv_cell).collect::<Result<Vec<_>, _>>()?
                     }
-                    serde_json::to_string_pretty(&json_docs[idx])
-                        .map_err(|e| format!("JSON format error: {e}"))
+                    other => vec![json_to_csv_cell(other)?],
+                };
+                if row.len() < width {
+                    row.resize(width, String::new());
                 }
-                other => Err(format!("unsupported doc mode: {other}")),
+                writer
+                    .write_record(row.iter())
+                    .map_err(|e| format!("CSV format error: {e}"))?;
             }
         }
-        "json-to-yaml" => {
-            let j: serde_json::Value =
-                serde_json::from_str(input).map_err(|e| format!("JSON parse error: {e}"))?;
-            // zq enables serde_json/arbitrary_precision in the dependency graph.
-            // Serializing serde_json::Value directly to YAML then represents
-            // numbers via an internal wrapper map. Roundtrip through JSON text
-            // and serde_yaml::Value keeps plain scalar numbers stable.
-            let normalized_json =
-                serde_json::to_string(&j).map_err(|e| format!("JSON normalize error: {e}"))?;
-            let y: serde_yaml::Value = serde_yaml::from_str(&normalized_json)
-                .map_err(|e| format!("JSON->YAML conversion error: {e}"))?;
-            serde_yaml::to_string(&y).map_err(|e| format!("JSON->YAML conversion error: {e}"))
-        }
-        _ => Err("unsupported mode".to_string()),
+        writer
+            .flush()
+            .map_err(|e| format!("CSV format error: {e}"))?;
     }
+    String::from_utf8(out).map_err(|e| format!("CSV format error: {e}"))
+}
+
+fn collect_csv_headers_json(values: &[serde_json::Value]) -> Vec<String> {
+    let mut headers = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for value in values {
+        let serde_json::Value::Object(obj) = value else {
+            continue;
+        };
+        for key in obj.keys() {
+            if seen.insert(key.clone()) {
+                headers.push(key.clone());
+            }
+        }
+    }
+    headers
+}
+
+fn json_to_csv_cell(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::Bool(v) => Ok(v.to_string()),
+        serde_json::Value::Number(v) => Ok(v.to_string()),
+        serde_json::Value::String(v) => Ok(v.clone()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::to_string(value).map_err(|e| format!("CSV format error: {e}"))
+        }
+    }
+}
+
+fn render_xml_output_json(values: &[serde_json::Value], pretty: bool) -> Result<String, String> {
+    if values.is_empty() {
+        return Ok(String::new());
+    }
+    let mut docs = Vec::with_capacity(values.len());
+    for value in values {
+        let rendered = render_xml_doc_json(value)?;
+        docs.push(if pretty {
+            pretty_xml(&rendered)
+        } else {
+            rendered
+        });
+    }
+    Ok(docs.join("\n"))
+}
+
+fn pretty_xml(src: &str) -> String {
+    let mut out = String::new();
+    let mut indent: usize = 0;
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'>' {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            }
+            let token = &src[i..=j];
+            let trimmed = token.trim();
+            let is_closing = trimmed.starts_with("</");
+            let is_self_closing = trimmed.ends_with("/>");
+            let is_decl = trimmed.starts_with("<?") || trimmed.starts_with("<!");
+
+            if is_closing {
+                indent = indent.saturating_sub(1);
+            }
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&"  ".repeat(indent));
+            out.push_str(trimmed);
+            if !is_closing && !is_self_closing && !is_decl {
+                indent = indent.saturating_add(1);
+            }
+            i = j + 1;
+            continue;
+        }
+        let mut j = i;
+        while j < bytes.len() && bytes[j] != b'<' {
+            j += 1;
+        }
+        let text = src[i..j].trim();
+        if !text.is_empty() {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&"  ".repeat(indent));
+            out.push_str(text);
+        }
+        i = j;
+    }
+
+    out.trim().to_string()
+}
+
+fn render_xml_doc_json(value: &serde_json::Value) -> Result<String, String> {
+    let mut out = String::new();
+    match value {
+        serde_json::Value::Object(map) if map.len() == 1 => {
+            let (root, content) = map
+                .iter()
+                .next()
+                .expect("single-key object must have one entry");
+            if root != "#text" && !root.starts_with('@') && is_valid_xml_name(root) {
+                write_xml_field_json(&mut out, root, content)?;
+            } else {
+                write_xml_field_json(&mut out, "root", value)?;
+            }
+        }
+        _ => write_xml_field_json(&mut out, "root", value)?,
+    }
+    Ok(out)
+}
+
+fn write_xml_field_json(
+    out: &mut String,
+    name: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                write_xml_element_json(out, name, item)?;
+            }
+        }
+        _ => write_xml_element_json(out, name, value)?,
+    }
+    Ok(())
+}
+
+fn write_xml_element_json(
+    out: &mut String,
+    name: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    if !is_valid_xml_name(name) {
+        return Err(format!("encode xml: invalid element name `{name}`"));
+    }
+
+    match value {
+        serde_json::Value::Null => {
+            out.push('<');
+            out.push_str(name);
+            out.push_str("/>");
+            Ok(())
+        }
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::String(_) => {
+            out.push('<');
+            out.push_str(name);
+            out.push('>');
+            out.push_str(&escape_xml_text(&json_scalar_text(value)?));
+            out.push_str("</");
+            out.push_str(name);
+            out.push('>');
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            out.push('<');
+            out.push_str(name);
+            out.push('>');
+            for item in items {
+                write_xml_field_json(out, "item", item)?;
+            }
+            out.push_str("</");
+            out.push_str(name);
+            out.push('>');
+            Ok(())
+        }
+        serde_json::Value::Object(fields) => {
+            out.push('<');
+            out.push_str(name);
+
+            for (key, attr_value) in fields.iter().filter(|(k, _)| k.starts_with('@')) {
+                let attr_name = &key[1..];
+                if attr_name.is_empty() || !is_valid_xml_name(attr_name) {
+                    return Err(format!("encode xml: invalid attribute name `{key}`"));
+                }
+                out.push(' ');
+                out.push_str(attr_name);
+                out.push_str("=\"");
+                out.push_str(&escape_xml_attribute(&json_scalar_text(attr_value)?));
+                out.push('"');
+            }
+
+            let children_count = fields
+                .keys()
+                .filter(|key| !key.starts_with('@') && key.as_str() != "#text")
+                .count();
+            let text_value = fields.get("#text");
+
+            if children_count == 0 && text_value.is_none() {
+                out.push_str("/>");
+                return Ok(());
+            }
+
+            out.push('>');
+            if let Some(text_value) = text_value {
+                out.push_str(&escape_xml_text(&json_scalar_text(text_value)?));
+            }
+            for (child_name, child_value) in fields {
+                if child_name.starts_with('@') || child_name == "#text" {
+                    continue;
+                }
+                write_xml_field_json(out, child_name, child_value)?;
+            }
+            out.push_str("</");
+            out.push_str(name);
+            out.push('>');
+            Ok(())
+        }
+    }
+}
+
+fn json_scalar_text(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::Bool(v) => Ok(v.to_string()),
+        serde_json::Value::Number(v) => Ok(v.to_string()),
+        serde_json::Value::String(v) => Ok(v.clone()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            Err("encode xml: scalar value expected".to_string())
+        }
+    }
+}
+
+fn is_valid_xml_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("name is not empty");
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn escape_xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_xml_attribute(value: &str) -> String {
+    escape_xml_text(value)
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn jq_payload(
@@ -1397,113 +2124,401 @@ fn jq_payload(
     raw_output: bool,
 ) -> Result<String, String> {
     let docs = crate::query::parse_input_docs_prefer_json(input)
-        .map_err(|e| format_web_query_error("jq", "input", input, &e))?;
+        .map_err(|e| format_web_query_error("jq", query, input, &e))?;
     let selected = select_docs_for_web(docs, doc_mode, doc_index, "jq")?;
     let out = crate::query::run_query_stream(query, selected)
-        .map_err(|e| format_web_query_error("jq", "query", query, &e))?;
-    let mut lines = Vec::with_capacity(out.len());
-    for v in out {
-        if raw_output {
-            if let Some(s) = v.as_str() {
-                lines.push(s.to_string());
-                continue;
-            }
-        }
-        let line = if compact {
-            serde_json::to_string(&v).map_err(|e| format!("jq output encode error: {e}"))?
-        } else {
-            serde_json::to_string_pretty(&v).map_err(|e| format!("jq output encode error: {e}"))?
-        };
-        lines.push(line);
-    }
-    Ok(lines.join("\n"))
+        .map_err(|e| format_web_query_error("jq", query, input, &e))?;
+    crate::query::format_output_json_lines(&out, compact, raw_output)
+        .map_err(|e| format!("jq output encode error: {e}"))
 }
 
 fn format_web_query_error(
     tool: &str,
-    source_label: &str,
-    source_text: &str,
+    query: &str,
+    input: &str,
     err: &crate::query::Error,
 ) -> String {
-    let base = format!("{tool} {source_label} error: {err}");
-    let Some((line, col)) = extract_query_error_line_col(&base) else {
-        return base;
-    };
-    let ctx = render_query_error_context(source_label, source_text, line, col);
-    if ctx.is_empty() {
-        base
-    } else {
-        format!("{base}\n{ctx}\nHint: check {source_label} near ^")
-    }
+    crate::query::format_query_error(tool, query, input, err)
 }
 
-fn extract_query_error_line_col(msg: &str) -> Option<(usize, usize)> {
-    use std::sync::OnceLock;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SemanticDiffKind {
+    Added,
+    Removed,
+    Changed,
+}
 
-    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| {
-        vec![
-            regex::Regex::new(r"(?:at\s+)?line\s+(\d+)\s+column\s+(\d+)").expect("regex"),
-            regex::Regex::new(r"(?:at\s+)?line\s+(\d+)\s*,\s*column\s+(\d+)").expect("regex"),
-            regex::Regex::new(r"line\s*:\s*(\d+)\s*,\s*column\s*:\s*(\d+)").expect("regex"),
-        ]
-    });
-    for re in patterns {
-        if let Some(caps) = re.captures(msg) {
-            let line = caps.get(1)?.as_str().parse::<usize>().ok()?;
-            let col = caps.get(2)?.as_str().parse::<usize>().ok()?;
-            return Some((line, col));
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct SemanticDiffEntry {
+    kind: SemanticDiffKind,
+    path: String,
+    left: Option<serde_json::Value>,
+    right: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+struct SemanticDiffSummary {
+    equal: bool,
+    total: usize,
+    changed: usize,
+    added: usize,
+    removed: usize,
+}
+
+impl SemanticDiffSummary {
+    fn from_diffs(diffs: &[SemanticDiffEntry]) -> Self {
+        let mut summary = Self {
+            equal: diffs.is_empty(),
+            total: diffs.len(),
+            changed: 0,
+            added: 0,
+            removed: 0,
+        };
+        for diff in diffs {
+            match diff.kind {
+                SemanticDiffKind::Added => summary.added += 1,
+                SemanticDiffKind::Removed => summary.removed += 1,
+                SemanticDiffKind::Changed => summary.changed += 1,
+            }
         }
+        summary
     }
-    None
 }
 
-fn render_query_error_context(
-    source_label: &str,
-    source_text: &str,
-    line: usize,
-    col: usize,
-) -> String {
-    let lines: Vec<&str> = source_text.lines().collect();
-    if lines.is_empty() || line == 0 {
-        return String::new();
-    }
-    let from = line.saturating_sub(2).max(1);
-    let to = (line + 2).min(lines.len());
-    let mut out = String::new();
-    out.push_str(source_label);
-    out.push_str(" context:\n");
-    for i in from..=to {
-        let marker = if i == line { '>' } else { ' ' };
-        let text = lines.get(i - 1).copied().unwrap_or_default();
-        out.push_str(&format!("{marker} {:>5} | {text}\n", i));
-        if i == line {
-            let caret_pad = col.saturating_sub(1);
-            out.push_str(&format!("  {:>5} | {}^\n", "", " ".repeat(caret_pad)));
-        }
-    }
-    out.trim_end().to_string()
-}
-
-fn dyff_payload(
+fn semantic_diff_payload(
     from: &str,
     to: &str,
+    from_format: &str,
+    to_format: &str,
+    output_format: &str,
     ignore_order: bool,
     ignore_whitespace: bool,
 ) -> Result<String, String> {
-    let diff = crate::dyfflike::between_yaml(
-        from,
-        to,
-        crate::dyfflike::DiffOptions {
-            ignore_order_changes: ignore_order,
-            ignore_whitespace_change: ignore_whitespace,
-        },
-    )
-    .map_err(|e| format!("dyff parse error: {e}"))?;
-    if diff.trim().is_empty() {
-        return Ok("No differences".to_string());
+    let left_format = parse_semantic_diff_input_format(from_format)?;
+    let right_format = parse_semantic_diff_input_format(to_format)?;
+
+    let mut left_docs = zq::parse_native_input_values_with_format(from, left_format)
+        .map(|parsed| parsed.values)
+        .map_err(|e| crate::query::format_query_error("semantic-diff:left", "", from, &e))?;
+    let mut right_docs = zq::parse_native_input_values_with_format(to, right_format)
+        .map(|parsed| parsed.values)
+        .map_err(|e| crate::query::format_query_error("semantic-diff:right", "", to, &e))?;
+
+    if ignore_order || ignore_whitespace {
+        for value in &mut left_docs {
+            normalize_semantic_diff_value(value, ignore_order, ignore_whitespace);
+        }
+        for value in &mut right_docs {
+            normalize_semantic_diff_value(value, ignore_order, ignore_whitespace);
+        }
     }
-    Ok(diff)
+
+    let diffs = collect_semantic_doc_diffs(&left_docs, &right_docs);
+    let summary = SemanticDiffSummary::from_diffs(&diffs);
+    format_semantic_diff_output(&diffs, summary, output_format)
+}
+
+fn parse_semantic_diff_input_format(value: &str) -> Result<zq::NativeInputFormat, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(zq::NativeInputFormat::Auto),
+        "json" => Ok(zq::NativeInputFormat::Json),
+        "yaml" => Ok(zq::NativeInputFormat::Yaml),
+        "toml" => Ok(zq::NativeInputFormat::Toml),
+        "csv" => Ok(zq::NativeInputFormat::Csv),
+        "xml" => Ok(zq::NativeInputFormat::Xml),
+        other => Err(format!(
+            "unsupported semantic diff input format '{other}' (expected auto|json|yaml|toml|csv|xml)"
+        )),
+    }
+}
+
+fn normalize_semantic_diff_value(
+    value: &mut serde_json::Value,
+    ignore_order: bool,
+    ignore_whitespace: bool,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if ignore_whitespace {
+                let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                *text = normalized;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                normalize_semantic_diff_value(item, ignore_order, ignore_whitespace);
+            }
+            if ignore_order {
+                items.sort_by(|a, b| {
+                    let la = serde_json::to_string(a).unwrap_or_default();
+                    let lb = serde_json::to_string(b).unwrap_or_default();
+                    la.cmp(&lb)
+                });
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                normalize_semantic_diff_value(item, ignore_order, ignore_whitespace);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn collect_semantic_doc_diffs(
+    left_docs: &[serde_json::Value],
+    right_docs: &[serde_json::Value],
+) -> Vec<SemanticDiffEntry> {
+    let mut out = Vec::new();
+    if left_docs.len() == 1 && right_docs.len() == 1 {
+        collect_semantic_diffs("$", &left_docs[0], &right_docs[0], &mut out);
+        return out;
+    }
+    let max_len = left_docs.len().max(right_docs.len());
+    for idx in 0..max_len {
+        let path = format!("$[{idx}]");
+        match (left_docs.get(idx), right_docs.get(idx)) {
+            (Some(left), Some(right)) => collect_semantic_diffs(&path, left, right, &mut out),
+            (Some(left), None) => out.push(SemanticDiffEntry {
+                kind: SemanticDiffKind::Removed,
+                path,
+                left: Some(left.clone()),
+                right: None,
+            }),
+            (None, Some(right)) => out.push(SemanticDiffEntry {
+                kind: SemanticDiffKind::Added,
+                path,
+                left: None,
+                right: Some(right.clone()),
+            }),
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+fn collect_semantic_diffs(
+    path: &str,
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    out: &mut Vec<SemanticDiffEntry>,
+) {
+    if left == right {
+        return;
+    }
+    match (left, right) {
+        (serde_json::Value::Object(left_map), serde_json::Value::Object(right_map)) => {
+            let mut keys = std::collections::BTreeSet::new();
+            keys.extend(left_map.keys().cloned());
+            keys.extend(right_map.keys().cloned());
+            for key in keys {
+                let key_path = join_semantic_diff_key(path, &key);
+                match (left_map.get(&key), right_map.get(&key)) {
+                    (Some(l), Some(r)) => collect_semantic_diffs(&key_path, l, r, out),
+                    (Some(l), None) => out.push(SemanticDiffEntry {
+                        kind: SemanticDiffKind::Removed,
+                        path: key_path,
+                        left: Some(l.clone()),
+                        right: None,
+                    }),
+                    (None, Some(r)) => out.push(SemanticDiffEntry {
+                        kind: SemanticDiffKind::Added,
+                        path: key_path,
+                        left: None,
+                        right: Some(r.clone()),
+                    }),
+                    (None, None) => {}
+                }
+            }
+        }
+        (serde_json::Value::Array(left_items), serde_json::Value::Array(right_items)) => {
+            let max_len = left_items.len().max(right_items.len());
+            for idx in 0..max_len {
+                let key_path = format!("{path}[{idx}]");
+                match (left_items.get(idx), right_items.get(idx)) {
+                    (Some(l), Some(r)) => collect_semantic_diffs(&key_path, l, r, out),
+                    (Some(l), None) => out.push(SemanticDiffEntry {
+                        kind: SemanticDiffKind::Removed,
+                        path: key_path,
+                        left: Some(l.clone()),
+                        right: None,
+                    }),
+                    (None, Some(r)) => out.push(SemanticDiffEntry {
+                        kind: SemanticDiffKind::Added,
+                        path: key_path,
+                        left: None,
+                        right: Some(r.clone()),
+                    }),
+                    (None, None) => {}
+                }
+            }
+        }
+        _ => out.push(SemanticDiffEntry {
+            kind: SemanticDiffKind::Changed,
+            path: path.to_string(),
+            left: Some(left.clone()),
+            right: Some(right.clone()),
+        }),
+    }
+}
+
+fn join_semantic_diff_key(base: &str, key: &str) -> String {
+    let is_simple = {
+        let mut chars = key.chars();
+        match chars.next() {
+            Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
+            _ => return format!(
+                "{base}[{}]",
+                serde_json::to_string(key).unwrap_or_else(|_| "\"<invalid>\"".to_string())
+            ),
+        }
+        chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    };
+    if is_simple {
+        format!("{base}.{key}")
+    } else {
+        format!(
+            "{base}[{}]",
+            serde_json::to_string(key).unwrap_or_else(|_| "\"<invalid>\"".to_string())
+        )
+    }
+}
+
+fn format_semantic_diff_output(
+    diffs: &[SemanticDiffEntry],
+    summary: SemanticDiffSummary,
+    output_format: &str,
+) -> Result<String, String> {
+    match output_format.trim().to_ascii_lowercase().as_str() {
+        "" | "diff" | "text" => {
+            if summary.equal {
+                return Ok("No semantic differences".to_string());
+            }
+            let mut lines = Vec::with_capacity(diffs.len() + 2);
+            for diff in diffs {
+                match diff.kind {
+                    SemanticDiffKind::Added => lines.push(format!(
+                        "added: {}: {}",
+                        diff.path,
+                        serde_json::to_string(diff.right.as_ref().unwrap_or(&serde_json::Value::Null))
+                            .unwrap_or_else(|_| "null".to_string())
+                    )),
+                    SemanticDiffKind::Removed => lines.push(format!(
+                        "removed: {}: {}",
+                        diff.path,
+                        serde_json::to_string(diff.left.as_ref().unwrap_or(&serde_json::Value::Null))
+                            .unwrap_or_else(|_| "null".to_string())
+                    )),
+                    SemanticDiffKind::Changed => lines.push(format!(
+                        "changed: {}: {} -> {}",
+                        diff.path,
+                        serde_json::to_string(diff.left.as_ref().unwrap_or(&serde_json::Value::Null))
+                            .unwrap_or_else(|_| "null".to_string()),
+                        serde_json::to_string(diff.right.as_ref().unwrap_or(&serde_json::Value::Null))
+                            .unwrap_or_else(|_| "null".to_string())
+                    )),
+                }
+            }
+            lines.push(format!(
+                "summary: total={} changed={} added={} removed={}",
+                summary.total, summary.changed, summary.added, summary.removed
+            ));
+            Ok(lines.join("\n"))
+        }
+        "patch" => {
+            if summary.equal {
+                return Ok("No semantic differences".to_string());
+            }
+            let mut lines = Vec::with_capacity(diffs.len() * 3 + 4);
+            lines.push("--- left".to_string());
+            lines.push("+++ right".to_string());
+            for (idx, diff) in diffs.iter().enumerate() {
+                if idx > 0 {
+                    lines.push(String::new());
+                }
+                lines.push(format!("@@ {} @@", diff.path));
+                match diff.kind {
+                    SemanticDiffKind::Added => lines.push(format!(
+                        "+{}",
+                        serde_json::to_string(
+                            diff.right.as_ref().unwrap_or(&serde_json::Value::Null)
+                        )
+                        .unwrap_or_else(|_| "null".to_string())
+                    )),
+                    SemanticDiffKind::Removed => lines.push(format!(
+                        "-{}",
+                        serde_json::to_string(
+                            diff.left.as_ref().unwrap_or(&serde_json::Value::Null)
+                        )
+                        .unwrap_or_else(|_| "null".to_string())
+                    )),
+                    SemanticDiffKind::Changed => {
+                        lines.push(format!(
+                            "-{}",
+                            serde_json::to_string(
+                                diff.left.as_ref().unwrap_or(&serde_json::Value::Null)
+                            )
+                            .unwrap_or_else(|_| "null".to_string())
+                        ));
+                        lines.push(format!(
+                            "+{}",
+                            serde_json::to_string(
+                                diff.right.as_ref().unwrap_or(&serde_json::Value::Null)
+                            )
+                            .unwrap_or_else(|_| "null".to_string())
+                        ));
+                    }
+                }
+            }
+            lines.push(String::new());
+            lines.push(format!(
+                "Summary: changed={} added={} removed={}",
+                summary.changed, summary.added, summary.removed
+            ));
+            Ok(lines.join("\n"))
+        }
+        "summary" => Ok(format!(
+            "equal={} total={} changed={} added={} removed={}",
+            summary.equal, summary.total, summary.changed, summary.added, summary.removed
+        )),
+        "json" => serde_json::to_string_pretty(&serde_json::json!({
+            "equal": summary.equal,
+            "summary": summary,
+            "differences": diffs,
+        }))
+        .map_err(|e| format!("semantic diff json encode: {e}")),
+        "jsonl" => {
+            let mut lines = Vec::with_capacity(diffs.len() + 1);
+            for diff in diffs {
+                lines.push(
+                    serde_json::to_string(&serde_json::json!({
+                        "type": "diff",
+                        "kind": diff.kind,
+                        "path": diff.path,
+                        "left": diff.left,
+                        "right": diff.right,
+                    }))
+                    .map_err(|e| format!("semantic diff jsonl encode: {e}"))?,
+                );
+            }
+            lines.push(
+                serde_json::to_string(&serde_json::json!({
+                    "type": "summary",
+                    "equal": summary.equal,
+                    "total": summary.total,
+                    "changed": summary.changed,
+                    "added": summary.added,
+                    "removed": summary.removed,
+                }))
+                .map_err(|e| format!("semantic diff jsonl encode: {e}"))?,
+            );
+            Ok(lines.join("\n"))
+        }
+        other => Err(format!(
+            "unsupported semantic diff output format '{other}' (expected diff|patch|summary|json|jsonl)"
+        )),
+    }
 }
 
 fn select_docs_for_web(
@@ -1889,8 +2904,8 @@ pub fn render_page_html(source_yaml: &str, generated_values_yaml: &str) -> Strin
             },
             {
                 "id": "dyff-compare",
-                "title": "dyff Compare",
-                "description": "Compare two YAML payloads with dyff-like output."
+                "title": "Semantic Diff",
+                "description": "Compare two payloads semantically across formats."
             }
         ]
     });
@@ -1927,8 +2942,8 @@ pub fn render_compose_page_html(
             },
             {
                 "id": "dyff-compare",
-                "title": "dyff Compare",
-                "description": "Compare two YAML payloads with dyff-like output."
+                "title": "Semantic Diff",
+                "description": "Compare two payloads semantically across formats."
             }
         ]
     });
@@ -1957,8 +2972,8 @@ pub fn render_tools_page_html(stdin_text: Option<&str>) -> String {
             },
             {
                 "id": "dyff-compare",
-                "title": "dyff Compare",
-                "description": "Compare two YAML payloads with dyff-like output."
+                "title": "Semantic Diff",
+                "description": "Compare two payloads semantically across formats."
             }
         ]
     });
@@ -3039,7 +4054,7 @@ window.addEventListener('error', function(e) {{
   <div class='top'>
     <div class='brand'>
       <h2 class='title'>{{{{ model.title }}}}</h2>
-      <div class='subtitle'>Fast local toolset for YAML/JSON, jq and dyff.</div>
+      <div class='subtitle'>Fast local toolset for YAML/JSON, jq and semantic diff.</div>
     </div>
     <div class='top-actions'>
       <button @click='exitUi'>Exit</button>
@@ -3297,6 +4312,7 @@ window.addEventListener('error', function(e) {{
               <div class='checks-inline'>
                 <label class='chk'><input type='checkbox' v-model='mainImportIncludeStatus'/> include status</label>
                 <label class='chk'><input type='checkbox' v-model='mainImportIncludeCrds'/> include CRDs</label>
+                <label class='chk' v-if='mainImportSourceType === "chart"'><input type='checkbox' v-model='mainImportYamlAnchors'/> YAML anchors optimize</label>
               </div>
               <div class='field-hint'>Use CRDs when you want generated chart to include source chart CRDs.</div>
             </div>
@@ -3419,9 +4435,8 @@ window.addEventListener('error', function(e) {{
     </div>
     <div class='converter-controls'>
       <select v-model='converterMode'>
-        <optgroup label='YAML/JSON'>
-          <option value='yaml-to-json'>YAML → JSON</option>
-          <option value='json-to-yaml'>JSON → YAML</option>
+        <optgroup label='Structured'>
+          <option value='structured-convert'>Structured convert</option>
         </optgroup>
         <optgroup label='Encoding'>
           <option value='base64-encode'>Base64 encode</option>
@@ -3439,18 +4454,38 @@ window.addEventListener('error', function(e) {{
           <option value='jwt-inspect'>JWT inspect</option>
         </optgroup>
       </select>
-      <select v-model='converterDocMode' :disabled='converterMode !== "yaml-to-json"'>
+      <select v-if='converterMode === "structured-convert"' v-model='converterStructuredInputFormat'>
+        <option value='json'>input: JSON</option>
+        <option value='yaml'>input: YAML</option>
+        <option value='toml'>input: TOML</option>
+        <option value='csv'>input: CSV</option>
+        <option value='xml'>input: XML</option>
+      </select>
+      <select v-if='converterMode === "structured-convert"' v-model='converterStructuredOutputFormat'>
+        <option value='json'>output: JSON</option>
+        <option value='yaml'>output: YAML</option>
+        <option value='toml'>output: TOML</option>
+        <option value='csv'>output: CSV</option>
+        <option value='xml'>output: XML</option>
+      </select>
+      <select v-if='converterUsesYamlDocMode' v-model='converterDocMode'>
         <option value='all'>YAML docs: all</option>
         <option value='first'>YAML docs: first</option>
         <option value='index'>YAML docs: index</option>
       </select>
-      <input v-if='converterMode === "yaml-to-json" && converterDocMode === "index"'
+      <input v-if='converterUsesYamlDocMode && converterDocMode === "index"'
              v-model.number='converterDocIndex'
              type='number'
              min='0'
              step='1'
              style='width:140px;'
              placeholder='doc index' />
+      <label class='chk' v-if='converterUsesYamlAnchors'>
+        <input type='checkbox' v-model='converterYamlAnchors'/> YAML anchors
+      </label>
+      <label class='chk' v-if='converterSupportsPretty'>
+        <input type='checkbox' v-model='converterPrettyOutput'/> Pretty output
+      </label>
       <div class='muted'>{{{{ converterModeLabel }}}}</div>
     </div>
     <div class='conv-grid'>
@@ -3530,7 +4565,9 @@ window.addEventListener('error', function(e) {{
     </div>
     <div class='result-meta'>
       <span>mode: {{{{ converterModeLabel }}}}</span>
-      <span v-if='converterMode === "yaml-to-json"'>docs: {{{{ converterDocMode }}}}</span>
+      <span v-if='converterMode === "structured-convert"'>{{{{ converterStructuredInputFormat.toUpperCase() }}}} → {{{{ converterStructuredOutputFormat.toUpperCase() }}}}</span>
+      <span v-if='converterUsesYamlDocMode'>docs: {{{{ converterDocMode }}}}</span>
+      <span v-if='converterSupportsPretty'>pretty: {{{{ converterPrettyOutput ? "on" : "off" }}}}</span>
       <span>output chars: {{{{ (converterOutput || '').length }}}}</span>
     </div>
     <div class='err' v-if='converterError' style='margin-top:8px;'>{{{{ converterError }}}}</div>
@@ -3625,29 +4662,52 @@ window.addEventListener('error', function(e) {{
 
   <div v-else-if='activeUtilityKey === "dyff-compare"' class='card'>
     <div class='cardhead'>
-      <h3>dyff Compare</h3>
+      <h3>Semantic Diff</h3>
       <div class='cardbtns'>
-        <button class='secondary' @click='runDyff'>Run compare</button>
+        <button class='secondary' @click='runDyff'>Run diff</button>
         <button class='secondary' @click='clearDyff'>Clear</button>
         <button class='secondary' @click='loadSampleDyff'>Sample</button>
       </div>
     </div>
     <div class='converter-controls'>
+      <select v-model='dyffFromFormat'>
+        <option value='auto'>From: Auto</option>
+        <option value='json'>From: JSON</option>
+        <option value='yaml'>From: YAML</option>
+        <option value='toml'>From: TOML</option>
+        <option value='csv'>From: CSV</option>
+        <option value='xml'>From: XML</option>
+      </select>
+      <select v-model='dyffToFormat'>
+        <option value='auto'>To: Auto</option>
+        <option value='json'>To: JSON</option>
+        <option value='yaml'>To: YAML</option>
+        <option value='toml'>To: TOML</option>
+        <option value='csv'>To: CSV</option>
+        <option value='xml'>To: XML</option>
+      </select>
+      <select v-model='dyffOutputFormat'>
+        <option value='diff'>Output: Diff text</option>
+        <option value='patch'>Output: Patch</option>
+        <option value='summary'>Output: Summary</option>
+        <option value='json'>Output: JSON</option>
+        <option value='jsonl'>Output: JSONL</option>
+      </select>
       <label class='chk'><input type='checkbox' v-model='dyffIgnoreOrder'/> ignore order</label>
       <label class='chk'><input type='checkbox' v-model='dyffIgnoreWhitespace'/> ignore whitespace</label>
       <button class='secondary' @click='copyDyffOutput'>Copy output</button>
-      <div class='muted'>Live compare is enabled</div>
+      <div class='muted'>Live semantic compare is enabled</div>
     </div>
     <div class='conv-grid'>
       <div>
-        <div class='panel-label'>From YAML</div>
+        <div class='panel-label'>From</div>
         <div class='editor-shell'>
           <div v-if='cmAvailable' class='editor-host' ref='dyffFromCmHost' style='min-height:240px;height:36vh;'></div>
           <textarea v-else v-model='dyffFrom' spellcheck='false' @select='onDyffFromTextareaSelect' @keyup='onDyffFromTextareaSelect' @mouseup='onDyffFromTextareaSelect'></textarea>
         </div>
       </div>
       <div>
-        <div class='panel-label'>To YAML</div>
+        <div class='panel-label'>To</div>
         <div class='editor-shell'>
           <div v-if='cmAvailable' class='editor-host' ref='dyffToCmHost' style='min-height:240px;height:36vh;'></div>
           <textarea v-else v-model='dyffTo' spellcheck='false' @select='onDyffToTextareaSelect' @keyup='onDyffToTextareaSelect' @mouseup='onDyffToTextareaSelect'></textarea>
@@ -3655,14 +4715,15 @@ window.addEventListener('error', function(e) {{
       </div>
     </div>
     <div style='margin-top:10px;'>
-      <div class='panel-label'>Diff result</div>
+      <div class='panel-label'>Semantic diff result</div>
       <div class='editor-shell'>
         <div v-if='cmAvailable' class='editor-host' ref='dyffOutputCmHost' style='min-height:260px;height:40vh;'></div>
         <pre v-else class='code-output' v-html='dyffOutputHighlighted'></pre>
       </div>
     </div>
     <div class='result-meta'>
-      <span>changed lines: {{{{ dyffChangedCount }}}}</span>
+      <span>diff count: {{{{ dyffChangedCount }}}}</span>
+      <span>output: {{{{ dyffOutputFormat }}}}</span>
       <span>ignore order: {{{{ dyffIgnoreOrder ? "on" : "off" }}}}</span>
       <span>ignore whitespace: {{{{ dyffIgnoreWhitespace ? "on" : "off" }}}}</span>
     </div>
@@ -3751,7 +4812,11 @@ const app = Vue.createApp({{
       wrapLines: false,
       fontSize: 13,
       collapsedTitles: {{}},
-      converterMode: 'yaml-to-json',
+      converterMode: 'structured-convert',
+      converterStructuredInputFormat: 'yaml',
+      converterStructuredOutputFormat: 'json',
+      converterYamlAnchors: false,
+      converterPrettyOutput: true,
       converterDocMode: 'all',
       converterDocIndex: 0,
       converterInput: '',
@@ -3795,6 +4860,9 @@ const app = Vue.createApp({{
       dyffTo: '',
       dyffOutput: '',
       dyffError: '',
+      dyffFromFormat: 'auto',
+      dyffToFormat: 'auto',
+      dyffOutputFormat: 'diff',
       dyffIgnoreOrder: false,
       dyffIgnoreWhitespace: false,
       dyffRequestSeq: 0,
@@ -3810,6 +4878,7 @@ const app = Vue.createApp({{
       mainImportMinIncludeBytes: 24,
       mainImportIncludeStatus: false,
       mainImportIncludeCrds: false,
+      mainImportYamlAnchors: false,
       mainImportKubeVersion: '',
       mainImportValuesFilesText: '',
       mainImportSetText: '',
@@ -3963,8 +5032,7 @@ const app = Vue.createApp({{
     }},
     converterModeLabel() {{
       const map = {{
-        'yaml-to-json': 'YAML → JSON',
-        'json-to-yaml': 'JSON → YAML',
+        'structured-convert': 'Structured convert',
         'base64-encode': 'Base64 encode',
         'base64-decode': 'Base64 decode',
         'url-encode': 'URL encode',
@@ -3977,29 +5045,56 @@ const app = Vue.createApp({{
       }};
       return map[this.converterMode] || this.converterMode;
     }},
+    converterUsesYamlDocMode() {{
+      if (this.converterMode !== 'structured-convert') return false;
+      return String(this.converterStructuredInputFormat || '').toLowerCase() === 'yaml';
+    }},
+    converterUsesYamlAnchors() {{
+      if (this.converterMode !== 'structured-convert') return false;
+      return String(this.converterStructuredOutputFormat || '').toLowerCase() === 'yaml';
+    }},
+    converterSupportsPretty() {{
+      if (this.converterMode !== 'structured-convert') return false;
+      const outFmt = String(this.converterStructuredOutputFormat || '').toLowerCase();
+      return outFmt === 'json' || outFmt === 'toml' || outFmt === 'xml';
+    }},
+    converterInputSyntaxFormat() {{
+      if (this.converterMode !== 'structured-convert') return 'text';
+      const inFmt = String(this.converterStructuredInputFormat || '').toLowerCase();
+      return ['yaml', 'json', 'toml', 'csv', 'xml'].includes(inFmt) ? inFmt : 'text';
+    }},
+    converterOutputSyntaxFormat() {{
+      if (this.converterMode === 'structured-convert') {{
+        return String(this.converterStructuredOutputFormat || 'text').toLowerCase();
+      }}
+      if (this.converterMode === 'jwt-inspect') return 'json';
+      if (this.converterMode === 'text-to-hex') return 'hex';
+      return 'text';
+    }},
     converterOutputUseCm() {{
-      return this.converterMode === 'yaml-to-json'
-        || this.converterMode === 'json-to-yaml'
-        || this.converterMode === 'jwt-inspect';
+      return false;
     }},
     jqQueryHighlighted() {{
       return this.highlightJq(this.jqQuery || '');
     }},
     converterOutputHighlighted() {{
-      return this.highlightStructured(this.converterOutput || '');
+      return this.highlightBySyntaxFormat(this.converterOutput || '', this.converterOutputSyntaxFormat);
     }},
     converterOutputRich() {{
       if (this.converterMode === 'text-to-hex') {{
         return this.highlightHexOutput(this.converterOutput || '', this.converterHexView || 'dump');
       }}
       if (!this.converterOutputUseCm) {{
+        if (this.converterMode === 'structured-convert' || this.converterMode === 'jwt-inspect') {{
+          return this.highlightBySyntaxFormat(this.converterOutput || '', this.converterOutputSyntaxFormat);
+        }}
         return this.renderTextWithSyncOverlay(
           this.converterOutput || '',
           this.converterPlainRanges || [],
           this.converterPlainCursor
         );
       }}
-      return this.highlightStructured(this.converterOutput || '');
+      return this.highlightBySyntaxFormat(this.converterOutput || '', this.converterOutputSyntaxFormat);
     }},
     converterHexDumpInteractive() {{
       return this.converterMode === 'text-to-hex' && this.converterHexView === 'dump';
@@ -4067,7 +5162,25 @@ const app = Vue.createApp({{
     yqOutputHighlighted() {{
       return this.highlightStructured(this.yqOutput || '');
     }},
+    dyffFromSyntaxFormat() {{
+      const fmt = String(this.dyffFromFormat || 'auto').toLowerCase();
+      if (fmt === 'auto') return this.guessStructuredFormat(this.dyffFrom || '');
+      return ['json', 'yaml', 'toml', 'csv', 'xml'].includes(fmt) ? fmt : 'text';
+    }},
+    dyffToSyntaxFormat() {{
+      const fmt = String(this.dyffToFormat || 'auto').toLowerCase();
+      if (fmt === 'auto') return this.guessStructuredFormat(this.dyffTo || '');
+      return ['json', 'yaml', 'toml', 'csv', 'xml'].includes(fmt) ? fmt : 'text';
+    }},
+    dyffOutputSyntaxFormat() {{
+      const fmt = String(this.dyffOutputFormat || 'diff').toLowerCase();
+      if (fmt === 'json' || fmt === 'jsonl') return 'json';
+      return 'text';
+    }},
     dyffOutputHighlighted() {{
+      if (this.dyffOutputSyntaxFormat === 'json') {{
+        return this.highlightBySyntaxFormat(this.dyffOutput || '', 'json');
+      }}
       return this.highlightDyff(this.dyffOutput || '');
     }},
     mainImportSourceHighlighted() {{
@@ -4182,7 +5295,38 @@ const app = Vue.createApp({{
     dyffChangedCount() {{
       const t = this.dyffOutput || '';
       if(!t) return 0;
-      return t.split('\n').filter(l => /^changed: |^added: |^removed: /.test(l)).length;
+      const outFmt = String(this.dyffOutputFormat || 'diff').toLowerCase();
+      if (outFmt === 'diff' || outFmt === 'text') {{
+        return t.split('\n').filter(l => /^changed: |^added: |^removed: /.test(l)).length;
+      }}
+      if (outFmt === 'summary') {{
+        const m = /total=(\d+)/.exec(t);
+        return m ? Number(m[1] || 0) : 0;
+      }}
+      if (outFmt === 'json') {{
+        try {{
+          const parsed = JSON.parse(t);
+          return Number(parsed && parsed.summary && parsed.summary.total ? parsed.summary.total : 0);
+        }} catch(_) {{
+          return 0;
+        }}
+      }}
+      if (outFmt === 'jsonl') {{
+        return t.split('\n').filter((line) => {{
+          const text = String(line || '').trim();
+          if (!text) return false;
+          try {{
+            const parsed = JSON.parse(text);
+            return parsed && parsed.type === 'diff';
+          }} catch(_) {{
+            return false;
+          }}
+        }}).length;
+      }}
+      if (outFmt === 'patch') {{
+        return t.split('\n').filter((line) => String(line || '').startsWith('@@ ')).length;
+      }}
+      return 0;
     }},
     mainImportPathPlaceholder() {{
       if (this.mainImportSourceType === 'compose') {{
@@ -4204,6 +5348,19 @@ const app = Vue.createApp({{
         this.collapsedTitles = s.collapsedTitles || {{}};
         if(s.activeUtilityId) this.activeUtilityId = s.activeUtilityId;
         if(s.converterMode) this.converterMode = s.converterMode;
+        if (this.converterMode === 'yaml-to-json') {{
+          this.converterMode = 'structured-convert';
+          this.converterStructuredInputFormat = 'yaml';
+          this.converterStructuredOutputFormat = 'json';
+        }} else if (this.converterMode === 'json-to-yaml') {{
+          this.converterMode = 'structured-convert';
+          this.converterStructuredInputFormat = 'json';
+          this.converterStructuredOutputFormat = 'yaml';
+        }}
+        if (s.converterStructuredInputFormat) this.converterStructuredInputFormat = s.converterStructuredInputFormat;
+        if (s.converterStructuredOutputFormat) this.converterStructuredOutputFormat = s.converterStructuredOutputFormat;
+        this.converterYamlAnchors = !!s.converterYamlAnchors;
+        this.converterPrettyOutput = s.converterPrettyOutput !== false;
         if(s.converterDocMode) this.converterDocMode = s.converterDocMode;
         this.converterDocIndex = Number.isFinite(s.converterDocIndex) ? Number(s.converterDocIndex) : 0;
         this.converterInput = s.converterInput || '';
@@ -4227,6 +5384,9 @@ const app = Vue.createApp({{
         this.yqRawOutput = !!s.yqRawOutput;
         this.dyffFrom = s.dyffFrom || '';
         this.dyffTo = s.dyffTo || '';
+        this.dyffFromFormat = s.dyffFromFormat || 'auto';
+        this.dyffToFormat = s.dyffToFormat || 'auto';
+        this.dyffOutputFormat = s.dyffOutputFormat || 'diff';
         this.dyffIgnoreOrder = !!s.dyffIgnoreOrder;
         this.dyffIgnoreWhitespace = !!s.dyffIgnoreWhitespace;
         this.mainImportSourceType = s.mainImportSourceType || 'chart';
@@ -4240,6 +5400,7 @@ const app = Vue.createApp({{
         this.mainImportMinIncludeBytes = Number.isFinite(s.mainImportMinIncludeBytes) ? Number(s.mainImportMinIncludeBytes) : 24;
         this.mainImportIncludeStatus = !!s.mainImportIncludeStatus;
         this.mainImportIncludeCrds = !!s.mainImportIncludeCrds;
+        this.mainImportYamlAnchors = !!s.mainImportYamlAnchors;
         this.mainImportKubeVersion = s.mainImportKubeVersion || '';
         this.mainImportValuesFilesText = s.mainImportValuesFilesText || '';
         this.mainImportSetText = s.mainImportSetText || '';
@@ -4317,15 +5478,49 @@ const app = Vue.createApp({{
     }},
     converterMode() {{
       this.saveSettings();
+      if (this.converterMode !== 'structured-convert') {{
+        this.converterDocMode = 'all';
+        this.converterDocIndex = 0;
+        this.converterYamlAnchors = false;
+      }}
+      this.syncConverterInputEditorLanguage();
       this.clearHexSelection();
       this.scheduleConvert();
       this.$nextTick(() => this.initToolCodeMirror());
+    }},
+    converterStructuredInputFormat() {{
+      this.saveSettings();
+      if (!this.converterUsesYamlDocMode) {{
+        this.converterDocMode = 'all';
+        this.converterDocIndex = 0;
+      }}
+      this.syncConverterInputEditorLanguage();
+      this.scheduleConvert();
+    }},
+    converterStructuredOutputFormat() {{
+      this.saveSettings();
+      if (!this.converterUsesYamlAnchors) this.converterYamlAnchors = false;
+      this.scheduleConvert();
+      this.$nextTick(() => this.initToolCodeMirror());
+    }},
+    converterYamlAnchors() {{
+      this.saveSettings();
+      this.scheduleConvert();
+    }},
+    converterPrettyOutput() {{
+      this.saveSettings();
+      this.scheduleConvert();
     }},
     converterDocMode() {{
       this.saveSettings();
       this.scheduleConvert();
     }},
     converterDocIndex() {{
+      const normalized = Math.max(0, Math.floor(Number(this.converterDocIndex || 0)));
+      if (!Number.isFinite(normalized) || normalized !== Number(this.converterDocIndex)) {{
+        this.converterDocIndex = Number.isFinite(normalized) ? normalized : 0;
+        return;
+      }}
       this.saveSettings();
       this.scheduleConvert();
     }},
@@ -4427,11 +5622,28 @@ const app = Vue.createApp({{
     dyffFrom() {{
       this.saveSettings();
       if (this.dyffFromCm) this.dyffFromCm.setValue(this.dyffFrom || '');
+      this.syncDyffEditorLanguages();
       this.scheduleDyffRun();
     }},
     dyffTo() {{
       this.saveSettings();
       if (this.dyffToCm) this.dyffToCm.setValue(this.dyffTo || '');
+      this.syncDyffEditorLanguages();
+      this.scheduleDyffRun();
+    }},
+    dyffFromFormat() {{
+      this.saveSettings();
+      this.syncDyffEditorLanguages();
+      this.scheduleDyffRun();
+    }},
+    dyffToFormat() {{
+      this.saveSettings();
+      this.syncDyffEditorLanguages();
+      this.scheduleDyffRun();
+    }},
+    dyffOutputFormat() {{
+      this.saveSettings();
+      this.syncDyffEditorLanguages();
       this.scheduleDyffRun();
     }},
     dyffOutput() {{
@@ -4448,6 +5660,9 @@ const app = Vue.createApp({{
     }},
     mainImportSourceType() {{
       this.saveSettings();
+      if (this.mainImportSourceType !== 'chart' && this.mainImportYamlAnchors) {{
+        this.mainImportYamlAnchors = false;
+      }}
     }},
     mainImportPath: 'saveSettings',
     mainImportEnv: 'saveSettings',
@@ -4459,6 +5674,7 @@ const app = Vue.createApp({{
     mainImportMinIncludeBytes: 'saveSettings',
     mainImportIncludeStatus: 'saveSettings',
     mainImportIncludeCrds: 'saveSettings',
+    mainImportYamlAnchors: 'saveSettings',
     mainImportKubeVersion: 'saveSettings',
     mainImportValuesFilesText: 'saveSettings',
     mainImportSetText: 'saveSettings',
@@ -4706,12 +5922,18 @@ const app = Vue.createApp({{
     }},
     ensureToolEditor(instanceKey, hostRef, options) {{
       const cmApi = this.getCodeMirrorApi();
-      if (!cmApi || typeof cmApi.createYamlEditor !== 'function') return null;
+      const creator = cmApi && (cmApi.createCodeEditor || cmApi.createYamlEditor);
+      if (!creator || typeof creator !== 'function') return null;
       if (this[instanceKey]) return this[instanceKey];
       const host = this.$refs[hostRef];
       if (!host) return null;
-      this[instanceKey] = cmApi.createYamlEditor(host, options || {{}});
+      this[instanceKey] = creator(host, options || {{}});
       return this[instanceKey];
+    }},
+    syncConverterInputEditorLanguage() {{
+      const cm = this.converterInputCm;
+      if (!cm || typeof cm.setLanguage !== 'function') return;
+      cm.setLanguage(this.converterInputSyntaxFormat || 'text');
     }},
     initConverterCodeMirror() {{
       if (!this.cmAvailable) return;
@@ -4721,9 +5943,11 @@ const app = Vue.createApp({{
         readOnly: false,
         wrapLines: this.wrapLines,
         fontSize: this.fontSize,
+        language: this.converterInputSyntaxFormat || 'text',
         onChange: (next) => {{ this.converterInput = next; }},
         onSelectionChange: (sel) => {{ this.onConverterSelection(sel); }},
       }});
+      this.syncConverterInputEditorLanguage();
       if (this.converterOutputUseCm) {{
         this.ensureToolEditor('converterOutputCm', 'converterOutputCmHost', {{
           value: this.converterOutput || '',
@@ -4790,6 +6014,7 @@ const app = Vue.createApp({{
         readOnly: false,
         wrapLines: this.wrapLines,
         fontSize: this.fontSize,
+        language: this.dyffFromSyntaxFormat || 'text',
         onChange: (next) => {{ this.dyffFrom = next; }},
         onSelectionChange: (sel) => {{ this.onDyffFromSelection(sel); }},
       }});
@@ -4798,6 +6023,7 @@ const app = Vue.createApp({{
         readOnly: false,
         wrapLines: this.wrapLines,
         fontSize: this.fontSize,
+        language: this.dyffToSyntaxFormat || 'text',
         onChange: (next) => {{ this.dyffTo = next; }},
         onSelectionChange: (sel) => {{ this.onDyffToSelection(sel); }},
       }});
@@ -4806,8 +6032,21 @@ const app = Vue.createApp({{
         readOnly: true,
         wrapLines: this.wrapLines,
         fontSize: this.fontSize,
+        language: this.dyffOutputSyntaxFormat || 'text',
       }});
+      this.syncDyffEditorLanguages();
       this.applyDyffSelectionSync();
+    }},
+    syncDyffEditorLanguages() {{
+      if (this.dyffFromCm && typeof this.dyffFromCm.setLanguage === 'function') {{
+        this.dyffFromCm.setLanguage(this.dyffFromSyntaxFormat || 'text');
+      }}
+      if (this.dyffToCm && typeof this.dyffToCm.setLanguage === 'function') {{
+        this.dyffToCm.setLanguage(this.dyffToSyntaxFormat || 'text');
+      }}
+      if (this.dyffOutputCm && typeof this.dyffOutputCm.setLanguage === 'function') {{
+        this.dyffOutputCm.setLanguage(this.dyffOutputSyntaxFormat || 'text');
+      }}
     }},
     initToolCodeMirror() {{
       if (!this.refreshCodeMirrorAvailability()) return;
@@ -4828,6 +6067,10 @@ const app = Vue.createApp({{
           collapsedTitles: this.collapsedTitles,
           activeUtilityId: this.activeUtilityId,
           converterMode: this.converterMode,
+          converterStructuredInputFormat: this.converterStructuredInputFormat,
+          converterStructuredOutputFormat: this.converterStructuredOutputFormat,
+          converterYamlAnchors: this.converterYamlAnchors,
+          converterPrettyOutput: this.converterPrettyOutput,
           converterDocMode: this.converterDocMode,
           converterDocIndex: this.converterDocIndex,
           converterInput: this.converterInput,
@@ -4851,6 +6094,9 @@ const app = Vue.createApp({{
           yqRawOutput: this.yqRawOutput,
           dyffFrom: this.dyffFrom,
           dyffTo: this.dyffTo,
+          dyffFromFormat: this.dyffFromFormat,
+          dyffToFormat: this.dyffToFormat,
+          dyffOutputFormat: this.dyffOutputFormat,
           dyffIgnoreOrder: this.dyffIgnoreOrder,
           dyffIgnoreWhitespace: this.dyffIgnoreWhitespace,
           mainImportSourceType: this.mainImportSourceType,
@@ -4864,6 +6110,7 @@ const app = Vue.createApp({{
           mainImportMinIncludeBytes: this.mainImportMinIncludeBytes,
           mainImportIncludeStatus: this.mainImportIncludeStatus,
           mainImportIncludeCrds: this.mainImportIncludeCrds,
+          mainImportYamlAnchors: this.mainImportYamlAnchors,
           mainImportKubeVersion: this.mainImportKubeVersion,
           mainImportValuesFilesText: this.mainImportValuesFilesText,
           mainImportSetText: this.mainImportSetText,
@@ -4932,6 +6179,16 @@ const app = Vue.createApp({{
         .split(/\r?\n/)
         .map(s => s.trim())
         .filter(Boolean);
+    }},
+    guessStructuredFormat(v) {{
+      const src = String(v || '').trim();
+      if (!src) return 'yaml';
+      const first = src.split(/\r?\n/, 1)[0] || '';
+      if (src.startsWith('{{') || src.startsWith('[')) return 'json';
+      if (src.startsWith('<')) return 'xml';
+      if (/^\s*\[[^\]]+\]\s*$/.test(first) || /^\s*[A-Za-z0-9_.-]+\s*=/.test(first)) return 'toml';
+      if (first.includes(',') && first.split(',').length > 1) return 'csv';
+      return 'yaml';
     }},
     parseSetBlocks() {{
       const out = {{
@@ -5377,6 +6634,7 @@ const app = Vue.createApp({{
             minIncludeBytes: Number(this.mainImportMinIncludeBytes || 24),
             includeStatus: !!this.mainImportIncludeStatus,
             includeCrds: !!this.mainImportIncludeCrds,
+            yamlAnchors: this.mainImportSourceType === 'chart' && !!this.mainImportYamlAnchors,
             kubeVersion: this.mainImportKubeVersion,
             valuesFiles: this.parseLines(this.mainImportValuesFilesText),
             setValues: this.parseLines(this.mainImportSetText),
@@ -5536,6 +6794,7 @@ const app = Vue.createApp({{
             chartName: this.mainImportOutChartName || undefined,
             libraryChartPath: this.mainImportLibraryChartPath || undefined,
             valuesYaml: this.mainImportOutput,
+            yamlAnchors: this.mainImportSourceType === 'chart' && !!this.mainImportYamlAnchors,
           }}),
           signal: ctrl && ctrl.signal ? ctrl.signal : undefined,
         }});
@@ -5576,6 +6835,7 @@ const app = Vue.createApp({{
       this.mainImportMinIncludeBytes = 24;
       this.mainImportIncludeStatus = false;
       this.mainImportIncludeCrds = false;
+      this.mainImportYamlAnchors = false;
       this.mainImportKubeVersion = '';
       this.mainImportValuesFilesText = '';
       this.mainImportSetText = '';
@@ -5597,6 +6857,7 @@ const app = Vue.createApp({{
       this.mainImportMinIncludeBytes = 24;
       this.mainImportIncludeStatus = false;
       this.mainImportIncludeCrds = false;
+      this.mainImportYamlAnchors = false;
       this.mainImportKubeVersion = '';
       this.mainImportValuesFilesText = '';
       this.mainImportSetText = '';
@@ -5945,15 +7206,24 @@ const app = Vue.createApp({{
       this.converting = true;
       const ctrl = this.beginAbortableRequest('convert');
       try {{
-        if (this.converterMode === 'yaml-to-json' || this.converterMode === 'json-to-yaml') {{
+        if (this.converterMode === 'structured-convert') {{
+          const useYamlDocs = this.converterUsesYamlDocMode;
+          const docMode = useYamlDocs ? this.converterDocMode : 'all';
+          const docIndex = (useYamlDocs && docMode === 'index')
+            ? Number(this.converterDocIndex)
+            : undefined;
           const res = await fetch('/api/convert', {{
             method: 'POST',
             headers: {{ 'content-type': 'application/json' }},
             body: JSON.stringify({{
               mode: this.converterMode,
-              docMode: this.converterDocMode,
-              docIndex: this.converterDocMode === 'index' ? Number(this.converterDocIndex) : undefined,
-              input: payload
+              input: payload,
+              inputFormat: this.converterStructuredInputFormat,
+              outputFormat: this.converterStructuredOutputFormat,
+              docMode,
+              docIndex,
+              yamlAnchors: this.converterUsesYamlAnchors ? !!this.converterYamlAnchors : false,
+              pretty: this.converterSupportsPretty ? !!this.converterPrettyOutput : true,
             }}),
             signal: ctrl && ctrl.signal ? ctrl.signal : undefined,
           }});
@@ -6000,9 +7270,14 @@ const app = Vue.createApp({{
       }}, 120);
     }},
     swapConvertMode() {{
+      if (this.converterMode === 'structured-convert') {{
+        const from = this.converterStructuredInputFormat || 'yaml';
+        const to = this.converterStructuredOutputFormat || 'json';
+        this.converterStructuredInputFormat = to;
+        this.converterStructuredOutputFormat = from;
+        return;
+      }}
       const pairs = {{
-        'yaml-to-json': 'json-to-yaml',
-        'json-to-yaml': 'yaml-to-json',
         'base64-encode': 'base64-decode',
         'base64-decode': 'base64-encode',
         'url-encode': 'url-decode',
@@ -6023,10 +7298,22 @@ const app = Vue.createApp({{
     }},
     loadSampleConverter() {{
       const m = this.converterMode;
-      if (m === 'yaml-to-json' || m === 'json-to-yaml') {{
-        this.converterMode = 'yaml-to-json';
-        this.converterDocMode = 'all';
-        this.converterInput = "global:\n  env: dev\napps-stateless:\n  app-1:\n    enabled: true\n";
+      if (m === 'structured-convert') {{
+        const inFmt = String(this.converterStructuredInputFormat || 'yaml').toLowerCase();
+        if (inFmt === 'yaml') {{
+          this.converterDocMode = 'all';
+          this.converterInput = "global:\n  env: dev\napps-stateless:\n  app-1:\n    enabled: true\n";
+        }} else if (inFmt === 'json') {{
+          this.converterInput = '{{"global":{{"env":"dev"}},"apps-stateless":{{"app-1":{{"enabled":true}}}}}}';
+        }} else if (inFmt === 'toml') {{
+          this.converterInput = "[global]\nenv = \"dev\"\n\n[apps-stateless.app-1]\nenabled = true\n";
+        }} else if (inFmt === 'csv') {{
+          this.converterInput = "name,enabled,replicas\napp-1,true,2\napp-2,false,1\n";
+        }} else if (inFmt === 'xml') {{
+          this.converterInput = "<root><app name=\"app-1\"><enabled>true</enabled></app></root>\n";
+        }} else {{
+          this.converterInput = '';
+        }}
       }} else if (m === 'base64-encode' || m === 'base64-decode') {{
         this.converterInput = m === 'base64-encode' ? 'hello happ' : 'aGVsbG8gaGFwcA==';
       }} else if (m === 'url-encode' || m === 'url-decode') {{
@@ -6616,6 +7903,27 @@ const app = Vue.createApp({{
         this.applySelectionsToEditor(this.mainImportGeneratedCm, ranges, cursorPos);
       }}
     }},
+    converterSourceSemanticKind() {{
+      if (this.converterMode !== 'structured-convert') return 'text';
+      const inFmt = String(this.converterStructuredInputFormat || '').toLowerCase();
+      if (inFmt === 'yaml') return 'yaml';
+      if (inFmt === 'json') return 'json';
+      return 'text';
+    }},
+    converterOutputSemanticKind() {{
+      if (this.converterMode === 'jwt-inspect') return 'json';
+      if (this.converterMode !== 'structured-convert') return 'text';
+      const outFmt = String(this.converterStructuredOutputFormat || '').toLowerCase();
+      if (outFmt === 'yaml') return 'yaml';
+      if (outFmt === 'json') return 'json';
+      return 'text';
+    }},
+    converterSelectionPathHint(info) {{
+      if (!info) return [];
+      return this.converterSourceSemanticKind() === 'yaml'
+        ? this.extractYamlPathAt(info.sourceText || '', info.from)
+        : [];
+    }},
     async applyConverterSelectionSync() {{
       const info = this.converterSelection;
       if (!info) return;
@@ -6650,9 +7958,7 @@ const app = Vue.createApp({{
           if (Number(info.from) === Number(info.to)) this.converterPlainCursor = fromOut;
           return;
         }}
-        const path = (this.converterMode === 'yaml-to-json' || this.converterMode === 'json-to-yaml')
-          ? this.extractYamlPathAt(info.sourceText || '', info.from)
-          : [];
+        const path = this.converterSelectionPathHint(info);
         const local = this.findSemanticRangesLocal(this.converterOutput || '', info, path);
         this.converterPlainRanges = local;
         if (Number(info.from) === Number(info.to) && local.length) this.converterPlainCursor = Number(local[0].from);
@@ -6667,11 +7973,9 @@ const app = Vue.createApp({{
         this.applySelectionsToEditor(this.converterOutputCm, ranges, cursorPos);
         return;
       }}
-      const path = (this.converterMode === 'yaml-to-json' || this.converterMode === 'json-to-yaml')
-        ? this.extractYamlPathAt(info.sourceText || '', info.from)
-        : [];
-      const sourceKind = (this.converterMode === 'yaml-to-json') ? 'yaml' : ((this.converterMode === 'json-to-yaml') ? 'json' : 'text');
-      const outputKind = (this.converterMode === 'yaml-to-json') ? 'json' : ((this.converterMode === 'json-to-yaml') ? 'yaml' : 'text');
+      const path = this.converterSelectionPathHint(info);
+      const sourceKind = this.converterSourceSemanticKind();
+      const outputKind = this.converterOutputSemanticKind();
       try {{
         const ranges = await this.requestSemanticRanges('converter', {{
           source: info.sourceText || '',
@@ -6762,12 +8066,18 @@ const app = Vue.createApp({{
       if (!this.dyffOutputCm) return;
       const info = this.dyffFromSelection || this.dyffToSelection;
       if (!info) return;
+      const sourceFormat = (info === this.dyffFromSelection)
+        ? this.dyffFromSyntaxFormat
+        : this.dyffToSyntaxFormat;
+      const sourceKind = (sourceFormat === 'yaml' || sourceFormat === 'json')
+        ? sourceFormat
+        : 'auto';
       try {{
         const ranges = await this.requestSemanticRanges('dyff', {{
           source: info.sourceText || '',
           output: this.dyffOutput || '',
-          sourceKind: 'auto',
-          outputKind: 'text',
+          sourceKind,
+          outputKind: this.dyffOutputSyntaxFormat === 'json' ? 'json' : 'text',
           from: info.from,
           to: info.to,
           selectedText: info.text || '',
@@ -6811,6 +8121,69 @@ const app = Vue.createApp({{
       out = out.replace(/\b(-?\d+(?:\.\d+)?)\b/g, "<span class='tok-num'>$1</span>");
       return out || ' ';
     }},
+    highlightToml(src) {{
+      let out = this.escapeHtml(src);
+      out = out.replace(/^(\s*\[.*?\]\s*)$/gm, "<span class='tok-key'>$1</span>");
+      out = out.replace(/^(\s*)([A-Za-z0-9_.-]+)(\s*=)/gm, "$1<span class='tok-key'>$2</span><span class='tok-op'>$3</span>");
+      out = out.replace(/("([^"\\]|\\.)*")/g, "<span class='tok-str'>$1</span>");
+      out = out.replace(/\b(true|false)\b/g, "<span class='tok-bool'>$1</span>");
+      out = out.replace(/\b(-?\d+(?:\.\d+)?)\b/g, "<span class='tok-num'>$1</span>");
+      out = out.replace(/(^|\s)(#.*)$/gm, "$1<span class='tok-null'>$2</span>");
+      return out || ' ';
+    }},
+    highlightXml(src) {{
+      let out = this.escapeHtml(src);
+      out = out.replace(/(&lt;\/?)([A-Za-z_][A-Za-z0-9_.:-]*)([^&]*?)(\/?&gt;)/g, (_m, open, tag, attrs, close) => {{
+        let attrsOut = String(attrs || '');
+        attrsOut = attrsOut.replace(/([A-Za-z_][A-Za-z0-9_.:-]*)(=)(&quot;[^&]*?&quot;)/g, "<span class='tok-key'>$1</span><span class='tok-op'>$2</span><span class='tok-str'>$3</span>");
+        return "<span class='tok-op'>" + open + "</span><span class='tok-key'>" + tag + "</span>" + attrsOut + "<span class='tok-op'>" + close + "</span>";
+      }});
+      return out || ' ';
+    }},
+    highlightCsv(src) {{
+      const lines = String(src || '').split('\n');
+      if (!lines.length) return ' ';
+      const out = [];
+      for (let i = 0; i < lines.length; i += 1) {{
+        const line = lines[i];
+        if (!line) {{
+          out.push('');
+          continue;
+        }}
+        const cells = [];
+        let cur = '';
+        let inQuote = false;
+        for (let p = 0; p < line.length; p += 1) {{
+          const ch = line[p];
+          if (ch === '"') inQuote = !inQuote;
+          if (ch === ',' && !inQuote) {{
+            cells.push(cur);
+            cur = '';
+          }} else {{
+            cur += ch;
+          }}
+        }}
+        cells.push(cur);
+        const rendered = cells.map((cell, idx) => {{
+          const safe = this.escapeHtml(cell);
+          if (i === 0) return "<span class='tok-key'>" + safe + "</span>";
+          if (/^-?\d+(?:\.\d+)?$/.test(cell.trim())) return "<span class='tok-num'>" + safe + "</span>";
+          if (/^(true|false)$/i.test(cell.trim())) return "<span class='tok-bool'>" + safe + "</span>";
+          if ((cell.startsWith('"') && cell.endsWith('"')) || /[,\"]/.test(cell)) return "<span class='tok-str'>" + safe + "</span>";
+          return safe;
+        }});
+        out.push(rendered.join("<span class='tok-op'>,</span>"));
+      }}
+      return out.join('\n') || ' ';
+    }},
+    highlightBySyntaxFormat(src, format) {{
+      const fmt = String(format || '').toLowerCase();
+      if (fmt === 'json' || fmt === 'yaml') return this.highlightStructured(src);
+      if (fmt === 'toml') return this.highlightToml(src);
+      if (fmt === 'xml') return this.highlightXml(src);
+      if (fmt === 'csv') return this.highlightCsv(src);
+      return this.escapeHtml(src || '') || ' ';
+    }},
     highlightDyff(src) {{
       const lines = String(src || '').split('\n');
       const html = lines.map((line) => {{
@@ -6818,6 +8191,12 @@ const app = Vue.createApp({{
         if (safe.startsWith('added: ')) return "<span class='tok-diff-add'>" + safe + "</span>";
         if (safe.startsWith('removed: ')) return "<span class='tok-diff-rem'>" + safe + "</span>";
         if (safe.startsWith('changed: ')) return "<span class='tok-diff-chg'>" + safe + "</span>";
+        if (safe.startsWith('--- ')) return "<span class='tok-diff-rem'>" + safe + "</span>";
+        if (safe.startsWith('+++ ')) return "<span class='tok-diff-add'>" + safe + "</span>";
+        if (safe.startsWith('@@ ') && safe.endsWith(' @@')) return "<span class='tok-key'>" + safe + "</span>";
+        if (safe.startsWith('+')) return "<span class='tok-diff-add'>" + safe + "</span>";
+        if (safe.startsWith('-')) return "<span class='tok-diff-rem'>" + safe + "</span>";
+        if (safe.startsWith('Summary: ')) return "<span class='tok-key'>" + safe + "</span>";
         return safe;
       }});
       return html.join('\n');
@@ -6983,12 +8362,15 @@ const app = Vue.createApp({{
       }}
       const ctrl = this.beginAbortableRequest('dyff');
       try {{
-        const res = await fetch('/api/dyff', {{
+        const res = await fetch('/api/semantic-diff', {{
           method: 'POST',
           headers: {{ 'content-type': 'application/json' }},
           body: JSON.stringify({{
             from,
             to,
+            fromFormat: this.dyffFromFormat,
+            toFormat: this.dyffToFormat,
+            outputFormat: this.dyffOutputFormat,
             ignoreOrder: this.dyffIgnoreOrder,
             ignoreWhitespace: this.dyffIgnoreWhitespace
           }}),
@@ -6999,14 +8381,14 @@ const app = Vue.createApp({{
         try {{
           data = JSON.parse(raw);
         }} catch(_) {{
-          throw new Error('dyff API returned non-JSON response: ' + raw.slice(0, 300));
+          throw new Error('semantic diff API returned non-JSON response: ' + raw.slice(0, 300));
         }}
         if(!res.ok) {{
-          throw new Error(data.output || ('dyff API HTTP ' + res.status));
+          throw new Error(data.output || ('semantic diff API HTTP ' + res.status));
         }}
         if(reqId !== this.dyffRequestSeq) return;
         if(!data.ok) {{
-          this.dyffError = data.output || 'dyff execution failed';
+          this.dyffError = data.output || 'Semantic diff failed';
           this.dyffOutput = '';
           return;
         }}
@@ -7035,6 +8417,9 @@ const app = Vue.createApp({{
       this.dyffError = '';
     }},
     loadSampleDyff() {{
+      this.dyffFromFormat = 'yaml';
+      this.dyffToFormat = 'yaml';
+      this.dyffOutputFormat = 'diff';
       this.dyffFrom = "apiVersion: v1\nkind: Service\nmetadata:\n  name: app\nspec:\n  ports:\n    - port: 80\n";
       this.dyffTo = "apiVersion: v1\nkind: Service\nmetadata:\n  name: app\nspec:\n  ports:\n    - port: 8080\n";
     }},
@@ -7125,14 +8510,14 @@ mod tests {
         assert!(html.contains("jq Playground"));
         assert!(html.contains("/api/jq"));
         assert!(!html.contains("yq Playground"));
-        assert!(html.contains("dyff Compare"));
-        assert!(html.contains("/api/dyff"));
+        assert!(html.contains("Semantic Diff"));
+        assert!(html.contains("/api/semantic-diff"));
         assert!(html.contains("jq-suggest"));
         assert!(html.contains("onJqKeydown"));
         assert!(html.contains("applyJqPreset"));
         assert!(html.contains("chip-row"));
         assert!(html.contains("select enabled"));
-        assert!(html.contains("YAML → JSON"));
+        assert!(html.contains("Structured convert"));
         assert!(html.contains("localStorage"));
         assert!(html.contains("Copy values"));
         assert!(html.contains("Save as chart"));
@@ -7173,11 +8558,27 @@ mod tests {
 
     #[test]
     fn convert_payload_yaml_to_json_and_back() {
-        let j =
-            convert_payload("yaml-to-json", "a: 1\nb:\n  - x\n", "all", None).expect("yaml->json");
+        let j = convert_payload(
+            "structured-convert",
+            "a: 1\nb:\n  - x\n",
+            "all",
+            None,
+            "yaml",
+            "json",
+            false,
+        )
+        .expect("yaml->json");
         assert!(j.contains("\"a\": 1"));
-        let y = convert_payload("json-to-yaml", r#"{"a":1,"b":["x"]}"#, "all", None)
-            .expect("json->yaml");
+        let y = convert_payload(
+            "structured-convert",
+            r#"{"a":1,"b":["x"]}"#,
+            "all",
+            None,
+            "json",
+            "yaml",
+            false,
+        )
+        .expect("json->yaml");
         assert!(y.contains("a: 1"));
         assert!(y.contains("- x"));
     }
@@ -7191,7 +8592,16 @@ obj:
   <<: { foo: 123, bar: 456 }
   baz: 999
 "#;
-        let j = convert_payload("yaml-to-json", input, "all", None).expect("yaml->json");
+        let j = convert_payload(
+            "structured-convert",
+            input,
+            "all",
+            None,
+            "yaml",
+            "json",
+            false,
+        )
+        .expect("yaml->json");
         assert!(j.contains("\"foo\": 123"));
         assert!(j.contains("\"bar\": 456"));
         assert!(j.contains("\"baz\": 999"));
@@ -7208,10 +8618,24 @@ folded: >-
   a
   b
 "#;
-        let j = convert_payload("yaml-to-json", src, "all", None).expect("yaml->json");
+        let j = convert_payload(
+            "structured-convert",
+            src,
+            "all",
+            None,
+            "yaml",
+            "json",
+            false,
+        )
+        .expect("yaml->json");
         let v: serde_json::Value = serde_json::from_str(&j).expect("json");
-        assert_eq!(v[0]["literal"], "line1\nline2");
-        assert_eq!(v[0]["folded"], "a b");
+        let doc = if let Some(arr) = v.as_array() {
+            arr.first().cloned().unwrap_or(serde_json::Value::Null)
+        } else {
+            v
+        };
+        assert_eq!(doc["literal"], "line1\nline2");
+        assert_eq!(doc["folded"], "a b");
     }
 
     #[test]
@@ -7227,8 +8651,26 @@ text: |-
   hello
   world
 "#;
-        let as_json = convert_payload("yaml-to-json", src, "first", None).expect("yaml->json");
-        let back_yaml = convert_payload("json-to-yaml", &as_json, "all", None).expect("json->yaml");
+        let as_json = convert_payload(
+            "structured-convert",
+            src,
+            "first",
+            None,
+            "yaml",
+            "json",
+            false,
+        )
+        .expect("yaml->json");
+        let back_yaml = convert_payload(
+            "structured-convert",
+            &as_json,
+            "all",
+            None,
+            "json",
+            "yaml",
+            false,
+        )
+        .expect("json->yaml");
 
         let left: serde_yaml::Value = serde_yaml::from_str(src).expect("src yaml");
         let right: serde_yaml::Value = serde_yaml::from_str(&back_yaml).expect("roundtrip yaml");
@@ -7240,10 +8682,30 @@ text: |-
     #[test]
     fn convert_payload_rejects_multi_document_yaml() {
         let src = "a: 1\n---\na: 2\n";
-        let all = convert_payload("yaml-to-json", src, "all", None).expect("ok");
-        let v: serde_json::Value = serde_json::from_str(&all).expect("json");
-        assert_eq!(v.as_array().map(|x| x.len()), Some(2));
-        let first = convert_payload("yaml-to-json", src, "first", None).expect("ok");
+        let all = convert_payload(
+            "structured-convert",
+            src,
+            "all",
+            None,
+            "yaml",
+            "json",
+            false,
+        )
+        .expect("ok");
+        let docs = zq::parse_native_input_values_with_format(&all, zq::NativeInputFormat::Json)
+            .expect("json stream")
+            .values;
+        assert_eq!(docs.len(), 2);
+        let first = convert_payload(
+            "structured-convert",
+            src,
+            "first",
+            None,
+            "yaml",
+            "json",
+            false,
+        )
+        .expect("ok");
         let one: serde_json::Value = serde_json::from_str(&first).expect("json");
         assert_eq!(one["a"], 1);
     }
@@ -7251,7 +8713,16 @@ text: |-
     #[test]
     fn convert_payload_supports_index_doc_mode() {
         let src = "a: 1\n---\na: 2\n---\na: 3\n";
-        let at_1 = convert_payload("yaml-to-json", src, "index", Some(1)).expect("ok");
+        let at_1 = convert_payload(
+            "structured-convert",
+            src,
+            "index",
+            Some(1),
+            "yaml",
+            "json",
+            false,
+        )
+        .expect("ok");
         let one: serde_json::Value = serde_json::from_str(&at_1).expect("json");
         assert_eq!(one["a"], 2);
     }
@@ -7259,35 +8730,233 @@ text: |-
     #[test]
     fn convert_payload_rejects_missing_index_for_index_doc_mode() {
         let src = "a: 1\n---\na: 2\n";
-        let err = convert_payload("yaml-to-json", src, "index", None).expect_err("error");
+        let err = convert_payload(
+            "structured-convert",
+            src,
+            "index",
+            None,
+            "yaml",
+            "json",
+            false,
+        )
+        .expect_err("error");
         assert!(err.contains("doc index is required"));
     }
 
     #[test]
     fn convert_payload_rejects_out_of_range_index_doc_mode() {
         let src = "a: 1\n---\na: 2\n";
-        let err = convert_payload("yaml-to-json", src, "index", Some(5)).expect_err("error");
+        let err = convert_payload(
+            "structured-convert",
+            src,
+            "index",
+            Some(5),
+            "yaml",
+            "json",
+            false,
+        )
+        .expect_err("error");
         assert!(err.contains("out of range"));
     }
 
     #[test]
     fn convert_payload_rejects_duplicate_keys_yaml() {
         let src = "a: 1\na: 2\n";
-        let err = convert_payload("yaml-to-json", src, "all", None).expect_err("error");
-        assert!(err.contains("YAML parse error"));
+        let err = convert_payload(
+            "structured-convert",
+            src,
+            "all",
+            None,
+            "yaml",
+            "json",
+            false,
+        )
+        .expect_err("error");
+        assert!(err.to_lowercase().contains("yaml"));
         assert!(err.to_lowercase().contains("duplicate"));
     }
 
     #[test]
     fn convert_payload_rejects_bad_mode() {
-        let err = convert_payload("bad", "a: 1", "all", None).expect_err("error");
+        let err = convert_payload("bad", "a: 1", "all", None, "yaml", "json", false)
+            .expect_err("error");
         assert!(err.contains("unsupported mode"));
     }
 
     #[test]
     fn convert_payload_rejects_bad_doc_mode() {
-        let err = convert_payload("yaml-to-json", "a: 1\n", "weird", None).expect_err("error");
+        let err = convert_payload(
+            "structured-convert",
+            "a: 1\n",
+            "weird",
+            None,
+            "yaml",
+            "json",
+            false,
+        )
+        .expect_err("error");
         assert!(err.contains("unsupported doc mode"));
+    }
+
+    #[test]
+    fn convert_payload_supports_toml_and_csv_formats() {
+        let as_json = convert_payload(
+            "structured-convert",
+            "[global]\nenv = \"dev\"\n",
+            "all",
+            None,
+            "toml",
+            "json",
+            false,
+        )
+        .expect("toml->json");
+        assert!(as_json.contains("\"env\": \"dev\""));
+
+        let as_csv = convert_payload(
+            "structured-convert",
+            "{\"name\":\"api\",\"replicas\":2}\n{\"name\":\"web\",\"replicas\":1}\n",
+            "all",
+            None,
+            "json",
+            "csv",
+            false,
+        )
+        .expect("json->csv");
+        assert!(as_csv.contains("name"));
+        assert!(as_csv.contains("replicas"));
+        assert!(as_csv.contains("api"));
+        assert!(as_csv.contains("web"));
+
+        let csv_json = convert_payload(
+            "structured-convert",
+            "name,replicas\napi,2\nweb,1\n",
+            "all",
+            None,
+            "csv",
+            "json",
+            false,
+        )
+        .expect("csv->json");
+        assert!(csv_json.contains("\"name\": \"api\""));
+        assert!(csv_json.contains("\"replicas\""));
+    }
+
+    #[test]
+    fn convert_payload_supports_xml_formats() {
+        let as_xml = convert_payload(
+            "structured-convert",
+            "{\"root\":{\"name\":\"api\",\"enabled\":true}}",
+            "all",
+            None,
+            "json",
+            "xml",
+            false,
+        )
+        .expect("json->xml");
+        assert!(as_xml.contains("<root>"));
+        assert!(as_xml.contains("<name>"));
+        assert!(as_xml.contains("api"));
+
+        let back_json = convert_payload(
+            "structured-convert",
+            &as_xml,
+            "all",
+            None,
+            "xml",
+            "json",
+            false,
+        )
+        .expect("xml->json");
+        assert!(back_json.contains("root"));
+        assert!(back_json.contains("api"));
+    }
+
+    #[test]
+    fn convert_payload_yaml_anchors_toggle_changes_output() {
+        let src = r#"{
+  "app1":{"cfg":{"name":"svc","ports":[80,443],"labels":{"tier":"web","team":"core"}}},
+  "app2":{"cfg":{"name":"svc","ports":[80,443],"labels":{"tier":"web","team":"core"}}},
+  "app3":{"cfg":{"name":"svc","ports":[80,443],"labels":{"tier":"web","team":"core"}}},
+  "app4":{"cfg":{"name":"svc","ports":[80,443],"labels":{"tier":"web","team":"core"}}}
+}"#;
+        let with_anchors = convert_payload(
+            "structured-convert",
+            src,
+            "all",
+            None,
+            "json",
+            "yaml",
+            true,
+        )
+        .expect("json->yaml with anchors");
+        let without_anchors = convert_payload(
+            "structured-convert",
+            src,
+            "all",
+            None,
+            "json",
+            "yaml",
+            false,
+        )
+        .expect("json->yaml");
+        assert!(with_anchors.contains('&'));
+        assert!(with_anchors.contains('*'));
+        assert!(without_anchors.contains("cfg:"));
+        assert_ne!(with_anchors, without_anchors);
+    }
+
+    #[test]
+    fn convert_payload_pretty_toggle_changes_json_and_xml_output() {
+        let pretty_json = convert_payload_with_options(
+            "structured-convert",
+            r#"{"a":1,"b":{"x":2}}"#,
+            "all",
+            None,
+            "json",
+            "json",
+            false,
+            true,
+        )
+        .expect("pretty json");
+        let compact_json = convert_payload_with_options(
+            "structured-convert",
+            r#"{"a":1,"b":{"x":2}}"#,
+            "all",
+            None,
+            "json",
+            "json",
+            false,
+            false,
+        )
+        .expect("compact json");
+        assert!(pretty_json.contains('\n'));
+        assert!(compact_json.contains(r#"{"a":1,"b":{"x":2}}"#));
+        assert!(!compact_json.contains("  \"a\""));
+
+        let pretty_xml = convert_payload_with_options(
+            "structured-convert",
+            r#"{"root":{"a":1,"b":{"x":2}}}"#,
+            "all",
+            None,
+            "json",
+            "xml",
+            false,
+            true,
+        )
+        .expect("pretty xml");
+        let compact_xml = convert_payload_with_options(
+            "structured-convert",
+            r#"{"root":{"a":1,"b":{"x":2}}}"#,
+            "all",
+            None,
+            "json",
+            "xml",
+            false,
+            false,
+        )
+        .expect("compact xml");
+        assert!(pretty_xml.contains('\n'));
+        assert!(!compact_xml.contains('\n'));
     }
 
     #[test]
@@ -7327,42 +8996,89 @@ text: |-
     fn format_web_query_error_adds_query_context_and_hint() {
         let err = format_web_query_error(
             "jq",
-            "query",
             ".items[\n",
+            "a: 1\n",
             &crate::query::Error::Unsupported("parse failed at line 1, column 7".to_string()),
         );
-        assert!(err.contains("jq query error"));
-        assert!(err.contains("query context:"));
-        assert!(err.contains(">     1 | .items["));
-        assert!(err.contains("^"));
-        assert!(err.contains("Hint: check query near ^"));
+        assert!(err.contains("--> <query>:1:7"));
+        assert!(err.contains(".items["));
     }
 
     #[test]
     fn format_web_query_error_adds_input_context_and_hint() {
+        let input = "a: 1\nb: [\n";
+        let parse_err = crate::query::parse_input_docs_prefer_yaml(input).expect_err("must fail");
         let err = format_web_query_error(
             "jq",
-            "input",
-            "a: 1\nb: [\n",
-            &crate::query::Error::Unsupported("yaml parse failed at line 2, column 4".to_string()),
+            ".",
+            input,
+            &parse_err,
         );
-        assert!(err.contains("jq input error"));
+        assert!(err.contains("jq: yaml:"));
         assert!(err.contains("input context:"));
-        assert!(err.contains(">     2 | b: ["));
-        assert!(err.contains("^"));
-        assert!(err.contains("Hint: check input near ^"));
+        assert!(err.contains("| b: ["));
     }
 
     #[test]
-    fn dyff_payload_finds_changes() {
-        let out = dyff_payload("a: 1\n", "a: 2\n", false, false).expect("dyff");
-        assert!(out.contains("changed: doc[0].a"));
+    fn semantic_diff_payload_finds_changes() {
+        let out =
+            semantic_diff_payload("a: 1\n", "a: 2\n", "yaml", "yaml", "diff", false, false)
+                .expect("diff");
+        assert!(out.contains("changed:"));
+        assert!(out.contains("$.a"));
     }
 
     #[test]
-    fn dyff_payload_no_differences() {
-        let out = dyff_payload("a: 1\n", "a: 1\n", false, false).expect("dyff");
-        assert_eq!(out, "No differences");
+    fn semantic_diff_payload_no_differences() {
+        let out =
+            semantic_diff_payload("a: 1\n", "a: 1\n", "yaml", "yaml", "diff", false, false)
+                .expect("diff");
+        assert_eq!(out, "No semantic differences");
+    }
+
+    #[test]
+    fn semantic_diff_payload_supports_cross_format_compare_and_output_formats() {
+        let summary = semantic_diff_payload(
+            "a: 1\n",
+            r#"{"a":1}"#,
+            "yaml",
+            "json",
+            "summary",
+            false,
+            false,
+        )
+        .expect("summary");
+        assert!(summary.contains("equal=true"));
+
+        let json_out = semantic_diff_payload(
+            "a: 1\n",
+            r#"{"a":2}"#,
+            "yaml",
+            "json",
+            "json",
+            false,
+            false,
+        )
+        .expect("json");
+        let payload: serde_json::Value = serde_json::from_str(&json_out).expect("json parse");
+        assert_eq!(payload["equal"], false);
+        assert!(payload["summary"]["total"].as_u64().unwrap_or(0) >= 1);
+
+        let patch_out = semantic_diff_payload(
+            "a: 1\n",
+            r#"{"a":2}"#,
+            "yaml",
+            "json",
+            "patch",
+            false,
+            false,
+        )
+        .expect("patch");
+        assert!(patch_out.contains("--- left"));
+        assert!(patch_out.contains("+++ right"));
+        assert!(patch_out.contains("@@ $.a @@"));
+        assert!(patch_out.contains("-1"));
+        assert!(patch_out.contains("+2"));
     }
 
     #[test]
@@ -7389,6 +9105,7 @@ text: |-
             Vec::new(),
             "error",
             None,
+            false,
         )
         .expect_err("expected error");
         assert!(err.contains("path is required"));
@@ -7418,6 +9135,7 @@ text: |-
             Vec::new(),
             "error",
             None,
+            false,
         )
         .expect_err("expected error");
         assert!(err.contains("unsupported sourceType"));
@@ -7503,6 +9221,7 @@ text: |-
             None,
             None,
             "global:\n  env: dev\n",
+            false,
         )
         .expect_err("error");
         assert!(err.contains("outChartDir is required"));
@@ -7519,6 +9238,7 @@ text: |-
             Some("demo"),
             None,
             "global:\n  env: dev\napps-stateless:\n  app:\n    enabled: true\n    containers:\n      app:\n        image:\n          name: nginx\n",
+            false,
         )
         .expect("saved");
         assert!(msg.contains("Chart saved"));
@@ -7546,6 +9266,7 @@ text: |-
             Some("demo"),
             None,
             "global:\n  env: dev\napps-stateless:\n  app:\n    enabled: true\n    containers:\n      app:\n        image:\n          name: nginx\n",
+            false,
         )
         .expect("save");
         assert!(msg.contains("CRDs copied"));
@@ -7578,6 +9299,7 @@ text: |-
             Some("demo"),
             None,
             "global:\n  env: dev\napps-k8s-manifests:\n  job-a:\n    spec: |\n      serviceAccountName: '{{ include \"opensearch-cluster.serviceAccountName\" . }}'\n",
+            false,
         )
         .expect("save");
         assert!(msg.contains("include helpers: added 2, missing 0"));
@@ -7652,5 +9374,41 @@ text: |-
         )
         .expect("semantic map");
         assert!(!ranges.is_empty());
+    }
+
+    #[test]
+    fn sanitize_relative_path_rejects_too_deep_paths() {
+        let deep = (0..(max_upload_path_depth() + 1))
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let err = sanitize_relative_path(&deep).expect_err("must fail");
+        assert!(err.contains("too deep"));
+    }
+
+    #[test]
+    fn write_uploaded_files_rejects_oversized_single_file() {
+        let td = TempDir::new().expect("tmp");
+        let b64 = "A".repeat(max_upload_file_bytes().saturating_mul(2));
+        let files = vec![serde_json::json!({
+            "path": "values.yaml",
+            "contentB64": b64,
+        })];
+        let err = write_uploaded_files(td.path(), "chart", &files).expect_err("must fail");
+        assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn load_chart_values_from_path_rejects_large_values_yaml() {
+        let td = TempDir::new().expect("tmp");
+        std::fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: x\nversion: 0.1.0\n",
+        )
+        .expect("chart");
+        let oversized = "a".repeat(max_chart_values_bytes() + 1);
+        std::fs::write(td.path().join("values.yaml"), oversized).expect("values");
+        let err = load_chart_values_from_path(td.path().to_str().expect("path")).expect_err("err");
+        assert!(err.contains("too large"));
     }
 }

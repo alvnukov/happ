@@ -1,4 +1,6 @@
-use super::report::{ActionParseReport, ControlAction, ControlKind, ParseCompatOptions, VariableRef};
+use super::report::{
+    ActionParseReport, ControlAction, ControlKind, ParseCompatOptions, VariableRef,
+};
 use crate::go_compat::compat;
 use crate::go_compat::scan::GoTemplateScanError;
 mod lex;
@@ -368,10 +370,7 @@ impl<'a> Parser<'a> {
                 {
                     return Err(GoTemplateScanError {
                         code: "non_executable_command_in_pipeline",
-                        message: format!(
-                            "non executable command in pipeline stage {}",
-                            stage
-                        ),
+                        message: format!("non executable command in pipeline stage {}", stage),
                         offset: self.abs(first.first_start),
                     });
                 }

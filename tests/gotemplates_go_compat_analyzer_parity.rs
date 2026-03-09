@@ -91,7 +91,11 @@ fn go_compat_analyzer_matches_go_parse_subset() {
         let analysis = analyze_trees(&trees);
 
         let go = &go_results[idx];
-        assert!(go.ok, "go parse failed for src={}; err={}", case.src, go.err);
+        assert!(
+            go.ok,
+            "go parse failed for src={}; err={}",
+            case.src, go.err
+        );
 
         assert_eq!(
             analysis.count(NodeType::If),

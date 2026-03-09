@@ -790,21 +790,24 @@ fn native_renderer_supports_range_variable_declarations_without_spaces() {
 }
 
 #[test]
-fn native_renderer_rejects_range_over_integer_like_go() {
+fn native_renderer_handles_range_over_integer_like_go() {
     let data = json!({});
-    let err = render_template_native("{{range 3}}{{.}}{{end}}", &data).expect_err("must fail");
-    match err {
-        NativeRenderError::UnsupportedAction { reason, .. } => {
-            assert!(reason.contains("range can't iterate over 3"));
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
+    let out = render_template_native("{{range 3}}{{.}}{{end}}", &data).expect("must render");
+    assert_eq!(out, "012");
+
+    let out =
+        render_template_native("{{range -2}}{{.}}{{else}}E{{end}}", &data).expect("must render");
+    assert_eq!(out, "E");
+
+    let out =
+        render_template_native("{{range $v := 3}}{{$v}};{{end}}", &data).expect("must render");
+    assert_eq!(out, "0;1;2;");
 
     let err = render_template_native("{{range $i, $v := 3}}{{$i}}={{$v}};{{end}}", &data)
         .expect_err("must fail");
     match err {
         NativeRenderError::UnsupportedAction { reason, .. } => {
-            assert!(reason.contains("range can't iterate over 3"));
+            assert!(reason.contains("can't use 3 to iterate over more than one variable"));
         }
         other => panic!("unexpected error: {other:?}"),
     }

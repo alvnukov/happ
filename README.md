@@ -23,6 +23,13 @@ Download artifacts from the latest [GitHub Releases](https://github.com/alvnukov
 - `.deb` packages: `happ_<version>_amd64.deb`, `happ_<version>_arm64.deb`
 - `.rpm` packages: `happ-<version>-1.x86_64.rpm`, `happ-<version>-1.aarch64.rpm`
 
+### Windows installer from Releases
+
+Download `happ_windows_amd64_installer.exe` from the latest [GitHub Releases](https://github.com/alvnukov/happ/releases) and run it.
+
+Installer target path: `C:\Program Files\happ\happ.exe`
+The installer enables `Add happ to PATH` by default (for next-next-next setup).
+
 ### Build from source
 
 ```bash
@@ -233,4 +240,21 @@ You can reproduce locally:
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov
 cargo llvm-cov --workspace --all-features --summary-only
+```
+
+## Linting
+
+Run Rust linters:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --locked
+```
+
+Run web asset linter:
+
+```bash
+cd web
+npm ci
+npm run lint
 ```

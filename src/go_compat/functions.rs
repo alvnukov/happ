@@ -8,30 +8,30 @@ use super::{
 const LEFT_DELIM: &str = "{{";
 const RIGHT_DELIM: &str = "}}";
 
-pub fn normalize_values_global_context(action: &str) -> String {
+pub fn normalize_values_global_context(src: &str) -> String {
     const TOKEN: &str = ".Values";
-    if !action.contains(TOKEN) {
-        return action.to_string();
+    if !src.contains(TOKEN) {
+        return src.to_string();
     }
     let token_len = TOKEN.len();
-    let bytes = action.as_bytes();
-    let mut out = String::with_capacity(action.len() + 4);
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len() + 4);
     let mut last = 0usize;
     let mut changed = false;
-    for (idx, _) in action.match_indices(TOKEN) {
+    for (idx, _) in src.match_indices(TOKEN) {
         let prev_is_dollar = idx > 0 && bytes[idx - 1] == b'$';
         if prev_is_dollar {
             continue;
         }
-        out.push_str(&action[last..idx]);
+        out.push_str(&src[last..idx]);
         out.push_str("$.Values");
         last = idx + token_len;
         changed = true;
     }
     if !changed {
-        return action.to_string();
+        return src.to_string();
     }
-    out.push_str(&action[last..]);
+    out.push_str(&src[last..]);
     out
 }
 
@@ -190,7 +190,15 @@ fn is_non_function_token(token: &str) -> bool {
 fn is_go_template_keyword(token: &str) -> bool {
     matches!(
         token,
-        "if" | "else" | "end" | "range" | "with" | "define" | "block" | "template"
+        "if" | "else"
+            | "end"
+            | "range"
+            | "with"
+            | "define"
+            | "block"
+            | "template"
+            | "break"
+            | "continue"
     )
 }
 

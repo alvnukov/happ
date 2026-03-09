@@ -58,7 +58,10 @@ mod tests {
     fn reason_builders_match_runtime_contracts() {
         assert_eq!(nil_is_not_a_command_reason(), "nil is not a command");
         assert_eq!(empty_pipeline_reason(), "empty pipeline");
-        assert_eq!(empty_command_in_pipeline_reason(), "empty command in pipeline");
+        assert_eq!(
+            empty_command_in_pipeline_reason(),
+            "empty command in pipeline"
+        );
         assert_eq!(
             multi_variable_decl_in_non_range_reason(),
             "multi-variable declarations are only supported in range pipelines"

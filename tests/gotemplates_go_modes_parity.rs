@@ -169,7 +169,10 @@ impl GoParseModeRunner {
         Ok(Self { _tmp: tmp, program })
     }
 
-    fn parse_error_codes(&self, cases: &[serde_json::Value]) -> Result<Vec<Option<String>>, String> {
+    fn parse_error_codes(
+        &self,
+        cases: &[serde_json::Value],
+    ) -> Result<Vec<Option<String>>, String> {
         let cases_json =
             serde_json::to_string(cases).map_err(|e| format!("serialize cases: {e}"))?;
         let encoded_cases = base64_encode(cases_json.as_bytes());

@@ -6,13 +6,13 @@ This file tracks which Go stdlib sources are the reference for the Rust
 All Go-related compatibility code is centralized under `src/go_compat/*`.
 Mirror namespace for upstream transfer lives at `src/go_compat/go_std/*`.
 
-Backend switch interface:
-- `NativeRenderOptions.logic_backend` controls which logic backend is used.
-- `LogicBackend::GoFfi` is available as an explicit FFI backend (Go helper).
-- `LogicBackend::Dual` runs go_ffi + go_compat in parallel and logs mismatches.
-- `HAPP_TEMPLATE_BACKEND` can override backend selection (`go_ffi`, `go_compat`, `dual`, `rust_native`).
-- `HAPP_TEMPLATE_DUAL_PRIMARY` controls primary result source in dual mode (`go_ffi` by default).
-- `HAPP_TEMPLATE_DUAL_LOG` optionally redirects dual mismatch logs to a file (append mode).
+Backend status (frozen native track):
+- Runtime execution is pinned to `go_ffi` only.
+- `LogicBackend` variants remain in codebase for future reactivation, but are currently not selected by runtime/options paths.
+- `HAPP_TEMPLATE_DUAL_PRIMARY` and `HAPP_TEMPLATE_DUAL_LOG` are kept only for dormant dual diagnostics code paths.
+- `HAPP_GO_FFI_TIMEOUT_MS` sets per-request go_ffi process timeout (default: `30000`).
+- `HAPP_GO_FFI_MAX_PARALLEL` caps concurrent go_ffi helper processes (default: `min(cpu, 4)`).
+- go_ffi helper binary is cached on disk and reused across happ restarts; rebuild happens only when embedded helper source hash changes.
 
 The current priority is the builtins and execution branches observed in the
 real chart corpus (`helm-apps` + integration examples). Less-used branches

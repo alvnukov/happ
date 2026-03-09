@@ -9,10 +9,15 @@ import {
   foldGutter,
   foldKeymap,
   indentUnit,
+  StreamLanguage,
   syntaxHighlighting,
 } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
 import { yaml } from "@codemirror/lang-yaml";
+import { json } from "@codemirror/lang-json";
+import { xml } from "@codemirror/lang-xml";
+import { toml as tomlMode } from "@codemirror/legacy-modes/mode/toml";
+import { spreadsheet as spreadsheetMode } from "@codemirror/legacy-modes/mode/spreadsheet";
 
 if (typeof globalThis !== "undefined") {
   globalThis.__happCmEntryReached = true;
@@ -139,6 +144,37 @@ class VirtualCursorWidget extends WidgetType {
   }
 }
 
+function normalizeLanguage(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (
+    raw === "yaml" ||
+    raw === "json" ||
+    raw === "toml" ||
+    raw === "csv" ||
+    raw === "xml"
+  ) {
+    return raw;
+  }
+  return "text";
+}
+
+function languageExtensionByName(name) {
+  switch (normalizeLanguage(name)) {
+    case "yaml":
+      return yaml();
+    case "json":
+      return json();
+    case "toml":
+      return StreamLanguage.define(tomlMode);
+    case "csv":
+      return StreamLanguage.define(spreadsheetMode);
+    case "xml":
+      return xml();
+    default:
+      return [];
+  }
+}
+
 const virtualCursorField = StateField.define({
   create() {
     return Decoration.none;
@@ -169,10 +205,12 @@ function createYamlEditor(el, opts = {}) {
     typeof opts.onSelectionChange === "function" ? opts.onSelectionChange : null;
   const wrapLines = !!opts.wrapLines;
   const fontSize = Number(opts.fontSize || 14);
+  const languageName = normalizeLanguage(opts.language || "yaml");
 
   const editableCompartment = new Compartment();
   const wrapCompartment = new Compartment();
   const fontCompartment = new Compartment();
+  const languageCompartment = new Compartment();
 
   const updateListener = EditorView.updateListener.of((update) => {
     if (update.docChanged && onChange) {
@@ -194,7 +232,7 @@ function createYamlEditor(el, opts = {}) {
       lineNumbers(),
       history(),
       keymap.of([...defaultKeymap, ...historyKeymap, ...foldKeymap]),
-      yaml(),
+      languageCompartment.of(languageExtensionByName(languageName)),
       syntaxHighlighting(jetBrainsLikeHighlight),
       virtualCursorField,
       foldGutter(),
@@ -233,6 +271,11 @@ function createYamlEditor(el, opts = {}) {
     },
     setFontSize(next) {
       view.dispatch({ effects: fontCompartment.reconfigure(makeTheme(next)) });
+    },
+    setLanguage(next) {
+      view.dispatch({
+        effects: languageCompartment.reconfigure(languageExtensionByName(next)),
+      });
     },
     setSelection(from, to) {
       const a = Math.max(0, Math.min(view.state.doc.length, Number(from) || 0));
@@ -294,8 +337,13 @@ function createYamlEditor(el, opts = {}) {
   };
 }
 
+function createCodeEditor(el, opts = {}) {
+  return createYamlEditor(el, opts);
+}
+
 const happCodeMirrorApi = {
   createYamlEditor,
+  createCodeEditor,
 };
 
 if (typeof globalThis !== "undefined") {
@@ -305,7 +353,9 @@ if (typeof globalThis !== "undefined") {
 let happRoot = null;
 try {
   happRoot = Function("return this")();
-} catch (_) {}
+} catch (_) {
+  // Some runtimes disallow Function constructor; fallback assignments are below.
+}
 if (happRoot) {
   happRoot.HappCodeMirror = happCodeMirrorApi;
 }

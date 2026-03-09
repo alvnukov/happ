@@ -76,6 +76,7 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
                     args.chart_name.as_deref(),
                     &values,
                     args.library_chart_path.as_deref(),
+                    false,
                 )?;
             }
             if args.out_chart_dir.is_none() || args.output.is_some() {
@@ -97,6 +98,7 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
                     args.chart_name.as_deref(),
                     &values,
                     args.library_chart_path.as_deref(),
+                    false,
                 )?;
             }
             if args.out_chart_dir.is_none() || args.output.is_some() {
@@ -152,10 +154,10 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
             let input = crate::source::read_input(&args.input)?;
             let mode = parse_doc_selection(&args)?;
             let docs = crate::query::parse_input_docs_prefer_json(&input)
-                .map_err(|e| Error::Convert(format_query_error("jq", &input, &e)))?;
+                .map_err(|e| Error::Convert(format_query_error("jq", &args.query, &input, &e)))?;
             let stream = select_docs(docs, mode, "jq")?;
             let out = crate::query::run_query_stream(&args.query, stream)
-                .map_err(|e| Error::Convert(format_query_error("jq", &input, &e)))?;
+                .map_err(|e| Error::Convert(format_query_error("jq", &args.query, &input, &e)))?;
             print_query_output(&out, args.compact, args.raw_output)?;
             Ok(())
         }
@@ -163,10 +165,10 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
             let input = crate::source::read_input(&args.input)?;
             let mode = parse_doc_selection(&args)?;
             let docs = crate::query::parse_input_docs_prefer_yaml(&input)
-                .map_err(|e| Error::Convert(format_query_error("yq", &input, &e)))?;
+                .map_err(|e| Error::Convert(format_query_error("yq", &args.query, &input, &e)))?;
             let stream = select_docs(docs, mode, "yq")?;
             let out = crate::query::run_query_stream(&args.query, stream)
-                .map_err(|e| Error::Convert(format_query_error("yq", &input, &e)))?;
+                .map_err(|e| Error::Convert(format_query_error("yq", &args.query, &input, &e)))?;
             print_query_output(&out, args.compact, args.raw_output)?;
             Ok(())
         }
@@ -318,6 +320,7 @@ fn run_chart_command(args: &crate::cli::ImportArgs) -> Result<(), Error> {
             args.chart_name.as_deref(),
             &values,
             args.library_chart_path.as_deref(),
+            false,
         )?;
         let _ = crate::output::sync_imported_include_helpers_from_source_chart(
             &args.path,
@@ -341,6 +344,7 @@ fn run_chart_command(args: &crate::cli::ImportArgs) -> Result<(), Error> {
                 args.chart_name.as_deref(),
                 &values,
                 args.library_chart_path.as_deref(),
+                false,
             )?;
             let _ = crate::output::sync_imported_include_helpers_from_source_chart(
                 &args.path,
@@ -471,26 +475,10 @@ fn print_query_output(
     compact: bool,
     raw_output: bool,
 ) -> Result<(), Error> {
-    for v in values {
-        if raw_output {
-            if let Some(s) = v.as_str() {
-                println!("{s}");
-                continue;
-            }
-        }
-        if compact {
-            println!(
-                "{}",
-                serde_json::to_string(v)
-                    .map_err(|e| Error::Convert(format!("encode json: {e}")))?,
-            );
-        } else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(v)
-                    .map_err(|e| Error::Convert(format!("encode json: {e}")))?,
-            );
-        }
+    let output = crate::query::format_output_json_lines(values, compact, raw_output)
+        .map_err(|e| Error::Convert(format!("encode json: {e}")))?;
+    if !output.is_empty() {
+        println!("{output}");
     }
     Ok(())
 }
@@ -503,21 +491,12 @@ enum DocSelection {
 }
 
 fn parse_doc_selection(args: &crate::cli::QueryArgs) -> Result<DocSelection, Error> {
-    match args.doc_mode.trim().to_ascii_lowercase().as_str() {
-        "" | "first" => Ok(DocSelection::First),
-        "all" => Ok(DocSelection::All),
-        "index" => {
-            let Some(idx) = args.doc_index else {
-                return Err(Error::Convert(
-                    "query: --doc-index is required when --doc-mode=index".to_string(),
-                ));
-            };
-            Ok(DocSelection::Index(idx))
-        }
-        other => Err(Error::Convert(format!(
-            "query: invalid --doc-mode '{}' (expected first|all|index)",
-            other
-        ))),
+    match crate::query::parse_doc_mode(&args.doc_mode, args.doc_index)
+        .map_err(|e| Error::Convert(format!("query: {e}")))?
+    {
+        zq::DocMode::First => Ok(DocSelection::First),
+        zq::DocMode::All => Ok(DocSelection::All),
+        zq::DocMode::Index(idx) => Ok(DocSelection::Index(idx)),
     }
 }
 
@@ -543,59 +522,8 @@ fn select_docs(
     }
 }
 
-fn format_query_error(tool: &str, input: &str, err: &crate::query::Error) -> String {
-    let base = format!("{tool}: {err}");
-    let Some((line, col)) = extract_line_col(&base) else {
-        return base;
-    };
-    let ctx = render_input_context(input, line, col);
-    if ctx.is_empty() {
-        base
-    } else {
-        format!("{base}\n{ctx}")
-    }
-}
-
-fn extract_line_col(msg: &str) -> Option<(usize, usize)> {
-    use std::sync::OnceLock;
-
-    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| {
-        vec![
-            regex::Regex::new(r"(?:at\s+)?line\s+(\d+)\s+column\s+(\d+)").expect("regex"),
-            regex::Regex::new(r"(?:at\s+)?line\s+(\d+)\s*,\s*column\s+(\d+)").expect("regex"),
-            regex::Regex::new(r"line\s*:\s*(\d+)\s*,\s*column\s*:\s*(\d+)").expect("regex"),
-        ]
-    });
-    for re in patterns {
-        if let Some(caps) = re.captures(msg) {
-            let line = caps.get(1)?.as_str().parse::<usize>().ok()?;
-            let col = caps.get(2)?.as_str().parse::<usize>().ok()?;
-            return Some((line, col));
-        }
-    }
-    None
-}
-
-fn render_input_context(input: &str, line: usize, col: usize) -> String {
-    let lines: Vec<&str> = input.lines().collect();
-    if lines.is_empty() || line == 0 {
-        return String::new();
-    }
-    let from = line.saturating_sub(2).max(1);
-    let to = (line + 2).min(lines.len());
-    let mut out = String::new();
-    out.push_str("input context:\n");
-    for i in from..=to {
-        let marker = if i == line { '>' } else { ' ' };
-        let text = lines.get(i - 1).copied().unwrap_or_default();
-        out.push_str(&format!("{marker} {:>5} | {text}\n", i));
-        if i == line {
-            let caret_pad = col.saturating_sub(1);
-            out.push_str(&format!("  {:>5} | {}^\n", "", " ".repeat(caret_pad)));
-        }
-    }
-    out.trim_end().to_string()
+fn format_query_error(tool: &str, query: &str, input: &str, err: &crate::query::Error) -> String {
+    crate::query::format_query_error(tool, query, input, err)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,32 +1056,23 @@ mod tests {
     #[test]
     fn format_query_error_adds_input_context_when_line_col_present() {
         let input = "a: 1\nb: [\n";
-        let err = crate::query::Error::Yaml(
-            serde_yaml::from_str::<serde_yaml::Value>(input).expect_err("must fail"),
-        );
-        let msg = format_query_error("yq", input, &err);
+        let err = crate::query::parse_input_docs_prefer_yaml(input).expect_err("must fail");
+        let msg = format_query_error("yq", ".", input, &err);
         assert!(msg.contains("input context:"));
         assert!(msg.contains("| b: ["));
     }
 
     #[test]
-    fn extract_line_col_supports_comma_variant() {
-        let msg = "yaml: something bad at line 12, column 34";
-        let got = extract_line_col(msg).expect("line/col");
-        assert_eq!(got, (12, 34));
-    }
-
-    #[test]
-    fn format_query_error_with_comma_variant_adds_context() {
-        let input = "a: 1\nb: [\n";
-        let msg = "yaml: parse failed at line 2, column 4";
+    fn format_query_error_for_compile_errors_points_to_query() {
+        let query = ".items[\n";
         let wrapped = format_query_error(
             "yq",
-            input,
-            &crate::query::Error::Unsupported(msg.to_string()),
+            query,
+            "a: 1\n",
+            &crate::query::Error::Unsupported("parse failed at line 1, column 7".to_string()),
         );
-        assert!(wrapped.contains("input context:"));
-        assert!(wrapped.contains(">     2 | b: ["));
+        assert!(wrapped.contains("--> <query>:1:7"));
+        assert!(wrapped.contains(".items["));
     }
 
     #[test]

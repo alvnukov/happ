@@ -15,11 +15,17 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("yaml: {0}")]
     Yaml(#[from] serde_yaml::Error),
+    #[error("yaml format: {0}")]
+    YamlFormat(String),
     #[error("library chart: {0}")]
     Library(String),
 }
 
 pub fn values_yaml(values: &Value) -> Result<String, Error> {
+    values_yaml_with_yaml_anchors(values, false)
+}
+
+pub fn values_yaml_with_yaml_anchors(values: &Value, yaml_anchors: bool) -> Result<String, Error> {
     let mut root = values.as_mapping().cloned().unwrap_or_default();
     let mut ordered = Mapping::new();
     if let Some(g) = root.remove(Value::String("global".into())) {
@@ -35,12 +41,31 @@ pub fn values_yaml(values: &Value) -> Result<String, Error> {
             ordered.insert(Value::String(k), v);
         }
     }
-    let text = serde_yaml::to_string(&Value::Mapping(ordered))?;
+    let ordered_value = Value::Mapping(ordered);
+    if yaml_anchors {
+        let json = serde_json::to_value(&ordered_value)
+            .map_err(|e| Error::YamlFormat(format!("YAML->JSON conversion error: {e}")))?;
+        let text = zq::format_output_yaml_documents_with_options(
+            std::slice::from_ref(&json),
+            zq::YamlFormatOptions::default().with_yaml_anchors(true),
+        )
+        .map_err(|e| Error::YamlFormat(format!("yaml anchors encode error: {e}")))?;
+        return Ok(text.trim_start_matches("---\n").to_string());
+    }
+    let text = serde_yaml::to_string(&ordered_value)?;
     Ok(text.trim_start_matches("---\n").to_string())
 }
 
 pub fn write_values(path: Option<&str>, values: &Value) -> Result<(), Error> {
-    let body = values_yaml(values)?;
+    write_values_with_yaml_anchors(path, values, false)
+}
+
+pub fn write_values_with_yaml_anchors(
+    path: Option<&str>,
+    values: &Value,
+    yaml_anchors: bool,
+) -> Result<(), Error> {
+    let body = values_yaml_with_yaml_anchors(values, yaml_anchors)?;
     if let Some(p) = path {
         fs::write(p, body.as_bytes())?;
     } else {
@@ -55,6 +80,7 @@ pub fn generate_consumer_chart(
     chart_name: Option<&str>,
     values: &Value,
     library_chart_path: Option<&str>,
+    yaml_anchors: bool,
 ) -> Result<(), Error> {
     let chart_name = chart_name
         .filter(|s| !s.trim().is_empty())
@@ -79,9 +105,12 @@ pub fn generate_consumer_chart(
         Path::new(out_dir).join("templates/init-helm-apps-library.yaml"),
         b"{{- include \"apps-utils.init-library\" $ }}\n",
     )?;
-    write_values(
+    let mut values_for_chart = values.clone();
+    normalize_library_template_strings_value(&mut values_for_chart);
+    write_values_with_yaml_anchors(
         Some(&Path::new(out_dir).join("values.yaml").to_string_lossy()),
-        values,
+        &values_for_chart,
+        yaml_anchors,
     )?;
 
     let dst = Path::new(out_dir).join("charts/helm-apps");
@@ -163,7 +192,7 @@ pub fn sync_imported_include_helpers_from_source_chart(
             let _ = missing.insert(name);
             continue;
         };
-        selected.insert(name.clone(), block.clone());
+        selected.insert(name.clone(), normalize_imported_helper_block(block));
         for dep in collect_include_names_from_values(block) {
             if is_supported_library_include(&dep) {
                 continue;
@@ -286,6 +315,428 @@ fn collect_include_names_from_values(values_yaml: &str) -> Vec<String> {
     collect_include_names_in_template(values_yaml)
 }
 
+fn normalize_imported_helper_block(block: &str) -> String {
+    rewrite_template_actions(block, normalize_values_scope_in_action)
+}
+
+fn normalize_library_template_strings_value(value: &mut Value) {
+    match value {
+        Value::String(src) => {
+            *src = normalize_library_template_string(src);
+        }
+        Value::Mapping(map) => {
+            for item in map.values_mut() {
+                normalize_library_template_strings_value(item);
+            }
+        }
+        Value::Sequence(seq) => {
+            for item in seq {
+                normalize_library_template_strings_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_library_template_string(src: &str) -> String {
+    rewrite_template_actions(src, normalize_library_action_context)
+}
+
+fn normalize_library_action_context(inner: &str) -> String {
+    let root_normalized = normalize_values_scope_in_action(inner);
+    normalize_include_context_to_root_in_action(&root_normalized)
+}
+
+fn rewrite_template_actions(src: &str, rewrite_inner: fn(&str) -> String) -> String {
+    if !src.contains("{{") {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len() + 16);
+    let mut cursor = 0usize;
+    while cursor < src.len() {
+        let Some(open_rel) = src[cursor..].find("{{") else {
+            out.push_str(&src[cursor..]);
+            break;
+        };
+        let open = cursor + open_rel;
+        out.push_str(&src[cursor..open]);
+        let action_start = open + 2;
+        let Some(action_end) = find_template_action_close(src, action_start) else {
+            out.push_str(&src[open..]);
+            break;
+        };
+        let inner = &src[action_start..action_end];
+        out.push_str("{{");
+        if is_comment_action(inner) {
+            out.push_str(inner);
+        } else {
+            out.push_str(&rewrite_inner(inner));
+        }
+        out.push_str("}}");
+        cursor = action_end + 2;
+    }
+    out
+}
+
+fn find_template_action_close(src: &str, action_start: usize) -> Option<usize> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Normal,
+        Single,
+        Double,
+        Raw,
+    }
+
+    let bytes = src.as_bytes();
+    let mut state = State::Normal;
+    let mut i = action_start;
+    while i + 1 < bytes.len() {
+        let ch = bytes[i];
+        match state {
+            State::Normal => match ch {
+                b'\'' => {
+                    state = State::Single;
+                    i += 1;
+                    continue;
+                }
+                b'"' => {
+                    state = State::Double;
+                    i += 1;
+                    continue;
+                }
+                b'`' => {
+                    state = State::Raw;
+                    i += 1;
+                    continue;
+                }
+                b'}' if bytes[i + 1] == b'}' => return Some(i),
+                _ => {}
+            },
+            State::Single => {
+                if ch == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if ch == b'\'' {
+                    state = State::Normal;
+                }
+                i += 1;
+                continue;
+            }
+            State::Double => {
+                if ch == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if ch == b'"' {
+                    state = State::Normal;
+                }
+                i += 1;
+                continue;
+            }
+            State::Raw => {
+                if ch == b'`' {
+                    state = State::Normal;
+                }
+                i += 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_comment_action(inner: &str) -> bool {
+    let trimmed = inner.trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch == '-');
+    trimmed.starts_with("/*")
+}
+
+fn normalize_values_scope_in_action(inner: &str) -> String {
+    const ROOT_TOKENS: [&[u8]; 6] = [
+        b".Values",
+        b".Release",
+        b".Chart",
+        b".Capabilities",
+        b".Files",
+        b".Template",
+    ];
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Normal,
+        Single,
+        Double,
+        Raw,
+    }
+
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    let mut state = State::Normal;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        match state {
+            State::Single => {
+                out.push(ch);
+                if ch == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    out.push(bytes[i]);
+                } else if ch == b'\'' {
+                    state = State::Normal;
+                }
+                i += 1;
+                continue;
+            }
+            State::Double => {
+                out.push(ch);
+                if ch == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    out.push(bytes[i]);
+                } else if ch == b'"' {
+                    state = State::Normal;
+                }
+                i += 1;
+                continue;
+            }
+            State::Raw => {
+                out.push(ch);
+                if ch == b'`' {
+                    state = State::Normal;
+                }
+                i += 1;
+                continue;
+            }
+            State::Normal => {}
+        }
+
+        match ch {
+            b'\'' => {
+                state = State::Single;
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            b'"' => {
+                state = State::Double;
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            b'`' => {
+                state = State::Raw;
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        let mut matched = false;
+        for token in ROOT_TOKENS {
+            if starts_with_root_ref(bytes, i, token)
+                && should_rewrite_root_ref(bytes, i, token.len())
+            {
+                out.push(b'$');
+                out.extend_from_slice(token);
+                i += token.len();
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            continue;
+        }
+
+        out.push(ch);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| inner.to_string())
+}
+
+fn normalize_include_context_to_root_in_action(inner: &str) -> String {
+    if !inner.contains("include") && !inner.contains("template") {
+        return inner.to_string();
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Normal,
+        Single,
+        Double,
+        Raw,
+    }
+
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() + 4);
+    let mut state = State::Normal;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        match state {
+            State::Single => {
+                out.push(ch);
+                if ch == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    out.push(bytes[i]);
+                } else if ch == b'\'' {
+                    state = State::Normal;
+                }
+                i += 1;
+                continue;
+            }
+            State::Double => {
+                out.push(ch);
+                if ch == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    out.push(bytes[i]);
+                } else if ch == b'"' {
+                    state = State::Normal;
+                }
+                i += 1;
+                continue;
+            }
+            State::Raw => {
+                out.push(ch);
+                if ch == b'`' {
+                    state = State::Normal;
+                }
+                i += 1;
+                continue;
+            }
+            State::Normal => {}
+        }
+
+        match ch {
+            b'\'' => {
+                state = State::Single;
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            b'"' => {
+                state = State::Double;
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            b'`' => {
+                state = State::Raw;
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(dot_idx) = match_include_context_dot(bytes, i) {
+            out.extend_from_slice(&bytes[i..dot_idx]);
+            out.push(b'$');
+            i = dot_idx + 1;
+            continue;
+        }
+
+        out.push(ch);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| inner.to_string())
+}
+
+fn starts_with_root_ref(bytes: &[u8], idx: usize, token: &[u8]) -> bool {
+    bytes.get(idx..).is_some_and(|tail| tail.starts_with(token))
+}
+
+fn should_rewrite_root_ref(bytes: &[u8], idx: usize, token_len: usize) -> bool {
+    let prev = idx.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+    if prev.is_some_and(is_ref_name_char) || prev.is_some_and(|b| b == b'$' || b == b'.') {
+        return false;
+    }
+    let next = bytes.get(idx + token_len).copied();
+    if next.is_some_and(is_ref_name_char) {
+        return false;
+    }
+    true
+}
+
+fn match_include_context_dot(bytes: &[u8], start: usize) -> Option<usize> {
+    let keyword_len = if bytes
+        .get(start..)
+        .is_some_and(|tail| tail.starts_with(b"include"))
+    {
+        "include".len()
+    } else if bytes
+        .get(start..)
+        .is_some_and(|tail| tail.starts_with(b"template"))
+    {
+        "template".len()
+    } else {
+        return None;
+    };
+    if !is_keyword_boundary(bytes, start, keyword_len) {
+        return None;
+    }
+    let mut i = start + keyword_len;
+    if i >= bytes.len() || !is_space_byte(bytes[i]) {
+        return None;
+    }
+    while i < bytes.len() && is_space_byte(bytes[i]) {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let quote = bytes[i];
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if ch == quote {
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    while i < bytes.len() && is_space_byte(bytes[i]) {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'.' {
+        return None;
+    }
+    let next = bytes.get(i + 1).copied();
+    if next.is_some_and(is_ref_name_char) || next.is_some_and(|b| b == b'.' || b == b'$') {
+        return None;
+    }
+    Some(i)
+}
+
+fn is_keyword_boundary(bytes: &[u8], start: usize, len: usize) -> bool {
+    let prev = start.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+    if prev.is_some_and(is_ref_name_char) {
+        return false;
+    }
+    let next = bytes.get(start + len).copied();
+    if next.is_some_and(is_ref_name_char) {
+        return false;
+    }
+    true
+}
+
+fn is_space_byte(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn is_ref_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 fn ensure_value_paths_present_with_examples(
     root: &mut Value,
     paths: &[Vec<String>],
@@ -370,12 +821,39 @@ mod tests {
             Some("demo"),
             &Value::Mapping(root),
             None,
+            false,
         )
         .expect("generate");
         assert!(out.join("Chart.yaml").exists());
         assert!(out.join("values.yaml").exists());
         assert!(out.join("templates/init-helm-apps-library.yaml").exists());
         assert!(out.join("charts/helm-apps/Chart.yaml").exists());
+    }
+
+    #[test]
+    fn generate_consumer_chart_normalizes_include_context_for_library_values() {
+        let td = TempDir::new().expect("tmp");
+        let out = td.path().join("chart");
+        let values: Value = serde_yaml::from_str(
+            r#"
+global: {}
+apps-k8s-manifests:
+  demo:
+    spec: |
+      x: '{{ include "foo.bar" . }}'
+      r: '{{ .Release.Name }}'
+      y: '{{ "{{" }} include "foo.skip" . {{ "}}" }}'
+"#,
+        )
+        .expect("parse values");
+
+        generate_consumer_chart(out.to_str().expect("path"), Some("demo"), &values, None, false)
+            .expect("generate");
+
+        let saved = fs::read_to_string(out.join("values.yaml")).expect("read values");
+        assert!(saved.contains(r#"include "foo.bar" $"#));
+        assert!(saved.contains(r#"{{ $.Release.Name }}"#));
+        assert!(saved.contains(r#"{{ "{{" }} include "foo.skip" . {{ "}}" }}"#));
     }
 
     #[test]
@@ -392,6 +870,7 @@ mod tests {
             Some("demo"),
             &Value::Mapping(root),
             Some("/definitely/not/exist"),
+            false,
         )
         .expect_err("must fail");
         assert!(matches!(err, Error::Library(_)), "{err:?}");
@@ -484,6 +963,10 @@ global:
         assert!(out_tpl.contains(r#"define "foo.name""#));
         assert!(out_tpl.contains(r#"define "foo.serviceAccountName""#));
         assert!(!out_tpl.contains(r#"define "foo.serviceAccountName.""#));
+        assert!(out_tpl.contains("$.Values.cluster.name"));
+        assert!(out_tpl.contains("$.Values.serviceAccount.create"));
+        assert!(out_tpl.contains("$.Values.serviceAccount.name"));
+        assert!(!out_tpl.contains(" .Values.serviceAccount.create "));
     }
 
     #[test]
@@ -564,5 +1047,33 @@ global:
         assert!(values.contains("cluster:"));
         assert!(values.contains("serviceAccount:"));
         assert!(values.contains("name: <example>"));
+    }
+
+    #[test]
+    fn normalize_imported_helper_block_rewrites_values_scope_only_in_actions() {
+        let src = r#"
+{{- define "foo.a" -}}
+{{ .Values.cluster.name }}-{{ $.Values.serviceAccount.name }}
+{{ printf "%s" ".Values.literal" }}
+{{/* .Values.comment */}}
+{{- if .Values.serviceAccount.create -}}ok{{- end -}}
+{{- end -}}
+"#;
+        let normalized = normalize_imported_helper_block(src);
+        assert!(normalized.contains("{{ $.Values.cluster.name }}"));
+        assert!(normalized.contains("{{- if $.Values.serviceAccount.create -}}"));
+        assert!(normalized.contains("{{ printf \"%s\" \".Values.literal\" }}"));
+        assert!(normalized.contains("{{/* .Values.comment */}}"));
+        assert!(!normalized.contains("{{ .Values.cluster.name }}"));
+        assert!(normalized.contains("{{ $.Values.serviceAccount.name }}"));
+    }
+
+    #[test]
+    fn rewrite_template_actions_handles_braces_inside_string_literals() {
+        let src = r#"{{ "}}" }} include "foo.skip" . {{ .Values.name }}"#;
+        let normalized = normalize_library_template_string(src);
+        assert!(normalized.contains(r#"{{ "}}" }}"#));
+        assert!(normalized.contains(r#"include "foo.skip" ."#));
+        assert!(normalized.contains(r#"{{ $.Values.name }}"#));
     }
 }

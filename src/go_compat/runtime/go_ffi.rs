@@ -405,15 +405,24 @@ fn go_ffi_max_parallel() -> usize {
 }
 
 fn go_ffi_max_request_bytes() -> usize {
-    env_usize_or("HAPP_GO_FFI_MAX_REQUEST_BYTES", DEFAULT_GO_FFI_MAX_REQUEST_BYTES)
+    env_usize_or(
+        "HAPP_GO_FFI_MAX_REQUEST_BYTES",
+        DEFAULT_GO_FFI_MAX_REQUEST_BYTES,
+    )
 }
 
 fn go_ffi_max_stdout_bytes() -> usize {
-    env_usize_or("HAPP_GO_FFI_MAX_STDOUT_BYTES", DEFAULT_GO_FFI_MAX_STDOUT_BYTES)
+    env_usize_or(
+        "HAPP_GO_FFI_MAX_STDOUT_BYTES",
+        DEFAULT_GO_FFI_MAX_STDOUT_BYTES,
+    )
 }
 
 fn go_ffi_max_stderr_bytes() -> usize {
-    env_usize_or("HAPP_GO_FFI_MAX_STDERR_BYTES", DEFAULT_GO_FFI_MAX_STDERR_BYTES)
+    env_usize_or(
+        "HAPP_GO_FFI_MAX_STDERR_BYTES",
+        DEFAULT_GO_FFI_MAX_STDERR_BYTES,
+    )
 }
 
 #[cfg(test)]

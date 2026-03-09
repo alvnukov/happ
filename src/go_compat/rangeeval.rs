@@ -1,8 +1,8 @@
-use crate::go_compat::valuefmt::format_value_like_go;
 use crate::go_compat::typedvalue::{
     decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_get, go_bytes_len,
     go_string_bytes_len,
 };
+use crate::go_compat::valuefmt::format_value_like_go;
 use serde_json::{Number, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +15,35 @@ pub fn range_items(source: Option<Value>) -> Result<Vec<(Option<Value>, Value)>,
     let Some(value) = source else {
         return Ok(Vec::new());
     };
+    if let Value::Number(n) = &value {
+        if let Some(i) = n.as_i64() {
+            if i <= 0 {
+                return Ok(Vec::new());
+            }
+            let len = usize::try_from(i).map_err(|_| RangeItemsError::CannotIterate {
+                rendered: format_value_like_go(&value),
+            })?;
+            let mut out = Vec::with_capacity(len);
+            for idx in 0..len {
+                let n = Number::from(idx as u64);
+                let v = Value::Number(n.clone());
+                out.push((Some(Value::Number(n)), v));
+            }
+            return Ok(out);
+        }
+        if let Some(u) = n.as_u64() {
+            let len = usize::try_from(u).map_err(|_| RangeItemsError::CannotIterate {
+                rendered: format_value_like_go(&value),
+            })?;
+            let mut out = Vec::with_capacity(len);
+            for idx in 0..len {
+                let n = Number::from(idx as u64);
+                let v = Value::Number(n.clone());
+                out.push((Some(Value::Number(n)), v));
+            }
+            return Ok(out);
+        }
+    }
     if let Some(len) = go_bytes_len(&value) {
         let mut out = Vec::with_capacity(len);
         for idx in 0..len {
@@ -100,12 +129,24 @@ mod tests {
     }
 
     #[test]
+    fn range_items_supports_integer_values_like_go() {
+        let out = range_items(Some(json!(3))).expect("must range");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], (Some(json!(0)), json!(0)));
+        assert_eq!(out[1], (Some(json!(1)), json!(1)));
+        assert_eq!(out[2], (Some(json!(2)), json!(2)));
+
+        let out = range_items(Some(json!(-2))).expect("must range");
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn range_items_rejects_non_iterable_values() {
-        let err = range_items(Some(json!(3))).expect_err("must fail");
+        let err = range_items(Some(json!(1.5))).expect_err("must fail");
         assert_eq!(
             err,
             RangeItemsError::CannotIterate {
-                rendered: "3".to_string()
+                rendered: "1.5".to_string()
             }
         );
     }

@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
+use crate::chart_ir::{decode_ir_documents, encode_documents, ChartIr};
 use crate::cli::ImportArgs;
 use crate::gotemplates::{
     contains_template_markup, escape_template_action, normalize_values_global_context,
@@ -13,6 +13,14 @@ use crate::gotemplates::{
 };
 use crate::templateanalyzer::collect_include_names_in_action;
 use crate::templatepolicy::is_supported_include;
+
+const DEFAULT_MAX_INPUT_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_MAX_MANIFEST_FILE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_MANIFEST_FILES: usize = 50_000;
+const DEFAULT_MAX_MANIFEST_WALK_DEPTH: usize = 128;
+const DEFAULT_MAX_YAML_DOCS_PER_STREAM: usize = 100_000;
+const DEFAULT_MAX_VALUES_FILE_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_MAX_CHART_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -22,23 +30,36 @@ pub enum Error {
     Yaml(#[from] serde_yaml::Error),
     #[error("no YAML files found at {0}")]
     NoYamlFiles(String),
-    #[error("helm template failed: {0}")]
-    Helm(String),
+    #[error("chart model build failed: {0}")]
+    ChartModel(String),
     #[error("unsupported source template includes: {0}")]
     UnsupportedTemplateIncludes(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RenderInvocation {
-    program: String,
-    args: Vec<String>,
+    #[error("resource limit exceeded: {0}")]
+    ResourceLimit(String),
+    #[error(transparent)]
+    ChartIr(#[from] crate::chart_ir::Error),
 }
 
 pub fn load_documents_for_chart(args: &ImportArgs) -> Result<Vec<Value>, Error> {
-    let rendered = render_chart(args, &args.path)?;
-    let mut docs = parse_documents(&rendered)?;
+    let ir = load_chart_ir_for_chart(args)?;
+    decode_ir_documents(&ir).map_err(Error::from)
+}
+
+pub fn load_chart_ir_for_chart(args: &ImportArgs) -> Result<ChartIr, Error> {
+    enforce_chart_source_safety(args)?;
+    let mut ir =
+        crate::go_compat::helm_ir_ffi::load_chart_ir_via_helm_goffi(args).map_err(|err| {
+            let message = match err {
+                crate::go_compat::helm_ir_ffi::HelmIrFfiError::Unavailable(reason)
+                | crate::go_compat::helm_ir_ffi::HelmIrFfiError::Render(reason)
+                | crate::go_compat::helm_ir_ffi::HelmIrFfiError::Decode(reason) => reason,
+            };
+            Error::ChartModel(augment_renderer_error_message(&message))
+        })?;
+    let mut docs = decode_ir_documents(&ir)?;
     rehydrate_templated_extra_objects(args, &mut docs)?;
-    Ok(docs)
+    ir.documents = encode_documents(&docs);
+    Ok(ir)
 }
 
 pub fn load_documents_for_manifests(path: &str) -> Result<Vec<Value>, Error> {
@@ -46,10 +67,24 @@ pub fn load_documents_for_manifests(path: &str) -> Result<Vec<Value>, Error> {
     if files.is_empty() {
         return Err(Error::NoYamlFiles(path.to_string()));
     }
+    if files.len() > max_manifest_files() {
+        return Err(Error::ResourceLimit(format!(
+            "too many YAML files: {} (max {})",
+            files.len(),
+            max_manifest_files()
+        )));
+    }
     let mut out = Vec::new();
     for file in files {
-        let data = fs::read_to_string(&file)?;
-        out.extend(parse_documents(&data)?);
+        let data = read_text_file_with_limit(&file, max_manifest_file_bytes())?;
+        let docs = parse_documents(&data)?;
+        if out.len().saturating_add(docs.len()) > max_yaml_docs_per_stream() {
+            return Err(Error::ResourceLimit(format!(
+                "too many YAML documents while loading manifests (max {})",
+                max_yaml_docs_per_stream()
+            )));
+        }
+        out.extend(docs);
     }
     Ok(flatten_k8s_lists(out))
 }
@@ -59,6 +94,12 @@ pub fn parse_documents(stream: &str) -> Result<Vec<Value>, Error> {
     for doc in serde_yaml::Deserializer::from_str(stream) {
         let v: Value = Value::deserialize(doc)?;
         if !v.is_null() {
+            if docs.len() >= max_yaml_docs_per_stream() {
+                return Err(Error::ResourceLimit(format!(
+                    "too many YAML documents in a single stream (max {})",
+                    max_yaml_docs_per_stream()
+                )));
+            }
             docs.push(v);
         }
     }
@@ -66,107 +107,99 @@ pub fn parse_documents(stream: &str) -> Result<Vec<Value>, Error> {
 }
 
 pub fn render_chart(args: &ImportArgs, chart_path: &str) -> Result<String, Error> {
-    let mut last_error = String::new();
-    for inv in render_invocations(args, chart_path) {
-        let output = match Command::new(&inv.program).args(&inv.args).output() {
-            Ok(o) => o,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                last_error = format!("{} not found", inv.program);
-                continue;
-            }
-            Err(e) => return Err(Error::Io(e)),
-        };
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            last_error = if err.is_empty() {
-                format!("{} exited with status {}", inv.program, output.status)
-            } else {
-                format!("{}: {err}", inv.program)
-            };
-            continue;
-        }
-        let rendered = String::from_utf8_lossy(&output.stdout).to_string();
-        if let Some(path) = &args.write_rendered_output {
-            fs::write(path, rendered.as_bytes())?;
-        }
-        return Ok(rendered);
+    let mut render_args = args.clone();
+    render_args.path = chart_path.to_string();
+    let ir = load_chart_ir_for_chart(&render_args)?;
+    let docs = decode_ir_documents(&ir)?;
+    let rendered = render_documents_yaml_stream(&docs)?;
+    if let Some(path) = &args.write_rendered_output {
+        fs::write(path, rendered.as_bytes())?;
     }
-    Err(Error::Helm(if last_error.is_empty() {
-        "no renderer available".to_string()
-    } else {
-        last_error
-    }))
+    Ok(rendered)
 }
 
-fn render_invocations(args: &ImportArgs, chart_path: &str) -> Vec<RenderInvocation> {
-    let mut out = Vec::with_capacity(2);
+fn augment_renderer_error_message(err: &str) -> String {
+    let trimmed = err.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let missing_paths = extract_missing_values_paths(trimmed);
+    if missing_paths.is_empty() {
+        return trimmed.to_string();
+    }
 
-    let mut werf = RenderInvocation {
-        program: "werf".to_string(),
-        args: vec![
-            "render".to_string(),
-            "--release".to_string(),
-            args.release_name.clone(),
-            chart_path.to_string(),
-        ],
-    };
-    apply_render_flags(&mut werf.args, args);
-    out.push(werf);
-
-    let mut helm = RenderInvocation {
-        program: "helm".to_string(),
-        args: vec![
-            "template".to_string(),
-            args.release_name.clone(),
-            chart_path.to_string(),
-        ],
-    };
-    apply_render_flags(&mut helm.args, args);
-    out.push(helm);
-
+    let mut out = String::from(trimmed);
+    out.push_str("\n\nhapp hint: custom values are missing for these template paths:\n");
+    for path in &missing_paths {
+        out.push_str("- ");
+        out.push_str(path);
+        out.push('\n');
+    }
+    out.push_str(
+        "Provide them via source chart values (--values / --set / --set-string), then retry.",
+    );
     out
 }
 
-fn apply_render_flags(cmd_args: &mut Vec<String>, args: &ImportArgs) {
-    if let Some(ns) = &args.namespace {
-        if !ns.trim().is_empty() {
-            cmd_args.push("--namespace".to_string());
-            cmd_args.push(ns.clone());
+fn extract_missing_values_paths(err: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let bytes = err.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < bytes.len() && bytes[j] != b'>' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let candidate = err[start..j].trim();
+        if let Some(path) = normalize_values_path_candidate(candidate) {
+            if seen.insert(path.clone()) {
+                out.push(path);
+            }
+        }
+        i = j + 1;
+    }
+    out
+}
+
+fn normalize_values_path_candidate(candidate: &str) -> Option<String> {
+    if let Some(rest) = candidate.strip_prefix("$.Values") {
+        if rest.is_empty() || rest.starts_with('.') {
+            return Some(format!("$.Values{rest}"));
         }
     }
-    for v in &args.values_files {
-        cmd_args.push("--values".to_string());
-        cmd_args.push(v.clone());
-    }
-    for v in &args.set_values {
-        cmd_args.push("--set".to_string());
-        cmd_args.push(v.clone());
-    }
-    for v in &args.set_string_values {
-        cmd_args.push("--set-string".to_string());
-        cmd_args.push(v.clone());
-    }
-    for v in &args.set_file_values {
-        cmd_args.push("--set-file".to_string());
-        cmd_args.push(v.clone());
-    }
-    for v in &args.set_json_values {
-        cmd_args.push("--set-json".to_string());
-        cmd_args.push(v.clone());
-    }
-    if let Some(kv) = &args.kube_version {
-        if !kv.trim().is_empty() {
-            cmd_args.push("--kube-version".to_string());
-            cmd_args.push(kv.clone());
+    if let Some(rest) = candidate.strip_prefix(".Values") {
+        if rest.is_empty() || rest.starts_with('.') {
+            return Some(format!("$.Values{rest}"));
         }
     }
-    for v in &args.api_versions {
-        cmd_args.push("--api-versions".to_string());
-        cmd_args.push(v.clone());
+    None
+}
+
+fn render_documents_yaml_stream(docs: &[Value]) -> Result<String, Error> {
+    let mut out = String::new();
+    for (idx, doc) in docs.iter().enumerate() {
+        if idx > 0 {
+            out.push_str("---\n");
+        }
+        let mut body = serde_yaml::to_string(doc)?;
+        if body.starts_with("---\n") {
+            body = body.replacen("---\n", "", 1);
+        }
+        out.push_str(&body);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
     }
-    if args.include_crds {
-        cmd_args.push("--include-crds".to_string());
-    }
+    Ok(out)
 }
 
 pub fn collect_manifest_files(path: &str) -> Result<Vec<PathBuf>, Error> {
@@ -175,23 +208,38 @@ pub fn collect_manifest_files(path: &str) -> Result<Vec<PathBuf>, Error> {
         return Ok(vec![p.to_path_buf()]);
     }
     let mut out = Vec::new();
-    walk_yaml_files(p, &mut out)?;
+    walk_yaml_files(p, &mut out, 0)?;
     out.sort();
     Ok(out)
 }
 
-fn walk_yaml_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
+fn walk_yaml_files(path: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<(), Error> {
+    if depth > max_manifest_walk_depth() {
+        return Err(Error::ResourceLimit(format!(
+            "manifest directory nesting is too deep (max depth {})",
+            max_manifest_walk_depth()
+        )));
+    }
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let p = entry.path();
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
-            walk_yaml_files(&p, out)?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            walk_yaml_files(&p, out, depth + 1)?;
             continue;
         }
         if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
             let low = name.to_ascii_lowercase();
             if low.ends_with(".yaml") || low.ends_with(".yml") {
+                if out.len() >= max_manifest_files() {
+                    return Err(Error::ResourceLimit(format!(
+                        "too many YAML files discovered (max {})",
+                        max_manifest_files()
+                    )));
+                }
                 out.push(p);
             }
         }
@@ -481,19 +529,153 @@ fn apply_templated_scalars(
 
 pub fn read_input(path: &str) -> Result<String, Error> {
     if path == "-" {
-        let mut s = String::new();
-        io::stdin().read_to_string(&mut s)?;
-        return Ok(s);
+        return read_stdin_with_limit(max_input_bytes());
     }
-    Ok(fs::read_to_string(path)?)
+    read_text_file_with_limit(Path::new(path), max_input_bytes())
 }
 
 pub fn validate_values_file(path: &str) -> Result<(), Error> {
-    let src = fs::read_to_string(path)?;
+    let src = read_text_file_with_limit(Path::new(path), max_values_file_bytes())?;
     for doc in serde_yaml::Deserializer::from_str(&src) {
         let _: Value = Value::deserialize(doc)?;
     }
     Ok(())
+}
+
+fn enforce_chart_source_safety(args: &ImportArgs) -> Result<(), Error> {
+    let chart_path = Path::new(&args.path);
+    if chart_path.is_file() {
+        let meta = fs::metadata(chart_path)
+            .map_err(|e| Error::ChartModel(format!("chart file '{}': {e}", args.path)))?;
+        let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+        if len > max_chart_archive_bytes() {
+            return Err(Error::ChartModel(format!(
+                "chart archive '{}' is too large: {} bytes (max {}). Extract it manually or raise HAPP_MAX_CHART_ARCHIVE_BYTES.",
+                args.path,
+                len,
+                max_chart_archive_bytes()
+            )));
+        }
+    }
+    if !chart_path.is_dir() && !chart_path.is_file() {
+        return Err(Error::ChartModel(format!(
+            "chart path '{}' does not exist or is not a regular file/directory",
+            args.path
+        )));
+    }
+    let mut total_values_bytes = 0usize;
+    for values_path in &args.values_files {
+        let meta = fs::metadata(values_path)
+            .map_err(|e| Error::ChartModel(format!("values file '{}': {e}", values_path)))?;
+        let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+        if len > max_values_file_bytes() {
+            return Err(Error::ChartModel(format!(
+                "values file '{}' is too large: {} bytes (max {})",
+                values_path,
+                len,
+                max_values_file_bytes()
+            )));
+        }
+        total_values_bytes = total_values_bytes.saturating_add(len);
+        if total_values_bytes > max_values_file_bytes().saturating_mul(8) {
+            return Err(Error::ChartModel(format!(
+                "total values files size is too large: {} bytes (max {})",
+                total_values_bytes,
+                max_values_file_bytes().saturating_mul(8)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_stdin_with_limit(limit: usize) -> Result<String, Error> {
+    let mut input = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut stdin = io::stdin();
+    loop {
+        let n = stdin.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if input.len().saturating_add(n) > limit {
+            return Err(Error::ResourceLimit(format!(
+                "stdin is too large (max {} bytes)",
+                limit
+            )));
+        }
+        input.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8(input).map_err(|e| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("input is not valid UTF-8: {e}"),
+        ))
+    })
+}
+
+fn read_text_file_with_limit(path: &Path, limit: usize) -> Result<String, Error> {
+    let meta = fs::metadata(path)?;
+    let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+    if len > limit {
+        return Err(Error::ResourceLimit(format!(
+            "file '{}' is too large: {} bytes (max {})",
+            path.display(),
+            len,
+            limit
+        )));
+    }
+    fs::read_to_string(path).map_err(Error::from)
+}
+
+fn max_input_bytes() -> usize {
+    env_usize_or("HAPP_MAX_INPUT_BYTES", DEFAULT_MAX_INPUT_BYTES)
+}
+
+fn max_manifest_file_bytes() -> usize {
+    env_usize_or(
+        "HAPP_MAX_MANIFEST_FILE_BYTES",
+        DEFAULT_MAX_MANIFEST_FILE_BYTES,
+    )
+}
+
+fn max_manifest_files() -> usize {
+    env_usize_or("HAPP_MAX_MANIFEST_FILES", DEFAULT_MAX_MANIFEST_FILES)
+}
+
+fn max_manifest_walk_depth() -> usize {
+    env_usize_or(
+        "HAPP_MAX_MANIFEST_WALK_DEPTH",
+        DEFAULT_MAX_MANIFEST_WALK_DEPTH,
+    )
+}
+
+fn max_yaml_docs_per_stream() -> usize {
+    env_usize_or(
+        "HAPP_MAX_YAML_DOCS_PER_STREAM",
+        DEFAULT_MAX_YAML_DOCS_PER_STREAM,
+    )
+}
+
+fn max_values_file_bytes() -> usize {
+    env_usize_or("HAPP_MAX_VALUES_FILE_BYTES", DEFAULT_MAX_VALUES_FILE_BYTES)
+}
+
+fn max_chart_archive_bytes() -> usize {
+    env_usize_or(
+        "HAPP_MAX_CHART_ARCHIVE_BYTES",
+        DEFAULT_MAX_CHART_ARCHIVE_BYTES,
+    )
+}
+
+fn env_usize_or(name: &str, default: usize) -> usize {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
 }
 
 #[cfg(test)]
@@ -757,40 +939,31 @@ spec:
     }
 
     #[test]
-    fn render_invocations_prefers_werf_then_helm() {
-        let args = minimal_import_args();
-        let inv = render_invocations(&args, "./chart");
-        assert_eq!(inv.len(), 2);
-        assert_eq!(inv[0].program, "werf");
-        assert_eq!(inv[0].args[0], "render");
-        assert_eq!(inv[1].program, "helm");
-        assert_eq!(inv[1].args[0], "template");
-    }
-
-    #[test]
-    fn render_invocations_apply_render_flags() {
-        let mut args = minimal_import_args();
-        args.namespace = Some("default".into());
-        args.values_files = vec!["values.yaml".into()];
-        args.set_values = vec!["a=b".into()];
-        args.set_string_values = vec!["x=1".into()];
-        args.set_file_values = vec!["k=path.txt".into()];
-        args.set_json_values = vec!["obj={}".into()];
-        args.kube_version = Some("1.29.0".into());
-        args.api_versions = vec!["batch/v1".into()];
-        args.include_crds = true;
-
-        let inv = render_invocations(&args, "./chart");
-        let helm = &inv[1].args;
-        assert!(helm.windows(2).any(|w| w == ["--namespace", "default"]));
-        assert!(helm.windows(2).any(|w| w == ["--values", "values.yaml"]));
-        assert!(helm.windows(2).any(|w| w == ["--set", "a=b"]));
-        assert!(helm.windows(2).any(|w| w == ["--set-string", "x=1"]));
-        assert!(helm.windows(2).any(|w| w == ["--set-file", "k=path.txt"]));
-        assert!(helm.windows(2).any(|w| w == ["--set-json", "obj={}"]));
-        assert!(helm.windows(2).any(|w| w == ["--kube-version", "1.29.0"]));
-        assert!(helm.windows(2).any(|w| w == ["--api-versions", "batch/v1"]));
-        assert!(helm.contains(&"--include-crds".to_string()));
+    fn render_documents_yaml_stream_emits_multi_doc_yaml() {
+        let docs = vec![
+            serde_yaml::from_str::<Value>(
+                r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a
+"#,
+            )
+            .expect("doc1"),
+            serde_yaml::from_str::<Value>(
+                r#"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: b
+"#,
+            )
+            .expect("doc2"),
+        ];
+        let rendered = render_documents_yaml_stream(&docs).expect("render");
+        assert!(rendered.contains("kind: ConfigMap"));
+        assert!(rendered.contains("---\n"));
+        assert!(rendered.contains("kind: Secret"));
     }
 
     #[test]
@@ -913,6 +1086,52 @@ stringData:
         assert!(!unsupported_template_mode_is_error(&args));
         args.unsupported_template_mode = "error".to_string();
         assert!(unsupported_template_mode_is_error(&args));
+    }
+
+    #[test]
+    fn extract_missing_values_paths_collects_unique_values_refs() {
+        let err = r#"template: gotpl:1: at <$.Values.cluster.security.config.admin_password>: nil pointer
+template: gotpl:2: at <.Values.serviceAccount.name>: nil pointer
+template: gotpl:3: at <$.Values.cluster.security.config.admin_password>: nil pointer"#;
+        assert_eq!(
+            extract_missing_values_paths(err),
+            vec![
+                "$.Values.cluster.security.config.admin_password".to_string(),
+                "$.Values.serviceAccount.name".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn augment_renderer_error_message_appends_user_hint_for_missing_values() {
+        let err = r#"template: gotpl:1: executing "x" at <$.Values.cluster.security.config.admin_password>: nil pointer"#;
+        let augmented = augment_renderer_error_message(err);
+        assert!(augmented.contains("happ hint: custom values are missing"));
+        assert!(augmented.contains("$.Values.cluster.security.config.admin_password"));
+        assert!(augmented.contains("--values / --set / --set-string"));
+
+        let plain = augment_renderer_error_message("renderer: random failure");
+        assert_eq!(plain, "renderer: random failure");
+    }
+
+    #[test]
+    fn enforce_chart_source_safety_allows_regular_chart_archive_file() {
+        let td = TempDir::new().expect("tmp");
+        let chart = td.path().join("chart.tgz");
+        fs::write(&chart, b"not-real-archive").expect("write");
+
+        let mut args = minimal_import_args();
+        args.path = chart.to_string_lossy().to_string();
+        enforce_chart_source_safety(&args).expect("file path should be allowed");
+    }
+
+    #[test]
+    fn enforce_chart_source_safety_rejects_missing_path() {
+        let mut args = minimal_import_args();
+        args.path = "/definitely/missing/chart".to_string();
+        let err = enforce_chart_source_safety(&args).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("does not exist"));
     }
 
     fn minimal_import_args() -> ImportArgs {

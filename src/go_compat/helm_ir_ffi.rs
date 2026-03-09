@@ -10,7 +10,7 @@ use crate::go_compat::ffi_runtime::{
 use crate::process_guard::{wait_child_with_timeout_limited, ChildWaitError};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -18,7 +18,8 @@ use std::time::Duration;
 
 const DEFAULT_HELM_IR_TIMEOUT_MS: u64 = 120_000;
 const HELM_IR_POLL_INTERVAL_MS: u64 = 10;
-const EMBEDDED_HELM_IR_HELPER_BIN: &[u8] = include_bytes!(env!("HAPP_HELM_IR_HELPER_BIN"));
+const EMBEDDED_HELM_IR_HELPER_BIN_ZSTD: &[u8] =
+    include_bytes!(env!("HAPP_HELM_IR_HELPER_BIN_ZSTD"));
 const DEFAULT_HELM_IR_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_HELM_IR_MAX_STDOUT_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_HELM_IR_MAX_STDERR_BYTES: usize = 2 * 1024 * 1024;
@@ -290,7 +291,9 @@ fn extract_embedded_helper_binary() -> Result<PathBuf, String> {
     {
         return Ok(bin_path);
     }
-    fs::write(&bin_path, EMBEDDED_HELM_IR_HELPER_BIN).map_err(|err| {
+    let helper_bin = decode_embedded_helper_binary()
+        .map_err(|err| format!("decode embedded helm goffi helper (zstd): {err}"))?;
+    fs::write(&bin_path, helper_bin).map_err(|err| {
         format!(
             "write embedded helm goffi helper {}: {err}",
             bin_path.display()
@@ -312,15 +315,25 @@ fn helper_binary_name() -> String {
 
 fn helper_stamp_payload() -> String {
     format!(
-        "helper_bin_hash={:016x}\nos={}\narch={}\n",
-        fnv1a64(EMBEDDED_HELM_IR_HELPER_BIN),
+        "helper_bin_zstd_hash={:016x}\nos={}\narch={}\n",
+        fnv1a64(EMBEDDED_HELM_IR_HELPER_BIN_ZSTD),
         std::env::consts::OS,
         std::env::consts::ARCH
     )
 }
 
+fn decode_embedded_helper_binary() -> Result<Vec<u8>, std::io::Error> {
+    let mut decoder = zstd::stream::read::Decoder::new(EMBEDDED_HELM_IR_HELPER_BIN_ZSTD)?;
+    let mut helper_bin = Vec::new();
+    decoder.read_to_end(&mut helper_bin)?;
+    Ok(helper_bin)
+}
+
 fn helm_ir_timeout() -> Duration {
-    Duration::from_millis(env_u64_or("HAPP_HELM_IR_FFI_TIMEOUT_MS", DEFAULT_HELM_IR_TIMEOUT_MS))
+    Duration::from_millis(env_u64_or(
+        "HAPP_HELM_IR_FFI_TIMEOUT_MS",
+        DEFAULT_HELM_IR_TIMEOUT_MS,
+    ))
 }
 
 fn helm_ir_max_request_bytes() -> usize {

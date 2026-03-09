@@ -1,6 +1,4 @@
-use happ::gotemplates::{
-    parse_template_tokens_strict_with_options, ParseCompatOptions,
-};
+use happ::gotemplates::{parse_template_tokens_strict_with_options, ParseCompatOptions};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -105,8 +103,8 @@ fn gotemplates_error_matrix_matches_go_parse_package() {
                 visible_variables: &[],
             },
         )
-            .err()
-            .map(|e| e.code.to_string());
+        .err()
+        .map(|e| e.code.to_string());
         let go_code = go_codes[idx].clone();
 
         assert_eq!(

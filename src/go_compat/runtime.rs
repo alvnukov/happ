@@ -91,7 +91,7 @@ impl Default for NativeRenderOptions {
         Self {
             missing_value_mode: MissingValueMode::GoDefault,
             function_dispatch_mode: FunctionDispatchMode::Extended,
-            logic_backend: LogicBackend::from_env().unwrap_or_default(),
+            logic_backend: LogicBackend::GoFfi,
         }
     }
 }
@@ -269,7 +269,18 @@ pub fn render_template_native_with_resolver(
     options: NativeRenderOptions,
     resolver: Option<&dyn NativeFunctionResolver>,
 ) -> Result<String, NativeRenderError> {
-    runtime_backend(options.logic_backend).render(src, root, options, resolver)
+    let mut selected = options;
+    if resolver.is_some()
+        && matches!(
+            selected.logic_backend,
+            LogicBackend::GoFfi | LogicBackend::Dual
+        )
+    {
+        // Go FFI helper does not support resolver callbacks yet.
+        // Preserve API behavior by routing resolver execution through GoCompat backend.
+        selected.logic_backend = LogicBackend::GoCompat;
+    }
+    runtime_backend(selected.logic_backend).render(src, root, selected, resolver)
 }
 
 fn render_with_go_ffi(
@@ -281,7 +292,7 @@ fn render_with_go_ffi(
     if resolver.is_some() {
         return Err(NativeRenderError::UnsupportedAction {
             action: "{{ ... }}".to_string(),
-            reason: "go_ffi backend does not support rust function resolver".to_string(),
+            reason: "go_ffi-only mode: resolver callbacks are not supported".to_string(),
         });
     }
     go_ffi::render_template_via_go_ffi(src, root, options).map_err(|err| match err {
@@ -289,11 +300,55 @@ fn render_with_go_ffi(
             action: "{{ ... }}".to_string(),
             reason: format!("go_ffi unavailable: {reason}"),
         },
-        go_ffi::GoFfiError::Render(reason) => NativeRenderError::UnsupportedAction {
-            action: "{{ ... }}".to_string(),
-            reason,
-        },
+        go_ffi::GoFfiError::Parse(reason) => {
+            if reason.contains("is not a defined function")
+                || reason.starts_with("illegal number syntax:")
+                || reason.starts_with("invalid syntax")
+            {
+                NativeRenderError::UnsupportedAction {
+                    action: "{{ ... }}".to_string(),
+                    reason,
+                }
+            } else {
+                NativeRenderError::Parse(GoTemplateScanError {
+                    code: go_ffi::parse_error_code(&reason),
+                    message: reason,
+                    offset: 0,
+                })
+            }
+        }
+        go_ffi::GoFfiError::Execute(reason) => {
+            if let Some(path) = extract_missing_value_path_from_reason(&reason) {
+                NativeRenderError::MissingValue {
+                    action: "{{ ... }}".to_string(),
+                    path,
+                }
+            } else {
+                NativeRenderError::UnsupportedAction {
+                    action: "{{ ... }}".to_string(),
+                    reason,
+                }
+            }
+        }
     })
+}
+
+fn extract_missing_value_path_from_reason(reason: &str) -> Option<String> {
+    // Keep MissingValue classification narrowly scoped to missingkey=error style
+    // map lookups. Errors like "nil pointer evaluating ..." must stay in
+    // UnsupportedAction to preserve Go parity matrix classes.
+    if !reason.contains("map has no entry for key") {
+        return None;
+    }
+    let start = reason.find('<')?;
+    let end_rel = reason[start + 1..].find('>')?;
+    let end = start + 1 + end_rel;
+    let raw = reason[start + 1..end].trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
 }
 
 fn render_for_backend(
@@ -340,7 +395,7 @@ fn log_dual_mismatch(
     primary_result: &Result<String, NativeRenderError>,
     secondary_result: &Result<String, NativeRenderError>,
 ) {
-    if primary_result == secondary_result {
+    if results_semantically_equal(primary_result, secondary_result) {
         return;
     }
     let line = format!(
@@ -350,6 +405,48 @@ fn log_dual_mismatch(
         result_preview(secondary_result)
     );
     emit_dual_log(&line);
+}
+
+fn results_semantically_equal(
+    left: &Result<String, NativeRenderError>,
+    right: &Result<String, NativeRenderError>,
+) -> bool {
+    match (left, right) {
+        (Ok(a), Ok(b)) => a == b,
+        (Err(a), Err(b)) => errors_semantically_equal(a, b),
+        _ => false,
+    }
+}
+
+fn errors_semantically_equal(left: &NativeRenderError, right: &NativeRenderError) -> bool {
+    match (left, right) {
+        (NativeRenderError::Parse(a), NativeRenderError::Parse(b)) => {
+            a.code == b.code && a.message == b.message
+        }
+        (
+            NativeRenderError::UnsupportedAction { reason: a, .. },
+            NativeRenderError::UnsupportedAction { reason: b, .. },
+        ) => a == b,
+        (
+            NativeRenderError::MissingValue { path: a, .. },
+            NativeRenderError::MissingValue { path: b, .. },
+        ) => a == b,
+        (
+            NativeRenderError::TemplateNotFound { name: a },
+            NativeRenderError::TemplateNotFound { name: b },
+        ) => a == b,
+        (
+            NativeRenderError::TemplateRecursionLimit {
+                name: an,
+                depth: ad,
+            },
+            NativeRenderError::TemplateRecursionLimit {
+                name: bn,
+                depth: bd,
+            },
+        ) => an == bn && ad == bd,
+        _ => false,
+    }
 }
 
 fn emit_dual_log(line: &str) {

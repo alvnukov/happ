@@ -1,13 +1,12 @@
-use crate::go_compat::typeutil::{
-    map_key_arg, option_type_name_for_template, parse_slice_like_index,
-    value_from_go_string_bytes, value_type_name_for_template, MapKeyArg, ParseSliceLikeIndexError,
-    SliceLikeIndexMode,
-};
 use crate::go_compat::typedvalue::{
     decode_go_bytes_value, decode_go_string_bytes_value, decode_go_typed_map_value,
     decode_go_typed_slice_value, encode_go_bytes_value, encode_go_nil_bytes_value,
-    encode_go_typed_slice_value, go_bytes_get, go_bytes_is_nil, go_bytes_len,
-    go_string_bytes_get, go_string_bytes_len, go_zero_value_for_type,
+    encode_go_typed_slice_value, go_bytes_get, go_bytes_is_nil, go_bytes_len, go_string_bytes_get,
+    go_string_bytes_len, go_zero_value_for_type,
+};
+use crate::go_compat::typeutil::{
+    map_key_arg, option_type_name_for_template, parse_slice_like_index, value_from_go_string_bytes,
+    value_type_name_for_template, MapKeyArg, ParseSliceLikeIndexError, SliceLikeIndexMode,
 };
 use serde_json::{Number, Value};
 
@@ -393,9 +392,9 @@ fn map_parse_slice_like_index_error(
         ParseSliceLikeIndexError::Nil => {
             format!("error calling {call_name}: cannot index slice/array with nil")
         }
-        ParseSliceLikeIndexError::WrongType { type_name } => format!(
-            "error calling {call_name}: cannot index slice/array with type {type_name}"
-        ),
+        ParseSliceLikeIndexError::WrongType { type_name } => {
+            format!("error calling {call_name}: cannot index slice/array with type {type_name}")
+        }
         ParseSliceLikeIndexError::OutOfRange { raw } => {
             format!("error calling {call_name}: index out of range: {raw}")
         }
@@ -488,7 +487,8 @@ mod tests {
     #[test]
     fn index_chain_after_missing_map_reports_nil_pointer_like_go() {
         let root = Some(json!({"a":{"x":1}}));
-        let err = builtin_index(&[root, Some(json!("missing")), Some(json!("x"))]).expect_err("must fail");
+        let err = builtin_index(&[root, Some(json!("missing")), Some(json!("x"))])
+            .expect_err("must fail");
         assert!(reason(err).contains("error calling index: index of nil pointer"));
     }
 
@@ -502,9 +502,10 @@ mod tests {
     fn index_chain_after_typed_interface_zero_reports_nil_pointer() {
         let mut entries = Map::new();
         entries.insert("a".to_string(), json!({"x":1}));
-        let typed = crate::go_compat::typedvalue::encode_go_typed_map_value("interface {}", Some(entries));
-        let err =
-            builtin_index(&[Some(typed), Some(json!("missing")), Some(json!("x"))]).expect_err("must fail");
+        let typed =
+            crate::go_compat::typedvalue::encode_go_typed_map_value("interface {}", Some(entries));
+        let err = builtin_index(&[Some(typed), Some(json!("missing")), Some(json!("x"))])
+            .expect_err("must fail");
         assert!(reason(err).contains("error calling index: index of nil pointer"));
     }
 }

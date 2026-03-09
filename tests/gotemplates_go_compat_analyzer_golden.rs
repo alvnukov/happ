@@ -53,15 +53,8 @@ struct Snapshot {
 }
 
 fn snapshot_for(src: &str, left_delim: &str, right_delim: &str) -> Snapshot {
-    let trees = parse(
-        "main",
-        src,
-        left_delim,
-        right_delim,
-        Mode::default(),
-        &[],
-    )
-    .expect("parse must succeed");
+    let trees = parse("main", src, left_delim, right_delim, Mode::default(), &[])
+        .expect("parse must succeed");
 
     let analysis = analyze_trees(&trees);
     let mut node_counts = BTreeMap::new();

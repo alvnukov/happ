@@ -391,6 +391,9 @@ mod tests {
     #[test]
     fn split_command_tokens_simple_keeps_parenthesized_chunks_split_by_space() {
         let tokens = split_command_tokens_simple(r#"include "x" (printf "%s" "a")"#);
-        assert_eq!(tokens, vec!["include", "\"x\"", "(printf", "\"%s\"", "\"a\")"]);
+        assert_eq!(
+            tokens,
+            vec!["include", "\"x\"", "(printf", "\"%s\"", "\"a\")"]
+        );
     }
 }

@@ -160,15 +160,27 @@ fn go_compat_template_exec_matrix_matches_go_text_template_subset() {
         Case::new(r#"{{define "main"}}{{call ("x")}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{call 1}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{call (1)}}{{end}}"#, json!({})),
-        Case::new(r#"{{define "main"}}{{call .fn}}{{end}}"#, json!({"fn":"ext"})),
-        Case::new(r#"{{define "main"}}{{1 | call .fn}}{{end}}"#, json!({"fn":"ext"})),
-        Case::new(r#"{{define "main"}}{{call (.fn)}}{{end}}"#, json!({"fn":"ext"})),
+        Case::new(
+            r#"{{define "main"}}{{call .fn}}{{end}}"#,
+            json!({"fn":"ext"}),
+        ),
+        Case::new(
+            r#"{{define "main"}}{{1 | call .fn}}{{end}}"#,
+            json!({"fn":"ext"}),
+        ),
+        Case::new(
+            r#"{{define "main"}}{{call (.fn)}}{{end}}"#,
+            json!({"fn":"ext"}),
+        ),
         Case::new(
             r#"{{define "main"}}{{call ((.fn))}}{{end}}"#,
             json!({"fn":"ext"}),
         ),
         Case::new(r#"{{define "main"}}{{call .missing}}{{end}}"#, json!({})),
-        Case::new(r#"{{define "main"}}{{1 | call .missing}}{{end}}"#, json!({})),
+        Case::new(
+            r#"{{define "main"}}{{1 | call .missing}}{{end}}"#,
+            json!({}),
+        ),
         Case::new(r#"{{define "main"}}{{call (.missing)}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{1 | call "x"}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main""#, json!({})),
@@ -202,7 +214,10 @@ fn go_compat_template_exec_matrix_matches_go_text_template_subset() {
         Case::new(r#"{{define "main"}}{{nil 1}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{(printf) 2}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{$x := 1}}{{$x 2}}{{end}}"#, json!({})),
-        Case::new(r#"{{define "main"}}{{$x := 1}}{{1 | $x}}{{end}}"#, json!({})),
+        Case::new(
+            r#"{{define "main"}}{{$x := 1}}{{1 | $x}}{{end}}"#,
+            json!({}),
+        ),
         Case::new(r#"{{define "main"}}{{.x 2}}{{end}}"#, json!({"x": 7})),
         Case::new(r#"{{define "main"}}{{.x 2}}{{end}}"#, json!({})),
         Case::new(r#"{{define "main"}}{{.a.b 2}}{{end}}"#, json!({"a": {}})),
@@ -215,7 +230,10 @@ fn go_compat_template_exec_matrix_matches_go_text_template_subset() {
             r#"{{define "main"}}{{$m := .m}}{{1 | $m.a}}{{end}}"#,
             json!({"m":{"a":1}}),
         ),
-        Case::new(r#"{{define "main"}}{{$x := 1}}{{$x.y 2}}{{end}}"#, json!({})),
+        Case::new(
+            r#"{{define "main"}}{{$x := 1}}{{$x.y 2}}{{end}}"#,
+            json!({}),
+        ),
     ];
 
     let go_results = runner

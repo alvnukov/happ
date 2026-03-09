@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+const DEFAULT_MAX_COMPOSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -57,6 +60,19 @@ pub struct Healthcheck {
 
 pub fn load(path: &str) -> Result<Report, Error> {
     let p = resolve_compose_path(path)?;
+    let meta = fs::metadata(&p)?;
+    let bytes = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+    if bytes > max_compose_bytes() {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compose file '{}' is too large: {} bytes (max {})",
+                p.display(),
+                bytes,
+                max_compose_bytes()
+            ),
+        )));
+    }
     let body = fs::read_to_string(&p)?;
     let doc: Value = serde_yaml::from_str(&body)?;
     let map = doc.as_mapping().cloned().unwrap_or_default();
@@ -130,6 +146,21 @@ fn parse_shell_string(v: Option<&Value>) -> Option<String> {
         Some(Value::String(s)) => Some(s.to_string()),
         _ => None,
     }
+}
+
+fn max_compose_bytes() -> usize {
+    env_usize_or("HAPP_MAX_COMPOSE_BYTES", DEFAULT_MAX_COMPOSE_BYTES)
+}
+
+fn env_usize_or(name: &str, default: usize) -> usize {
+    let Ok(raw) = env::var(name) else {
+        return default;
+    };
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
 }
 
 pub fn resolve_and_write(path: &str, format: &str, out: Option<&str>) -> Result<(), Error> {

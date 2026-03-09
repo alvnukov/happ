@@ -261,6 +261,19 @@ pub(super) fn eval_range(
         }
 
         let source = eval_expr_value(&source_expr, root, dot, state, resolver)?;
+        if decl.as_ref().is_some_and(|d| d.names.len() > 1) {
+            if let Some(Value::Number(n)) = source.as_ref() {
+                if n.as_i64().is_some() || n.as_u64().is_some() {
+                    return Err(NativeRenderError::UnsupportedAction {
+                        action: format!("{{{{range {expr}}}}}"),
+                        reason: format!(
+                            "can't use {} to iterate over more than one variable",
+                            format_value_like_go(&Value::Number(n.clone()))
+                        ),
+                    });
+                }
+            }
+        }
         if let Some(d) = &decl {
             let default_value = source.clone();
             for name in &d.names {

@@ -36,7 +36,10 @@ mod tests {
 
     #[test]
     fn reason_builders_match_runtime_strings() {
-        assert_eq!(undefined_function_reason("tpl"), "\"tpl\" is not a defined function");
+        assert_eq!(
+            undefined_function_reason("tpl"),
+            "\"tpl\" is not a defined function"
+        );
         assert_eq!(
             external_call_failed_reason("tpl", "boom"),
             "error calling tpl: boom"

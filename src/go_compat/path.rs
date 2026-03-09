@@ -223,7 +223,8 @@ mod tests {
         let b = crate::go_compat::typedvalue::encode_go_bytes_value(&[1, 2]);
         assert_eq!(value_type_name_for_path(&b), "[]uint8");
 
-        let t = crate::go_compat::typedvalue::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
+        let t =
+            crate::go_compat::typedvalue::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
         assert_eq!(value_type_name_for_path(&t), "[]int");
     }
 
@@ -231,23 +232,33 @@ mod tests {
     fn resolve_simple_path_handles_dot_root_and_vars() {
         let root = json!({"v":{"k":"x"}});
         let dot = json!({"a":1});
-        let val =
-            resolve_simple_path(&root, &dot, ".", PathMissingValueMode::GoDefault, |_| None)
-                .expect("ok");
+        let val = resolve_simple_path(&root, &dot, ".", PathMissingValueMode::GoDefault, |_| None)
+            .expect("ok");
         assert_eq!(val, Some(dot.clone()));
 
-        let val =
-            resolve_simple_path(&root, &dot, "$.v.k", PathMissingValueMode::GoDefault, |_| None)
-                .expect("ok");
+        let val = resolve_simple_path(
+            &root,
+            &dot,
+            "$.v.k",
+            PathMissingValueMode::GoDefault,
+            |_| None,
+        )
+        .expect("ok");
         assert_eq!(val, Some(json!("x")));
 
-        let val = resolve_simple_path(&root, &dot, "$x.k", PathMissingValueMode::GoDefault, |name| {
-            if name == "$x" {
-                Some(Some(json!({"k":"v"})))
-            } else {
-                None
-            }
-        })
+        let val = resolve_simple_path(
+            &root,
+            &dot,
+            "$x.k",
+            PathMissingValueMode::GoDefault,
+            |name| {
+                if name == "$x" {
+                    Some(Some(json!({"k":"v"})))
+                } else {
+                    None
+                }
+            },
+        )
         .expect("ok");
         assert_eq!(val, Some(json!("v")));
     }
@@ -255,9 +266,14 @@ mod tests {
     #[test]
     fn resolve_simple_path_reports_slice_field_errors_like_go() {
         let root = json!({"arr":[1,2]});
-        let err =
-            resolve_simple_path(&root, &root, ".arr.x", PathMissingValueMode::GoDefault, |_| None)
-                .expect_err("must fail");
+        let err = resolve_simple_path(
+            &root,
+            &root,
+            ".arr.x",
+            PathMissingValueMode::GoDefault,
+            |_| None,
+        )
+        .expect_err("must fail");
         assert_eq!(
             err,
             ResolveSimplePathError::CannotEvaluateField {

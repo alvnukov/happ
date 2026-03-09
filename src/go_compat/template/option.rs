@@ -66,7 +66,7 @@ impl TemplateOptions {
         NativeRenderOptions {
             missing_value_mode,
             function_dispatch_mode: FunctionDispatchMode::GoStrict,
-            logic_backend: LogicBackend::from_env().unwrap_or_default(),
+            logic_backend: LogicBackend::GoFfi,
         }
     }
 }
@@ -87,10 +87,7 @@ mod tests {
             native.function_dispatch_mode,
             FunctionDispatchMode::GoStrict
         );
-        assert_eq!(
-            native.logic_backend,
-            LogicBackend::from_env().unwrap_or_default()
-        );
+        assert_eq!(native.logic_backend, LogicBackend::GoFfi);
     }
 
     #[test]
@@ -104,10 +101,7 @@ mod tests {
                 native.function_dispatch_mode,
                 FunctionDispatchMode::GoStrict
             );
-            assert_eq!(
-                native.logic_backend,
-                LogicBackend::from_env().unwrap_or_default()
-            );
+            assert_eq!(native.logic_backend, LogicBackend::GoFfi);
         }
     }
 
@@ -123,9 +117,6 @@ mod tests {
             native.function_dispatch_mode,
             FunctionDispatchMode::GoStrict
         );
-        assert_eq!(
-            native.logic_backend,
-            LogicBackend::from_env().unwrap_or_default()
-        );
+        assert_eq!(native.logic_backend, LogicBackend::GoFfi);
     }
 }

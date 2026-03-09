@@ -71,7 +71,9 @@ fn parser_can_check_function_existence() {
     )
     .expect_err("must fail");
     assert_eq!(err.code, "undefined_function");
-    assert!(err.message.contains("function \"totallyUnknown\" not defined"));
+    assert!(err
+        .message
+        .contains("function \"totallyUnknown\" not defined"));
 
     let err = parse_action_compat_with_options(
         "{{ 1 | totallyUnknown }}",
@@ -85,7 +87,9 @@ fn parser_can_check_function_existence() {
     )
     .expect_err("must fail");
     assert_eq!(err.code, "undefined_function");
-    assert!(err.message.contains("function \"totallyUnknown\" not defined"));
+    assert!(err
+        .message
+        .contains("function \"totallyUnknown\" not defined"));
 
     let err = parse_action_compat_with_options(
         "{{ call totallyUnknown }}",
@@ -99,7 +103,9 @@ fn parser_can_check_function_existence() {
     )
     .expect_err("must fail");
     assert_eq!(err.code, "undefined_function");
-    assert!(err.message.contains("function \"totallyUnknown\" not defined"));
+    assert!(err
+        .message
+        .contains("function \"totallyUnknown\" not defined"));
 
     let err = parse_action_compat_with_options(
         "{{ 1 | call totallyUnknown }}",
@@ -113,7 +119,9 @@ fn parser_can_check_function_existence() {
     )
     .expect_err("must fail");
     assert_eq!(err.code, "undefined_function");
-    assert!(err.message.contains("function \"totallyUnknown\" not defined"));
+    assert!(err
+        .message
+        .contains("function \"totallyUnknown\" not defined"));
 }
 
 #[test]
@@ -328,7 +336,9 @@ fn parser_reports_non_executable_pipeline_stage_number_like_go() {
     )
     .expect_err("must fail");
     assert_eq!(err.code, "non_executable_command_in_pipeline");
-    assert!(err.message.contains("non executable command in pipeline stage 2"));
+    assert!(err
+        .message
+        .contains("non executable command in pipeline stage 2"));
     assert_eq!(err.offset, 7);
 
     let err = parse_action_compat_with_options(
@@ -343,6 +353,8 @@ fn parser_reports_non_executable_pipeline_stage_number_like_go() {
     )
     .expect_err("must fail");
     assert_eq!(err.code, "non_executable_command_in_pipeline");
-    assert!(err.message.contains("non executable command in pipeline stage 3"));
+    assert!(err
+        .message
+        .contains("non executable command in pipeline stage 3"));
     assert_eq!(err.offset, 15);
 }

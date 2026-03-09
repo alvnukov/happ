@@ -1,10 +1,10 @@
+use crate::go_compat::typedvalue::{
+    decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_is_nil,
+};
 use crate::go_compat::typeutil::{
     is_go_bytes_slice, is_map_object, option_string_like_bytes, option_type_name_for_template,
 };
 use crate::go_compat::valuefmt::format_value_like_go;
-use crate::go_compat::typedvalue::{
-    decode_go_typed_map_value, decode_go_typed_slice_value, go_bytes_is_nil,
-};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,12 +46,16 @@ pub fn eq_values(a: &Option<Value>, b: &Option<Value>) -> Result<bool, CompareEr
         return match (k1, k2) {
             (Some(BasicKind::Int), Some(BasicKind::Uint)) => match (number_kind(a), number_kind(b))
             {
-                (Some(NumberKind::Int(x)), Some(NumberKind::Uint(y))) => Ok(x >= 0 && (x as u64) == y),
+                (Some(NumberKind::Int(x)), Some(NumberKind::Uint(y))) => {
+                    Ok(x >= 0 && (x as u64) == y)
+                }
                 _ => Err(CompareError::IncompatibleTypes),
             },
             (Some(BasicKind::Uint), Some(BasicKind::Int)) => match (number_kind(a), number_kind(b))
             {
-                (Some(NumberKind::Uint(x)), Some(NumberKind::Int(y))) => Ok(y >= 0 && x == (y as u64)),
+                (Some(NumberKind::Uint(x)), Some(NumberKind::Int(y))) => {
+                    Ok(y >= 0 && x == (y as u64))
+                }
                 _ => Err(CompareError::IncompatibleTypes),
             },
             _ => {
@@ -166,7 +170,9 @@ fn number_kind(v: &Option<Value>) -> Option<NumberKind> {
 
 fn eq_non_basic_values(a: &Option<Value>, b: &Option<Value>) -> Result<bool, CompareError> {
     if !can_compare(a, b) {
-        return Err(CompareError::Detail(format_non_comparable_types_reason(a, b)));
+        return Err(CompareError::Detail(format_non_comparable_types_reason(
+            a, b,
+        )));
     }
     if is_nil(a) || is_nil(b) {
         return Ok(is_nil(a) == is_nil(b));
@@ -304,9 +310,18 @@ mod tests {
 
     #[test]
     fn lt_and_related_ops_follow_go_signed_unsigned_rules() {
-        assert_eq!(lt_values(&Some(json!(-1)), &Some(json!(1u64))).expect("lt"), true);
-        assert_eq!(lt_values(&Some(json!(1u64)), &Some(json!(-1))).expect("lt"), false);
-        assert_eq!(le_values(&Some(json!(1)), &Some(json!(1))).expect("le"), true);
+        assert_eq!(
+            lt_values(&Some(json!(-1)), &Some(json!(1u64))).expect("lt"),
+            true
+        );
+        assert_eq!(
+            lt_values(&Some(json!(1u64)), &Some(json!(-1))).expect("lt"),
+            false
+        );
+        assert_eq!(
+            le_values(&Some(json!(1)), &Some(json!(1))).expect("le"),
+            true
+        );
     }
 
     #[test]

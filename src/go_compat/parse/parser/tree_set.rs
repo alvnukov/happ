@@ -4,9 +4,7 @@ use crate::go_compat::compat::parse_go_quoted_prefix;
 use crate::go_compat::parse::{
     parse_action_report_with_options, ControlAction, ControlKind, ParseCompatOptions,
 };
-use crate::go_compat::scan::{
-    GoTemplateToken,
-};
+use crate::go_compat::scan::GoTemplateToken;
 
 use super::super::tree::ParseError;
 use super::action_inner_trimmed;

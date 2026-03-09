@@ -4,24 +4,21 @@ mod executor;
 mod functions;
 // Backward-compatible alias; canonical module is `crate::go_compat`.
 pub mod go_compat;
-pub(crate) mod parser;
 mod planner;
 mod scanner;
 mod typedvalue;
 
+pub use crate::go_compat::parse::report::ParseCompatOptions;
+pub use crate::go_compat::scan::{GoTemplateActionSpan, GoTemplateScanError, GoTemplateToken};
 pub use executor::{
-    FunctionDispatchMode,
-    LogicBackend,
     render_template_native, render_template_native_with_options,
-    render_template_native_with_resolver, MissingValueMode, NativeFunctionResolver,
-    NativeFunctionResolverError, NativeRenderError, NativeRenderOptions,
+    render_template_native_with_resolver, FunctionDispatchMode, LogicBackend, MissingValueMode,
+    NativeFunctionResolver, NativeFunctionResolverError, NativeRenderError, NativeRenderOptions,
 };
 pub use functions::{
     collect_function_calls_in_action, collect_function_calls_in_template, escape_template_action,
     normalize_values_global_context,
 };
-pub use crate::go_compat::parse::report::ParseCompatOptions;
-pub use crate::go_compat::scan::{GoTemplateActionSpan, GoTemplateScanError, GoTemplateToken};
 pub use planner::{plan_template_execution, CompatibilityReason, CompatibilityTier, ExecutionPlan};
 pub use scanner::{
     collect_action_spans, contains_template_markup, parse_template_tokens,

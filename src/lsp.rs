@@ -495,6 +495,7 @@ fn render_manifest_for_entity(
         Some("happ-lsp-preview"),
         &values_yaml,
         None,
+        false,
     )
     .map_err(|e| format!("prepare preview chart: {e}"))?;
 

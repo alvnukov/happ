@@ -113,8 +113,8 @@ fn value_to_i64(v: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        map_key_arg, option_string_like_bytes, parse_slice_like_index, value_type_name_for_template,
-        MapKeyArg, ParseSliceLikeIndexError, SliceLikeIndexMode,
+        map_key_arg, option_string_like_bytes, parse_slice_like_index,
+        value_type_name_for_template, MapKeyArg, ParseSliceLikeIndexError, SliceLikeIndexMode,
     };
     use serde_json::json;
 
@@ -135,7 +135,10 @@ mod tests {
 
     #[test]
     fn map_key_arg_supports_utf8_and_rejects_wrong_types() {
-        assert_eq!(map_key_arg(Some(&json!("k"))), MapKeyArg::Key("k".to_string()));
+        assert_eq!(
+            map_key_arg(Some(&json!("k"))),
+            MapKeyArg::Key("k".to_string())
+        );
         assert_eq!(map_key_arg(Some(&json!(1))), MapKeyArg::WrongType);
     }
 
@@ -151,7 +154,8 @@ mod tests {
         let b = crate::go_compat::typedvalue::encode_go_bytes_value(&[1, 2]);
         assert_eq!(value_type_name_for_template(&b), "[]uint8");
 
-        let t = crate::go_compat::typedvalue::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
+        let t =
+            crate::go_compat::typedvalue::encode_go_typed_slice_value("int", Some(vec![json!(1)]));
         assert_eq!(value_type_name_for_template(&t), "[]int");
     }
 }

@@ -80,7 +80,8 @@ fn parse_variable_token_at(src: &str, start: usize) -> Option<(&str, usize)> {
 }
 
 fn starts_with_at(src: &str, start: usize, needle: &str) -> bool {
-    src.get(start..).is_some_and(|tail| tail.starts_with(needle))
+    src.get(start..)
+        .is_some_and(|tail| tail.starts_with(needle))
 }
 
 fn skip_ascii_ws(src: &str, mut i: usize) -> usize {
