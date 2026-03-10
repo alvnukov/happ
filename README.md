@@ -182,6 +182,13 @@ use happ
 happ --web --web-open-browser=false
 ```
 
+## Studio mode (no port)
+
+```bash
+# studio backend over stdio (no HTTP listener)
+happ --studio
+```
+
 ## LSP mode (experimental)
 
 `happ` provides an experimental Language Server entrypoint:

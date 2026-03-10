@@ -16,6 +16,7 @@ const DEFAULT_MAX_UPLOAD_PATH_BYTES: usize = 1_024;
 const DEFAULT_MAX_UPLOAD_PATH_DEPTH: usize = 24;
 const DEFAULT_MAX_FS_LIST_ENTRIES: usize = 20_000;
 const DEFAULT_MAX_CHART_VALUES_BYTES: usize = 8 * 1024 * 1024;
+const HAPP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn serve(
     addr: &str,
@@ -1471,26 +1472,68 @@ fn import_payload(
             if docs.is_empty() {
                 return Err("no manifests found for import".to_string());
             }
-            let values = crate::convert::build_values(&args, &docs)
+            let base_values = crate::convert::build_values(&args, &docs)
                 .map_err(|e| format!("convert error: {e}"))?;
-            let out = crate::output::values_yaml(&values)
+            let (values, include_report) = if include_profiles {
+                crate::output::optimize_values_with_include_profiles(
+                    &base_values,
+                    min_include_bytes,
+                )
+            } else {
+                (
+                    base_values,
+                    crate::output::IncludeProfileOptimizationReport::default(),
+                )
+            };
+            let out = crate::output::values_yaml_with_yaml_anchors(&values, yaml_anchors)
                 .map_err(|e| format!("values encode error: {e}"))?;
+            let optimize_note = if include_profiles {
+                format!(
+                    " _include profiles added: {}.",
+                    include_report.profiles_added
+                )
+            } else {
+                String::new()
+            };
             Ok((
                 out,
-                format!("Imported {} document(s) from manifests.", docs.len()),
+                format!(
+                    "Imported {} document(s) from manifests.{}",
+                    docs.len(),
+                    optimize_note
+                ),
                 docs.len(),
             ))
         }
         "compose" => {
             let rep = crate::composeinspect::load(&args.path)
                 .map_err(|e| format!("compose inspect error: {e}"))?;
-            let values = crate::composeimport::build_values(&args, &rep);
-            let out = crate::output::values_yaml(&values)
+            let base_values = crate::composeimport::build_values(&args, &rep);
+            let (values, include_report) = if include_profiles {
+                crate::output::optimize_values_with_include_profiles(
+                    &base_values,
+                    min_include_bytes,
+                )
+            } else {
+                (
+                    base_values,
+                    crate::output::IncludeProfileOptimizationReport::default(),
+                )
+            };
+            let out = crate::output::values_yaml_with_yaml_anchors(&values, yaml_anchors)
                 .map_err(|e| format!("values encode error: {e}"))?;
             let count = rep.services.len();
+            let optimize_note = if include_profiles {
+                format!(
+                    " _include profiles added: {}.",
+                    include_report.profiles_added
+                )
+            } else {
+                String::new()
+            };
             Ok((
                 out,
-                format!("Imported {} compose service(s).", count),
+                format!("Imported {} compose service(s).{}", count, optimize_note),
                 count,
             ))
         }
@@ -3072,6 +3115,7 @@ fn write_response(
 pub fn render_page_html(source_yaml: &str, generated_values_yaml: &str) -> String {
     let model = serde_json::json!({
         "title": "happ inspect",
+        "version": HAPP_VERSION,
         "utilities": [
             {
                 "id": "inspect",
@@ -3109,6 +3153,7 @@ pub fn render_compose_page_html(
 ) -> String {
     let model = serde_json::json!({
         "title": "happ compose-inspect",
+        "version": HAPP_VERSION,
         "utilities": [
             {
                 "id": "compose-inspect",
@@ -3143,6 +3188,7 @@ pub fn render_compose_page_html(
 pub fn render_tools_page_html(stdin_text: Option<&str>) -> String {
     let model = serde_json::json!({
         "title": "happ web",
+        "version": HAPP_VERSION,
         "stdinText": stdin_text.unwrap_or(""),
         "utilities": [
             {
@@ -3222,6 +3268,18 @@ body {{
 .brand {{ display:flex; flex-direction:column; gap:2px; }}
 .title {{ margin:0; font-size:42px; line-height:1.04; letter-spacing:-0.03em; font-weight:800; color:#f3f4f7; }}
 .subtitle {{ margin:0; color:var(--muted); font-size:14px; }}
+.version-badge {{
+  display:inline-flex;
+  align-items:center;
+  margin-left:8px;
+  padding:1px 8px;
+  border-radius:999px;
+  border:1px solid #56657f;
+  color:#d6e3f7;
+  background:#222a36;
+  font-size:12px;
+  letter-spacing:0.02em;
+}}
 .top-actions {{ display:flex; align-items:center; gap:10px; }}
 button {{
   border:1px solid var(--border);
@@ -4244,7 +4302,7 @@ window.addEventListener('error', function(e) {{
   <div class='top'>
     <div class='brand'>
       <h2 class='title'>{{{{ model.title }}}}</h2>
-      <div class='subtitle'>Fast local toolset for YAML/JSON, jq and semantic diff.</div>
+      <div class='subtitle'>Fast local toolset for YAML/JSON, jq and semantic diff.<span class='version-badge'>v{{{{ model.version || "dev" }}}}</span></div>
     </div>
     <div class='top-actions'>
       <button @click='exitUi'>Exit</button>
@@ -4453,7 +4511,8 @@ window.addEventListener('error', function(e) {{
         <strong>Import configuration</strong>
         <button class='secondary' @click='loadSampleMainImport'>Sample config</button>
         <button class='secondary' @click='resetMainImportConfig'>Reset defaults</button>
-        <button class='secondary' @click='closeMainImportConfig'>Close</button>
+        <button class='secondary' @click='cancelMainImportConfig'>Cancel</button>
+        <button class='primary' @click='confirmMainImportConfig'>OK</button>
       </div>
       <div class='import-config compact'>
         <div class='import-section'>
@@ -4508,8 +4567,8 @@ window.addEventListener('error', function(e) {{
               <div class='checks-inline'>
                 <label class='chk'><input type='checkbox' v-model='mainImportIncludeStatus'/> include status</label>
                 <label class='chk'><input type='checkbox' v-model='mainImportIncludeCrds'/> include CRDs</label>
-                <label class='chk' v-if='mainImportSourceType === "chart"'><input type='checkbox' v-model='mainImportYamlAnchors'/> YAML anchors optimize</label>
-                <label class='chk' v-if='mainImportSourceType === "chart"'><input type='checkbox' v-model='mainImportIncludeProfiles'/> _include optimize (recursive merge)</label>
+                <label class='chk'><input type='checkbox' v-model='mainImportYamlAnchors'/> YAML anchors optimize</label>
+                <label class='chk'><input type='checkbox' v-model='mainImportIncludeProfiles'/> _include optimize (recursive merge)</label>
               </div>
               <div class='field-hint'>Use CRDs when you want generated chart to include source chart CRDs.</div>
             </div>
@@ -5091,6 +5150,7 @@ const app = Vue.createApp({{
       mainImportSourceCount: 0,
       mainImportRunning: false,
       mainImportConfigOpen: false,
+      mainImportConfigDraft: null,
       mainImportChartValuesEditor: '',
       mainImportLoadedChartValues: '',
       mainImportUseChartValuesEditor: false,
@@ -5924,12 +5984,6 @@ const app = Vue.createApp({{
     }},
     mainImportSourceType() {{
       this.saveSettings();
-      if (this.mainImportSourceType !== 'chart' && this.mainImportYamlAnchors) {{
-        this.mainImportYamlAnchors = false;
-      }}
-      if (this.mainImportSourceType !== 'chart' && this.mainImportIncludeProfiles) {{
-        this.mainImportIncludeProfiles = false;
-      }}
       if (this.mainImportSourceCm && !this.mainImportSourceCmUpdating) {{
         this.mainImportSourceCm.setValue(this.mainImportSourceEditorContent || '');
       }}
@@ -6684,10 +6738,66 @@ const app = Vue.createApp({{
       }}
       this.mainImportSectionCollapsed = out;
     }},
+    captureMainImportConfigState() {{
+      return {{
+        mainImportSourceType: this.mainImportSourceType,
+        mainImportPath: this.mainImportPath,
+        mainImportEnv: this.mainImportEnv,
+        mainImportGroupName: this.mainImportGroupName,
+        mainImportGroupType: this.mainImportGroupType,
+        mainImportImportStrategy: this.mainImportImportStrategy,
+        mainImportReleaseName: this.mainImportReleaseName,
+        mainImportNamespace: this.mainImportNamespace,
+        mainImportMinIncludeBytes: this.mainImportMinIncludeBytes,
+        mainImportIncludeStatus: this.mainImportIncludeStatus,
+        mainImportIncludeCrds: this.mainImportIncludeCrds,
+        mainImportYamlAnchors: this.mainImportYamlAnchors,
+        mainImportIncludeProfiles: this.mainImportIncludeProfiles,
+        mainImportKubeVersion: this.mainImportKubeVersion,
+        mainImportValuesFilesText: this.mainImportValuesFilesText,
+        mainImportSetText: this.mainImportSetText,
+        mainImportExtraSetText: this.mainImportExtraSetText,
+        mainImportApiVersionsText: this.mainImportApiVersionsText,
+        mainImportAllowTemplateIncludesText: this.mainImportAllowTemplateIncludesText,
+        mainImportUnsupportedTemplateMode: this.mainImportUnsupportedTemplateMode,
+      }};
+    }},
+    applyMainImportConfigState(state) {{
+      if (!state || typeof state !== 'object') return;
+      this.mainImportSourceType = String(state.mainImportSourceType || 'chart');
+      this.mainImportPath = String(state.mainImportPath || '');
+      this.mainImportEnv = String(state.mainImportEnv || 'dev');
+      this.mainImportGroupName = String(state.mainImportGroupName || 'apps-k8s-manifests');
+      this.mainImportGroupType = String(state.mainImportGroupType || 'apps-k8s-manifests');
+      this.mainImportImportStrategy = String(state.mainImportImportStrategy || 'helpers');
+      this.mainImportReleaseName = String(state.mainImportReleaseName || 'imported');
+      this.mainImportNamespace = String(state.mainImportNamespace || '');
+      this.mainImportMinIncludeBytes = Number.isFinite(Number(state.mainImportMinIncludeBytes))
+        ? Number(state.mainImportMinIncludeBytes)
+        : 24;
+      this.mainImportIncludeStatus = !!state.mainImportIncludeStatus;
+      this.mainImportIncludeCrds = !!state.mainImportIncludeCrds;
+      this.mainImportYamlAnchors = !!state.mainImportYamlAnchors;
+      this.mainImportIncludeProfiles = !!state.mainImportIncludeProfiles;
+      this.mainImportKubeVersion = String(state.mainImportKubeVersion || '');
+      this.mainImportValuesFilesText = String(state.mainImportValuesFilesText || '');
+      this.mainImportSetText = String(state.mainImportSetText || '');
+      this.mainImportExtraSetText = String(state.mainImportExtraSetText || '');
+      this.mainImportApiVersionsText = String(state.mainImportApiVersionsText || '');
+      this.mainImportAllowTemplateIncludesText = String(state.mainImportAllowTemplateIncludesText || '');
+      this.mainImportUnsupportedTemplateMode = String(state.mainImportUnsupportedTemplateMode || 'error');
+    }},
     openMainImportConfig() {{
+      this.mainImportConfigDraft = this.captureMainImportConfigState();
       this.mainImportConfigOpen = true;
     }},
-    closeMainImportConfig() {{
+    confirmMainImportConfig() {{
+      this.mainImportConfigDraft = null;
+      this.mainImportConfigOpen = false;
+    }},
+    cancelMainImportConfig() {{
+      this.applyMainImportConfigState(this.mainImportConfigDraft);
+      this.mainImportConfigDraft = null;
       this.mainImportConfigOpen = false;
     }},
     foldMainImportLevel(level) {{
@@ -7012,8 +7122,8 @@ const app = Vue.createApp({{
             minIncludeBytes: Number(this.mainImportMinIncludeBytes || 24),
             includeStatus: !!this.mainImportIncludeStatus,
             includeCrds: !!this.mainImportIncludeCrds,
-            yamlAnchors: this.mainImportSourceType === 'chart' && !!this.mainImportYamlAnchors,
-            includeProfiles: this.mainImportSourceType === 'chart' && !!this.mainImportIncludeProfiles,
+            yamlAnchors: !!this.mainImportYamlAnchors,
+            includeProfiles: !!this.mainImportIncludeProfiles,
             kubeVersion: this.mainImportKubeVersion,
             valuesFiles: this.parseLines(this.mainImportValuesFilesText),
             setValues: this.parseLines(this.mainImportSetText),
@@ -7180,8 +7290,8 @@ const app = Vue.createApp({{
             libraryChartPath: this.mainImportLibraryChartPath || undefined,
             valuesYaml: this.mainImportOutput,
             minIncludeBytes: Number(this.mainImportMinIncludeBytes || 24),
-            yamlAnchors: this.mainImportSourceType === 'chart' && !!this.mainImportYamlAnchors,
-            includeProfiles: this.mainImportSourceType === 'chart' && !!this.mainImportIncludeProfiles,
+            yamlAnchors: !!this.mainImportYamlAnchors,
+            includeProfiles: !!this.mainImportIncludeProfiles,
           }}),
           signal: ctrl && ctrl.signal ? ctrl.signal : undefined,
         }});
@@ -8919,6 +9029,9 @@ mod tests {
         assert!(html.contains("select enabled"));
         assert!(html.contains("Structured convert"));
         assert!(html.contains("localStorage"));
+        assert!(html.contains("version-badge"));
+        assert!(html.contains(&format!("v{{{{ model.version || \"dev\" }}}}")));
+        assert!(html.contains(HAPP_VERSION));
         assert!(html.contains("Copy values"));
         assert!(html.contains("Save as chart"));
         assert!(html.contains("Clear values"));

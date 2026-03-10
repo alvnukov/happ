@@ -7,11 +7,21 @@ pub const DEFAULT_COMPOSE_STUDIO_ADDR: &str = "127.0.0.1:18090";
 #[derive(Parser, Debug)]
 #[command(
     name = "happ",
+    version = env!("CARGO_PKG_VERSION"),
     about = "happ imports Helm chart render output or raw manifests into a helm-apps-based consumer chart"
 )]
 pub struct Cli {
     #[arg(long, global = true, default_value_t = false, action = ArgAction::SetTrue, help = "Start web utilities UI")]
     pub web: bool,
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        conflicts_with_all = ["web", "web_stdin", "web_addr", "web_open_browser"],
+        help = "Start studio backend over stdio (no HTTP port)"
+    )]
+    pub studio: bool,
     #[arg(
         long = "web-stdin",
         global = true,
@@ -408,6 +418,7 @@ mod tests {
         let cli = Cli::try_parse_from(["happ", "--web", "--web-addr", "127.0.0.1:9999"])
             .expect("parse web");
         assert!(cli.web);
+        assert!(!cli.studio);
         assert!(!cli.web_stdin);
         assert_eq!(cli.web_addr, "127.0.0.1:9999");
         assert!(cli.web_open_browser);
@@ -425,6 +436,7 @@ mod tests {
         ])
         .expect("parse web no open");
         assert!(cli.web);
+        assert!(!cli.studio);
         assert!(!cli.web_stdin);
         assert_eq!(cli.web_addr, "127.0.0.1:9999");
         assert!(!cli.web_open_browser);
@@ -435,16 +447,39 @@ mod tests {
     fn parses_top_level_web_mode_with_stdin_opt_in() {
         let cli = Cli::try_parse_from(["happ", "--web", "--web-stdin"]).expect("parse web stdin");
         assert!(cli.web);
+        assert!(!cli.studio);
         assert!(cli.web_stdin);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_top_level_studio_mode_without_subcommand() {
+        let cli = Cli::try_parse_from(["happ", "--studio"]).expect("parse studio");
+        assert!(!cli.web);
+        assert!(cli.studio);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn rejects_top_level_web_and_studio_combination() {
+        let err = Cli::try_parse_from(["happ", "--web", "--studio"]).expect_err("arg conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
     fn default_ports_for_web_and_studio_are_stable_and_distinct() {
         let cli = Cli::try_parse_from(["happ"]).expect("parse defaults");
         assert_eq!(cli.web_addr, DEFAULT_WEB_ADDR);
+        assert!(!cli.studio);
         assert_ne!(DEFAULT_WEB_ADDR, DEFAULT_STUDIO_ADDR);
         assert_ne!(DEFAULT_STUDIO_ADDR, DEFAULT_COMPOSE_STUDIO_ADDR);
+    }
+
+    #[test]
+    fn supports_top_level_version_flag() {
+        let err = Cli::try_parse_from(["happ", "--version"]).expect_err("display version");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

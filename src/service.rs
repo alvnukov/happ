@@ -35,6 +35,18 @@ pub fn run() -> Result<(), Error> {
 }
 
 pub fn run_with(cli: Cli) -> Result<(), Error> {
+    if cli.studio && cli.command.is_none() {
+        crate::lsp::run(crate::cli::LspArgs {
+            stdio: true,
+            parent_pid: None,
+        })?;
+        return Ok(());
+    }
+    if cli.studio {
+        return Err(Error::Convert(
+            "--studio cannot be combined with subcommands".to_string(),
+        ));
+    }
     if cli.web && cli.command.is_none() {
         let stdin_text = if cli.web_stdin {
             read_stdin_to_eof()?
@@ -46,7 +58,7 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
     }
     let Some(command) = cli.command else {
         return Err(Error::Convert(
-            "no command provided (use --help or --web)".to_string(),
+            "no command provided (use --help, --web or --studio)".to_string(),
         ));
     };
     match command {
@@ -713,6 +725,7 @@ mod tests {
     fn dyff_fail_on_diff_returns_error() {
         let cli = Cli {
             web: false,
+            studio: false,
             web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
@@ -899,6 +912,7 @@ mod tests {
     fn inspect_command_is_not_stubbed() {
         let cli = Cli {
             web: false,
+            studio: false,
             web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
@@ -932,6 +946,7 @@ mod tests {
         fs::write(&p, "global:\n  env: dev\n").expect("write");
         let cli = Cli {
             web: false,
+            studio: false,
             web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
@@ -953,6 +968,7 @@ mod tests {
         fs::write(&p, "global:\n  env: [dev\n").expect("write");
         let cli = Cli {
             web: false,
+            studio: false,
             web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
@@ -973,6 +989,7 @@ mod tests {
         let out = td.path().join("happ.bash");
         let cli = Cli {
             web: false,
+            studio: false,
             web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
@@ -1079,6 +1096,7 @@ mod tests {
     fn verify_equivalence_rejected_for_manifests_mode() {
         let cli = Cli {
             web: false,
+            studio: false,
             web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
@@ -1095,6 +1113,7 @@ mod tests {
     fn verify_equivalence_rejected_for_compose_mode() {
         let cli = Cli {
             web: false,
+            studio: false,
             web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
@@ -1113,6 +1132,7 @@ mod tests {
         let out = td.path().join("out");
         let cli = Cli {
             web: false,
+            studio: false,
             web_stdin: false,
             web_addr: "127.0.0.1:8088".to_string(),
             web_open_browser: true,
