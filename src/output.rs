@@ -60,6 +60,119 @@ pub fn write_values(path: Option<&str>, values: &Value) -> Result<(), Error> {
     write_values_with_yaml_anchors(path, values, false)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IncludeProfileOptimizationReport {
+    pub profiles_added: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncludeProfileCandidate {
+    common: Mapping,
+    members: Vec<String>,
+    bytes: usize,
+    score: usize,
+    signature: String,
+}
+
+pub fn optimize_values_with_include_profiles(
+    values: &Value,
+    min_profile_bytes: usize,
+) -> (Value, IncludeProfileOptimizationReport) {
+    let Some(mut root) = values.as_mapping().cloned() else {
+        return (values.clone(), IncludeProfileOptimizationReport::default());
+    };
+
+    let global_key = Value::String("global".to_string());
+    let had_global = root.contains_key(&global_key);
+    if root.get(&global_key).is_some_and(|v| !v.is_mapping()) {
+        return (
+            Value::Mapping(root),
+            IncludeProfileOptimizationReport::default(),
+        );
+    }
+
+    let mut global = root
+        .remove(&global_key)
+        .and_then(|v| v.as_mapping().cloned())
+        .unwrap_or_default();
+    let includes_key = Value::String("_includes".to_string());
+    let mut includes = global
+        .remove(&includes_key)
+        .and_then(|v| v.as_mapping().cloned())
+        .unwrap_or_default();
+
+    let mut include_names: BTreeSet<String> = includes
+        .keys()
+        .filter_map(|k| k.as_str().map(ToString::to_string))
+        .collect();
+    let mut profiles_added = 0usize;
+    let profile_min_bytes = min_profile_bytes.max(1);
+
+    let mut group_names: Vec<String> = root
+        .keys()
+        .filter_map(|k| k.as_str().map(ToString::to_string))
+        .filter(|k| k != "global")
+        .collect();
+    group_names.sort();
+
+    for group_name in group_names {
+        let group_key = Value::String(group_name.clone());
+        let Some(group_map) = root.get_mut(&group_key).and_then(Value::as_mapping_mut) else {
+            continue;
+        };
+        let mut group_profile_seq = 0usize;
+
+        loop {
+            let Some(candidate) =
+                select_best_include_profile_candidate(group_map, profile_min_bytes)
+            else {
+                break;
+            };
+
+            let profile_name =
+                next_include_profile_name(&group_name, group_profile_seq, &include_names);
+            let _ = include_names.insert(profile_name.clone());
+            includes.insert(
+                Value::String(profile_name.clone()),
+                Value::Mapping(candidate.common.clone()),
+            );
+            profiles_added += 1;
+            group_profile_seq += 1;
+
+            for entity_name in candidate.members {
+                let entity_key = Value::String(entity_name);
+                let Some(entity_map) = group_map.get(&entity_key).and_then(Value::as_mapping)
+                else {
+                    continue;
+                };
+                let mut reduced = subtract_common_mapping(entity_map, &candidate.common);
+                inject_include_ref(&mut reduced, &profile_name);
+                group_map.insert(entity_key, Value::Mapping(reduced));
+            }
+        }
+    }
+
+    if profiles_added == 0 {
+        if had_global || !global.is_empty() || !includes.is_empty() {
+            if !includes.is_empty() {
+                global.insert(includes_key, Value::Mapping(includes));
+            }
+            root.insert(global_key, Value::Mapping(global));
+        }
+        return (
+            Value::Mapping(root),
+            IncludeProfileOptimizationReport::default(),
+        );
+    }
+
+    global.insert(includes_key, Value::Mapping(includes));
+    root.insert(global_key, Value::Mapping(global));
+    (
+        Value::Mapping(root),
+        IncludeProfileOptimizationReport { profiles_added },
+    )
+}
+
 pub fn write_values_with_yaml_anchors(
     path: Option<&str>,
     values: &Value,
@@ -73,6 +186,428 @@ pub fn write_values_with_yaml_anchors(
         out.write_all(body.as_bytes())?;
     }
     Ok(())
+}
+
+fn intersect_mapping_in_place(common: &mut Mapping, other: &Mapping) {
+    let keys: Vec<Value> = common.keys().cloned().collect();
+    for key in keys {
+        if key.as_str() == Some("_include") {
+            common.remove(&key);
+            continue;
+        }
+        let Some(common_value) = common.get(&key).cloned() else {
+            continue;
+        };
+        let Some(other_value) = other.get(&key) else {
+            common.remove(&key);
+            continue;
+        };
+        match (common_value.as_mapping(), other_value.as_mapping()) {
+            (Some(common_map), Some(other_map)) => {
+                let mut nested = common_map.clone();
+                intersect_mapping_in_place(&mut nested, other_map);
+                if nested.is_empty() {
+                    common.remove(&key);
+                } else {
+                    common.insert(key, Value::Mapping(nested));
+                }
+            }
+            _ => {
+                if &common_value != other_value {
+                    common.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+fn select_best_include_profile_candidate(
+    group_map: &Mapping,
+    min_profile_bytes: usize,
+) -> Option<IncludeProfileCandidate> {
+    let mut entity_names: Vec<String> = group_map
+        .keys()
+        .filter_map(|k| k.as_str().map(ToString::to_string))
+        .collect();
+    entity_names.sort();
+
+    let entities: Vec<(String, Mapping)> = entity_names
+        .into_iter()
+        .filter_map(|name| {
+            let key = Value::String(name.clone());
+            group_map
+                .get(&key)
+                .and_then(Value::as_mapping)
+                .cloned()
+                .map(|m| (name, m))
+        })
+        .collect();
+    if entities.len() < 2 {
+        return None;
+    }
+
+    let mut best: Option<IncludeProfileCandidate> = None;
+    for i in 0..entities.len() {
+        for j in (i + 1)..entities.len() {
+            let mut common = entities[i].1.clone();
+            intersect_mapping_in_place(&mut common, &entities[j].1);
+            if common.is_empty() {
+                continue;
+            }
+
+            let bytes = mapping_yaml_size(&common);
+            if bytes < min_profile_bytes {
+                continue;
+            }
+
+            let members: Vec<String> = entities
+                .iter()
+                .filter_map(|(name, entity_map)| {
+                    if mapping_contains(entity_map, &common) {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if members.len() < 2 {
+                continue;
+            }
+
+            let score = bytes.saturating_mul(members.len().saturating_sub(1));
+            if score == 0 {
+                continue;
+            }
+            let signature = mapping_signature(&common);
+            let candidate = IncludeProfileCandidate {
+                common,
+                members,
+                bytes,
+                score,
+                signature,
+            };
+            let should_replace = match best.as_ref() {
+                Some(current) => include_candidate_better(&candidate, current),
+                None => true,
+            };
+            if should_replace {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+fn include_candidate_better(
+    candidate: &IncludeProfileCandidate,
+    current: &IncludeProfileCandidate,
+) -> bool {
+    if candidate.score != current.score {
+        return candidate.score > current.score;
+    }
+    if candidate.bytes != current.bytes {
+        return candidate.bytes > current.bytes;
+    }
+    if candidate.members.len() != current.members.len() {
+        return candidate.members.len() > current.members.len();
+    }
+    if candidate.members != current.members {
+        return candidate.members < current.members;
+    }
+    candidate.signature < current.signature
+}
+
+fn mapping_contains(haystack: &Mapping, needle: &Mapping) -> bool {
+    for (key, needle_value) in needle {
+        let Some(haystack_value) = haystack.get(key) else {
+            return false;
+        };
+        match (haystack_value.as_mapping(), needle_value.as_mapping()) {
+            (Some(haystack_map), Some(needle_map)) => {
+                if !mapping_contains(haystack_map, needle_map) {
+                    return false;
+                }
+            }
+            _ => {
+                if haystack_value != needle_value {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn subtract_common_mapping(source: &Mapping, common: &Mapping) -> Mapping {
+    let mut out = Mapping::new();
+    for (key, source_value) in source {
+        if key.as_str() == Some("_include") {
+            out.insert(key.clone(), source_value.clone());
+            continue;
+        }
+        let Some(common_value) = common.get(key) else {
+            out.insert(key.clone(), source_value.clone());
+            continue;
+        };
+        match (source_value.as_mapping(), common_value.as_mapping()) {
+            (Some(source_map), Some(common_map)) => {
+                let nested = subtract_common_mapping(source_map, common_map);
+                if !nested.is_empty() {
+                    out.insert(key.clone(), Value::Mapping(nested));
+                }
+            }
+            _ => {
+                if source_value != common_value {
+                    out.insert(key.clone(), source_value.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn inject_include_ref(target: &mut Mapping, profile_name: &str) {
+    let key = Value::String("_include".to_string());
+    if let Some(existing) = target.get(&key).cloned() {
+        let mut refs = normalize_include_refs(Some(&existing));
+        refs.push(profile_name.to_string());
+        let deduped = dedupe_preserve_order(refs);
+        if deduped.len() == 1 {
+            target.insert(key, Value::String(deduped[0].clone()));
+        } else {
+            target.insert(
+                key,
+                Value::Sequence(deduped.into_iter().map(Value::String).collect()),
+            );
+        }
+        return;
+    }
+    target.insert(key, Value::String(profile_name.to_string()));
+}
+
+fn normalize_include_refs(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            }
+        }
+        Some(Value::Sequence(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::trim))
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn dedupe_preserve_order(items: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if seen.insert(item.clone()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn mapping_yaml_size(map: &Mapping) -> usize {
+    serde_yaml::to_string(&Value::Mapping(map.clone()))
+        .map(|s| s.len())
+        .unwrap_or(0usize)
+}
+
+fn mapping_signature(map: &Mapping) -> String {
+    serde_yaml::to_string(&Value::Mapping(map.clone())).unwrap_or_default()
+}
+
+fn next_include_profile_name(
+    group_name: &str,
+    group_profile_seq: usize,
+    existing: &BTreeSet<String>,
+) -> String {
+    let group = normalize_include_profile_component(group_name);
+    let base = if group_profile_seq == 0 {
+        format!("default_{group}")
+    } else if group_profile_seq == 1 {
+        format!("common_{group}")
+    } else {
+        format!("common_{group}_{group_profile_seq}")
+    };
+    if !existing.contains(&base) {
+        return base;
+    }
+    let mut idx = 2usize;
+    loop {
+        let candidate = format!("{base}_{idx}");
+        if !existing.contains(&candidate) {
+            return candidate;
+        }
+        idx += 1;
+    }
+}
+
+fn normalize_include_profile_component(raw: &str) -> String {
+    let tokens = merge_include_compound_tokens(split_include_name_tokens(raw));
+    if tokens.is_empty() {
+        return "group".to_string();
+    }
+
+    let mut normalized = Vec::<String>::new();
+    for (idx, token) in tokens.into_iter().enumerate() {
+        let canonical = canonicalize_include_name_token(token);
+        if canonical.is_empty() {
+            continue;
+        }
+        if idx > 0 && is_include_name_stopword(canonical.as_str()) {
+            continue;
+        }
+        normalized.push(canonical);
+    }
+    if normalized.is_empty() {
+        return "group".to_string();
+    }
+
+    normalized = squash_include_name_tokens(normalized);
+    let max_parts = 3usize;
+    let compact = if normalized.len() <= max_parts {
+        normalized
+    } else {
+        vec![
+            normalized[0].clone(),
+            normalized[normalized.len() - 2].clone(),
+            normalized[normalized.len() - 1].clone(),
+        ]
+    };
+
+    let mut out = compact
+        .into_iter()
+        .map(|mut token| {
+            const MAX_PART_LEN: usize = 14;
+            if token.len() > MAX_PART_LEN {
+                token.truncate(MAX_PART_LEN);
+            }
+            token
+        })
+        .collect::<Vec<_>>()
+        .join("_");
+    if out.is_empty() {
+        out.push_str("group");
+    }
+    if !out
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        .unwrap_or(false)
+    {
+        out.insert_str(0, "group_");
+    }
+    out
+}
+
+fn split_include_name_tokens(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let chars = raw.chars().collect::<Vec<_>>();
+    for (idx, ch) in chars.iter().copied().enumerate() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        let should_split = if idx == 0 {
+            false
+        } else {
+            let prev = chars[idx - 1];
+            let next = chars.get(idx + 1).copied();
+            prev.is_ascii_alphanumeric()
+                && ((prev.is_ascii_lowercase() && ch.is_ascii_uppercase())
+                    || (prev.is_ascii_digit() && ch.is_ascii_alphabetic())
+                    || (prev.is_ascii_alphabetic() && ch.is_ascii_digit())
+                    || (prev.is_ascii_uppercase()
+                        && ch.is_ascii_uppercase()
+                        && next.map(|n| n.is_ascii_lowercase()).unwrap_or(false)))
+        };
+        if should_split && !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+
+        current.push(ch.to_ascii_lowercase());
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn merge_include_compound_tokens(tokens: Vec<String>) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if i + 2 < tokens.len()
+            && tokens[i].len() == 1
+            && tokens[i + 2].len() == 1
+            && tokens[i + 1].chars().all(|ch| ch.is_ascii_digit())
+            && tokens[i] == "k"
+            && tokens[i + 2] == "s"
+        {
+            out.push(format!("{}{}{}", tokens[i], tokens[i + 1], tokens[i + 2]));
+            i += 3;
+            continue;
+        }
+        out.push(tokens[i].clone());
+        i += 1;
+    }
+    out
+}
+
+fn is_include_name_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "the" | "a" | "an" | "for" | "of" | "to" | "by" | "with" | "from" | "in" | "on"
+    )
+}
+
+fn canonicalize_include_name_token(token: String) -> String {
+    match token.as_str() {
+        "configuration" => "config".to_string(),
+        "kubernetes" => "k8s".to_string(),
+        "manifest" | "manifests" => "mfst".to_string(),
+        "serviceaccount" => "sa".to_string(),
+        "deployment" => "deploy".to_string(),
+        "applications" => "apps".to_string(),
+        "application" => "app".to_string(),
+        "database" => "db".to_string(),
+        "messagequeue" => "mq".to_string(),
+        _ => token,
+    }
+}
+
+fn squash_include_name_tokens(tokens: Vec<String>) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    for token in tokens {
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(last) = out.last_mut() {
+            if *last == token {
+                continue;
+            }
+            if token.starts_with(last.as_str()) && token.len() > last.len() + 1 {
+                *last = token;
+                continue;
+            }
+        }
+        out.push(token);
+    }
+    out
 }
 
 pub fn generate_consumer_chart(
@@ -801,6 +1336,131 @@ mod tests {
         );
         let txt = values_yaml(&Value::Mapping(root)).expect("yaml");
         assert!(txt.starts_with("global:"));
+    }
+
+    #[test]
+    fn optimize_values_with_include_profiles_extracts_common_entity_map() {
+        let values: Value = serde_yaml::from_str(
+            r#"
+global:
+  env: dev
+apps-stateless:
+  api:
+    enabled: true
+    containers:
+      app:
+        image:
+          name: nginx
+          tag: "1.0"
+        port: 80
+    replicas: 2
+  web:
+    enabled: true
+    containers:
+      app:
+        image:
+          name: nginx
+          tag: "1.0"
+        port: 80
+    replicas: 3
+"#,
+        )
+        .expect("parse values");
+
+        let (optimized, report) = optimize_values_with_include_profiles(&values, 24);
+        assert_eq!(report.profiles_added, 1);
+
+        let root = optimized.as_mapping().expect("root map");
+        let global = root
+            .get(Value::String("global".into()))
+            .and_then(Value::as_mapping)
+            .expect("global map");
+        let includes = global
+            .get(Value::String("_includes".into()))
+            .and_then(Value::as_mapping)
+            .expect("_includes map");
+        let profile_name = "default_apps_stateless";
+        assert!(includes.contains_key(Value::String(profile_name.into())));
+
+        let apps = root
+            .get(Value::String("apps-stateless".into()))
+            .and_then(Value::as_mapping)
+            .expect("apps-stateless");
+        let api = apps
+            .get(Value::String("api".into()))
+            .and_then(Value::as_mapping)
+            .expect("api");
+        let web = apps
+            .get(Value::String("web".into()))
+            .and_then(Value::as_mapping)
+            .expect("web");
+        assert_eq!(
+            api.get(Value::String("_include".into()))
+                .and_then(Value::as_str),
+            Some(profile_name)
+        );
+        assert_eq!(
+            web.get(Value::String("_include".into()))
+                .and_then(Value::as_str),
+            Some(profile_name)
+        );
+        assert_eq!(
+            api.get(Value::String("replicas".into()))
+                .and_then(Value::as_i64),
+            Some(2)
+        );
+        assert_eq!(
+            web.get(Value::String("replicas".into()))
+                .and_then(Value::as_i64),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn optimize_values_with_include_profiles_respects_threshold() {
+        let values: Value = serde_yaml::from_str(
+            r#"
+global:
+  env: dev
+apps-stateless:
+  api:
+    enabled: true
+  web:
+    enabled: true
+"#,
+        )
+        .expect("parse values");
+
+        let (optimized, report) = optimize_values_with_include_profiles(&values, 1_000);
+        assert_eq!(report.profiles_added, 0);
+        assert_eq!(optimized, values);
+    }
+
+    #[test]
+    fn include_profile_naming_uses_dictionary_and_keeps_prefixes() {
+        let mut existing = BTreeSet::<String>::new();
+        let default_name = next_include_profile_name("apps-k8s-manifests", 0, &existing);
+        assert_eq!(default_name, "default_apps_k8s_mfst");
+        existing.insert(default_name.clone());
+
+        let common_name = next_include_profile_name("apps-k8s-manifests", 1, &existing);
+        assert_eq!(common_name, "common_apps_k8s_mfst");
+        assert_ne!(default_name, common_name);
+    }
+
+    #[test]
+    fn include_profile_naming_handles_collisions_with_suffixes() {
+        let mut existing = BTreeSet::<String>::new();
+        existing.insert("default_apps_stateless".to_string());
+        existing.insert("common_apps_stateless".to_string());
+        assert_eq!(
+            next_include_profile_name("apps-stateless", 0, &existing),
+            "default_apps_stateless_2"
+        );
+        assert_eq!(
+            next_include_profile_name("apps-stateless", 1, &existing),
+            "common_apps_stateless_2"
+        );
     }
 
     #[test]

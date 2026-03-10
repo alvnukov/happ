@@ -11,7 +11,7 @@ pub mod go_compat;
 pub mod gotemplates;
 mod inspectweb;
 mod lsp;
-mod output;
+pub mod output;
 mod process_guard;
 mod query;
 mod service;

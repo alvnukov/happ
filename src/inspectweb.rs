@@ -449,8 +449,21 @@ fn handle_connection(
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .filter(|x| !x.trim().is_empty());
+        let manifests_yaml = payload
+            .get("manifestsYaml")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|x| !x.trim().is_empty());
+        let manifests_input_only = payload
+            .get("manifestsInputOnly")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let yaml_anchors = payload
             .get("yamlAnchors")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let include_profiles = payload
+            .get("includeProfiles")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let (ok, values_yaml, message, source_count) = match import_payload(
@@ -475,7 +488,10 @@ fn handle_connection(
             allow_template_includes,
             unsupported_template_mode,
             chart_values_yaml,
+            manifests_yaml,
+            manifests_input_only,
             yaml_anchors,
+            include_profiles,
         ) {
             Ok((values, msg, cnt)) => (true, values, msg, cnt),
             Err(e) => (false, String::new(), e, 0usize),
@@ -658,8 +674,17 @@ fn handle_connection(
             .get("valuesYaml")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        let min_include_bytes = payload
+            .get("minIncludeBytes")
+            .and_then(|v| v.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(24);
         let yaml_anchors = payload
             .get("yamlAnchors")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let include_profiles = payload
+            .get("includeProfiles")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
@@ -670,7 +695,9 @@ fn handle_connection(
             chart_name.as_deref(),
             library_chart_path.as_deref(),
             values_yaml,
+            min_include_bytes,
             yaml_anchors,
+            include_profiles,
         ) {
             Ok(msg) => (true, msg),
             Err(e) => (false, e),
@@ -702,6 +729,31 @@ fn handle_connection(
         let resp = serde_json::json!({
             "ok": ok,
             "valuesYaml": values_yaml,
+            "message": message
+        })
+        .to_string();
+        return write_response(
+            stream,
+            200,
+            "application/json; charset=utf-8",
+            resp.as_bytes(),
+        )
+        .map_err(|e| e.to_string());
+    }
+    if route_path == "/api/manifests-source" && method == "POST" {
+        let payload: serde_json::Value =
+            serde_json::from_str(body).map_err(|e| format!("invalid JSON request: {e}"))?;
+        let manifests_path = payload
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let (ok, manifests_yaml, message) = match load_manifests_source_from_path(manifests_path) {
+            Ok(v) => (true, v, String::new()),
+            Err(e) => (false, String::new(), e),
+        };
+        let resp = serde_json::json!({
+            "ok": ok,
+            "manifestsYaml": manifests_yaml,
             "message": message
         })
         .to_string();
@@ -776,8 +828,21 @@ fn handle_connection(
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .filter(|x| !x.trim().is_empty());
+        let manifests_yaml = payload
+            .get("manifestsYaml")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|x| !x.trim().is_empty());
+        let manifests_input_only = payload
+            .get("manifestsInputOnly")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let yaml_anchors = payload
             .get("yamlAnchors")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let include_profiles = payload
+            .get("includeProfiles")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
@@ -817,7 +882,10 @@ fn handle_connection(
             allow_template_includes,
             unsupported_template_mode,
             chart_values_yaml,
+            manifests_yaml,
+            manifests_input_only,
             yaml_anchors,
+            include_profiles,
         ) {
             Ok((values, msg, cnt)) => (true, values, msg, cnt),
             Err(e) => (false, String::new(), e, 0usize),
@@ -1090,6 +1158,42 @@ fn load_chart_values_from_path(chart_path: &str) -> Result<String, String> {
     Ok(content)
 }
 
+fn load_manifests_source_from_path(manifests_path: &str) -> Result<String, String> {
+    if manifests_path.trim().is_empty() {
+        return Err("manifests path is required".to_string());
+    }
+    let docs = crate::source::load_documents_for_manifests(manifests_path)
+        .map_err(|e| format!("manifest load error: {e}"))?;
+    let rendered = render_yaml_documents_stream(&docs)?;
+    let bytes = rendered.len();
+    if bytes > max_chart_values_bytes() {
+        return Err(format!(
+            "manifests source is too large: {} bytes (max {})",
+            bytes,
+            max_chart_values_bytes()
+        ));
+    }
+    Ok(rendered)
+}
+
+fn render_yaml_documents_stream(docs: &[serde_yaml::Value]) -> Result<String, String> {
+    let mut out = String::new();
+    for (idx, doc) in docs.iter().enumerate() {
+        if idx > 0 {
+            out.push_str("---\n");
+        }
+        let mut body = serde_yaml::to_string(doc).map_err(|e| format!("yaml encode error: {e}"))?;
+        if body.starts_with("---\n") {
+            body = body.replacen("---\n", "", 1);
+        }
+        out.push_str(&body);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 fn write_uploaded_files(
     tmp_root: &Path,
     source_type: &str,
@@ -1252,10 +1356,33 @@ fn import_payload(
     allow_template_includes: Vec<String>,
     unsupported_template_mode: &str,
     chart_values_yaml: Option<String>,
+    manifests_yaml: Option<String>,
+    manifests_input_only: bool,
     yaml_anchors: bool,
+    include_profiles: bool,
 ) -> Result<(String, String, usize), String> {
-    if path.trim().is_empty() {
-        return Err("path is required".to_string());
+    let source_kind = source_type.trim().to_ascii_lowercase();
+    let inline_manifests_yaml = manifests_yaml.filter(|x| !x.trim().is_empty());
+    match source_kind.as_str() {
+        "manifests" => {
+            let has_path = !path.trim().is_empty();
+            let has_inline = inline_manifests_yaml.is_some();
+            if manifests_input_only {
+                if !has_inline {
+                    return Err(
+                        "inline manifests input is required when input-only mode is enabled"
+                            .to_string(),
+                    );
+                }
+            } else if !has_path && !has_inline {
+                return Err("path is required or provide inline manifests".to_string());
+            }
+        }
+        _ => {
+            if path.trim().is_empty() {
+                return Err("path is required".to_string());
+            }
+        }
     }
     let mut values_files = values_files;
     let mut inline_chart_values_temp: Option<PathBuf> = None;
@@ -1293,23 +1420,57 @@ fn import_payload(
         include_crds,
         write_rendered_output: None,
     };
-    let result = match source_type.trim().to_ascii_lowercase().as_str() {
+    let result = match source_kind.as_str() {
         "chart" => {
             let analyzed = crate::chart_analyzer::analyze_chart(&args)
                 .map_err(|e| format!("chart analyze error: {e}"))?;
             let docs = analyzed.documents;
-            let values = analyzed.values;
+            let (values, include_report) = if include_profiles {
+                crate::output::optimize_values_with_include_profiles(
+                    &analyzed.values,
+                    min_include_bytes,
+                )
+            } else {
+                (
+                    analyzed.values.clone(),
+                    crate::output::IncludeProfileOptimizationReport::default(),
+                )
+            };
             let out = crate::output::values_yaml_with_yaml_anchors(&values, yaml_anchors)
                 .map_err(|e| format!("values encode error: {e}"))?;
+            let optimize_note = if include_profiles {
+                format!(
+                    " _include profiles added: {}.",
+                    include_report.profiles_added
+                )
+            } else {
+                String::new()
+            };
             Ok((
                 out,
-                format!("Imported {} rendered document(s) from chart.", docs.len()),
+                format!(
+                    "Imported {} rendered document(s) from chart.{}",
+                    docs.len(),
+                    optimize_note
+                ),
                 docs.len(),
             ))
         }
         "manifests" => {
-            let docs = crate::source::load_documents_for_manifests(&args.path)
-                .map_err(|e| format!("manifest load error: {e}"))?;
+            let mut docs = Vec::new();
+            if !manifests_input_only && !args.path.trim().is_empty() {
+                let path_docs = crate::source::load_documents_for_manifests(&args.path)
+                    .map_err(|e| format!("manifest load error: {e}"))?;
+                docs.extend(path_docs);
+            }
+            if let Some(inline) = inline_manifests_yaml {
+                let inline_docs = crate::source::parse_documents(&inline)
+                    .map_err(|e| format!("manifest inline parse error: {e}"))?;
+                docs.extend(inline_docs);
+            }
+            if docs.is_empty() {
+                return Err("no manifests found for import".to_string());
+            }
             let values = crate::convert::build_values(&args, &docs)
                 .map_err(|e| format!("convert error: {e}"))?;
             let out = crate::output::values_yaml(&values)
@@ -1351,7 +1512,9 @@ fn save_chart_payload(
     chart_name: Option<&str>,
     library_chart_path: Option<&str>,
     values_yaml: &str,
+    min_include_bytes: usize,
     yaml_anchors: bool,
+    include_profiles: bool,
 ) -> Result<String, String> {
     if out_chart_dir.trim().is_empty() {
         return Err("outChartDir is required".to_string());
@@ -1361,20 +1524,36 @@ fn save_chart_payload(
     }
     let values: serde_yaml::Value =
         serde_yaml::from_str(values_yaml).map_err(|e| format!("values yaml parse error: {e}"))?;
+    let (values_for_chart, include_report) = if include_profiles {
+        crate::output::optimize_values_with_include_profiles(&values, min_include_bytes)
+    } else {
+        (
+            values,
+            crate::output::IncludeProfileOptimizationReport::default(),
+        )
+    };
     crate::output::generate_consumer_chart(
         out_chart_dir,
         chart_name,
-        &values,
+        &values_for_chart,
         library_chart_path,
         yaml_anchors,
     )
     .map_err(|e| format!("save chart error: {e}"))?;
     let mut notes = Vec::new();
+    if include_profiles {
+        notes.push(format!(
+            "_include profiles added {}",
+            include_report.profiles_added
+        ));
+    }
+    let values_yaml_for_sync = crate::output::values_yaml(&values_for_chart)
+        .map_err(|e| format!("values encode for helper sync error: {e}"))?;
     if source_type.trim().eq_ignore_ascii_case("chart") && !source_path.trim().is_empty() {
         match crate::output::sync_imported_include_helpers_from_source_chart(
             source_path,
             out_chart_dir,
-            values_yaml,
+            &values_yaml_for_sync,
         ) {
             Ok(sync) => {
                 if !sync.added.is_empty() || !sync.missing.is_empty() {
@@ -4157,18 +4336,24 @@ window.addEventListener('error', function(e) {{
     </div>
     <div class='import-layout'>
       <div class='import-section'>
-        <h4>Source chart values.yaml</h4>
-        <div v-if='mainImportSourceType !== "chart"' class='muted'>Source type is {{{{ mainImportSourceType }}}}. Source values editor is available only for chart mode.</div>
+        <h4>{{{{ mainImportSourceEditorTitle }}}}</h4>
+        <div class='segmented' style='margin-bottom:8px;'>
+          <button type='button' :class='{{ active: mainImportSourceType === "chart" }}' @click='mainImportSourceType = "chart"'>Chart</button>
+          <button type='button' :class='{{ active: mainImportSourceType === "manifests" }}' @click='mainImportSourceType = "manifests"'>Manifests</button>
+        </div>
+        <div v-if='mainImportSourceType === "compose"' class='muted'>Source type is compose. Inline source editor is available for chart values and raw manifests.</div>
         <div v-else class='source-editor-area'>
           <div class='import-toolbar' style='margin-bottom:6px;'>
             <div class='left'>
-              <button class='secondary' @click='loadChartValuesFromPath'>Load values.yaml</button>
+              <button class='secondary' @click='loadMainImportSourceFromPath'>{{{{ mainImportSourceLoadLabel }}}}</button>
               <button class='secondary' @click='pasteMainImportFromStdin' :disabled='!mainImportStdinText'>Paste stdin</button>
-              <button class='secondary' @click='resetChartValuesEditor'>Reset</button>
-              <button class='secondary' @click='clearChartValuesEditor' :disabled='!mainImportChartValuesEditor'>Clear values</button>
+              <button class='secondary' @click='resetMainImportSourceEditor'>Reset</button>
+              <button class='secondary' @click='clearMainImportSourceEditor' :disabled='!mainImportSourceEditorContent'>{{{{ mainImportSourceClearLabel }}}}</button>
             </div>
             <div class='right'>
-              <label class='chk'><input type='checkbox' v-model='mainImportUseChartValuesEditor'/> use edited chart values</label>
+              <label class='chk'><input type='checkbox' v-model='mainImportUseSourceEditor'/> {{{{ mainImportSourceUseCheckboxLabel }}}}</label>
+              <label class='chk' v-if='mainImportSourceType === "manifests"'><input type='checkbox' v-model='mainImportManifestsInputOnly'/> input only (ignore path manifests)</label>
+              <div class='field-hint' v-if='mainImportSourceType === "manifests"'>Inline input supplements path manifests by default.</div>
             </div>
           </div>
           <div class='editor-shell import-editor-shell'>
@@ -4177,7 +4362,7 @@ window.addEventListener('error', function(e) {{
               <pre class='yaml-editor-highlight' aria-hidden='true' v-html='mainImportSourceHighlighted'></pre>
               <textarea
                 class='yaml-editor-input'
-                v-model='mainImportChartValuesEditor'
+                v-model='mainImportSourceEditorContent'
                 ref='mainImportSourceInput'
                 spellcheck='false'
                 @scroll='syncMainImportSourceScroll'
@@ -4324,6 +4509,7 @@ window.addEventListener('error', function(e) {{
                 <label class='chk'><input type='checkbox' v-model='mainImportIncludeStatus'/> include status</label>
                 <label class='chk'><input type='checkbox' v-model='mainImportIncludeCrds'/> include CRDs</label>
                 <label class='chk' v-if='mainImportSourceType === "chart"'><input type='checkbox' v-model='mainImportYamlAnchors'/> YAML anchors optimize</label>
+                <label class='chk' v-if='mainImportSourceType === "chart"'><input type='checkbox' v-model='mainImportIncludeProfiles'/> _include optimize (recursive merge)</label>
               </div>
               <div class='field-hint'>Use CRDs when you want generated chart to include source chart CRDs.</div>
             </div>
@@ -4890,6 +5076,7 @@ const app = Vue.createApp({{
       mainImportIncludeStatus: false,
       mainImportIncludeCrds: false,
       mainImportYamlAnchors: false,
+      mainImportIncludeProfiles: false,
       mainImportKubeVersion: '',
       mainImportValuesFilesText: '',
       mainImportSetText: '',
@@ -4907,6 +5094,10 @@ const app = Vue.createApp({{
       mainImportChartValuesEditor: '',
       mainImportLoadedChartValues: '',
       mainImportUseChartValuesEditor: false,
+      mainImportManifestsEditor: '',
+      mainImportLoadedManifests: '',
+      mainImportUseManifestsEditor: false,
+      mainImportManifestsInputOnly: false,
       mainImportStdinText: (model && typeof model.stdinText === 'string') ? model.stdinText : '',
       mainImportSectionCollapsed: {{}},
       mainImportPickedFilesLabel: '',
@@ -5194,8 +5385,65 @@ const app = Vue.createApp({{
       }}
       return this.highlightDyff(this.dyffOutput || '');
     }},
+    mainImportSourceEditorTitle() {{
+      if (this.mainImportSourceType === 'compose') {{
+        return 'Source input';
+      }}
+      if (this.mainImportSourceType === 'manifests') {{
+        return 'Source raw manifests';
+      }}
+      return 'Source chart values.yaml';
+    }},
+    mainImportSourceLoadLabel() {{
+      if (this.mainImportSourceType === 'manifests') {{
+        return 'Load manifests';
+      }}
+      return 'Load values.yaml';
+    }},
+    mainImportSourceClearLabel() {{
+      if (this.mainImportSourceType === 'manifests') {{
+        return 'Clear manifests';
+      }}
+      return 'Clear values';
+    }},
+    mainImportSourceUseCheckboxLabel() {{
+      if (this.mainImportSourceType === 'manifests') {{
+        return 'use inline manifests';
+      }}
+      return 'use edited chart values';
+    }},
+    mainImportSourceEditorContent: {{
+      get() {{
+        if (this.mainImportSourceType === 'manifests') {{
+          return this.mainImportManifestsEditor || '';
+        }}
+        return this.mainImportChartValuesEditor || '';
+      }},
+      set(next) {{
+        if (this.mainImportSourceType === 'manifests') {{
+          this.mainImportManifestsEditor = next;
+          return;
+        }}
+        this.mainImportChartValuesEditor = next;
+      }},
+    }},
+    mainImportUseSourceEditor: {{
+      get() {{
+        if (this.mainImportSourceType === 'manifests') {{
+          return !!this.mainImportUseManifestsEditor;
+        }}
+        return !!this.mainImportUseChartValuesEditor;
+      }},
+      set(next) {{
+        if (this.mainImportSourceType === 'manifests') {{
+          this.mainImportUseManifestsEditor = !!next;
+          return;
+        }}
+        this.mainImportUseChartValuesEditor = !!next;
+      }},
+    }},
     mainImportSourceHighlighted() {{
-      return this.highlightStructured(this.mainImportChartValuesEditor || '');
+      return this.highlightStructured(this.mainImportSourceEditorContent || '');
     }},
     mainImportPreview() {{
       const _collapsed = this.mainImportSectionCollapsed;
@@ -5412,6 +5660,7 @@ const app = Vue.createApp({{
         this.mainImportIncludeStatus = !!s.mainImportIncludeStatus;
         this.mainImportIncludeCrds = !!s.mainImportIncludeCrds;
         this.mainImportYamlAnchors = !!s.mainImportYamlAnchors;
+        this.mainImportIncludeProfiles = !!s.mainImportIncludeProfiles;
         this.mainImportKubeVersion = s.mainImportKubeVersion || '';
         this.mainImportValuesFilesText = s.mainImportValuesFilesText || '';
         this.mainImportSetText = s.mainImportSetText || '';
@@ -5424,6 +5673,10 @@ const app = Vue.createApp({{
         this.mainImportChartValuesEditor = s.mainImportChartValuesEditor || '';
         this.mainImportLoadedChartValues = s.mainImportLoadedChartValues || '';
         this.mainImportUseChartValuesEditor = !!s.mainImportUseChartValuesEditor;
+        this.mainImportManifestsEditor = s.mainImportManifestsEditor || '';
+        this.mainImportLoadedManifests = s.mainImportLoadedManifests || '';
+        this.mainImportUseManifestsEditor = !!s.mainImportUseManifestsEditor;
+        this.mainImportManifestsInputOnly = !!s.mainImportManifestsInputOnly;
         this.mainImportSectionCollapsed = s.mainImportSectionCollapsed || {{}};
         this.mainImportOutChartDir = s.mainImportOutChartDir || '';
         this.mainImportOutChartName = s.mainImportOutChartName || '';
@@ -5674,6 +5927,13 @@ const app = Vue.createApp({{
       if (this.mainImportSourceType !== 'chart' && this.mainImportYamlAnchors) {{
         this.mainImportYamlAnchors = false;
       }}
+      if (this.mainImportSourceType !== 'chart' && this.mainImportIncludeProfiles) {{
+        this.mainImportIncludeProfiles = false;
+      }}
+      if (this.mainImportSourceCm && !this.mainImportSourceCmUpdating) {{
+        this.mainImportSourceCm.setValue(this.mainImportSourceEditorContent || '');
+      }}
+      this.$nextTick(() => this.syncMainImportSourceScroll());
     }},
     mainImportPath: 'saveSettings',
     mainImportEnv: 'saveSettings',
@@ -5686,6 +5946,7 @@ const app = Vue.createApp({{
     mainImportIncludeStatus: 'saveSettings',
     mainImportIncludeCrds: 'saveSettings',
     mainImportYamlAnchors: 'saveSettings',
+    mainImportIncludeProfiles: 'saveSettings',
     mainImportKubeVersion: 'saveSettings',
     mainImportValuesFilesText: 'saveSettings',
     mainImportSetText: 'saveSettings',
@@ -5703,12 +5964,29 @@ const app = Vue.createApp({{
     }},
     mainImportChartValuesEditor() {{
       this.saveSettings();
-      if (this.mainImportSourceCm && !this.mainImportSourceCmUpdating) {{
+      if (
+        this.mainImportSourceType === 'chart' &&
+        this.mainImportSourceCm &&
+        !this.mainImportSourceCmUpdating
+      ) {{
         this.mainImportSourceCm.setValue(this.mainImportChartValuesEditor || '');
       }}
       this.$nextTick(() => this.syncMainImportSourceScroll());
     }},
+    mainImportManifestsEditor() {{
+      this.saveSettings();
+      if (
+        this.mainImportSourceType === 'manifests' &&
+        this.mainImportSourceCm &&
+        !this.mainImportSourceCmUpdating
+      ) {{
+        this.mainImportSourceCm.setValue(this.mainImportManifestsEditor || '');
+      }}
+      this.$nextTick(() => this.syncMainImportSourceScroll());
+    }},
     mainImportUseChartValuesEditor: 'saveSettings',
+    mainImportUseManifestsEditor: 'saveSettings',
+    mainImportManifestsInputOnly: 'saveSettings',
     mainImportSectionCollapsed: {{ handler: 'saveSettings', deep: true }},
     mainImportOutChartDir: 'saveSettings',
     mainImportOutChartName: 'saveSettings',
@@ -5859,13 +6137,13 @@ const app = Vue.createApp({{
           const host = this.$refs.mainImportSourceCmHost;
           if (host) {{
             this.mainImportSourceCm = cmApi.createYamlEditor(host, {{
-              value: this.mainImportChartValuesEditor || '',
+              value: this.mainImportSourceEditorContent || '',
               readOnly: false,
               wrapLines: this.wrapLines,
               fontSize: this.fontSize,
               onChange: (next) => {{
                 this.mainImportSourceCmUpdating = true;
-                this.mainImportChartValuesEditor = next;
+                this.mainImportSourceEditorContent = next;
                 this.mainImportSourceCmUpdating = false;
               }},
               onSelectionChange: (sel) => {{
@@ -6122,6 +6400,7 @@ const app = Vue.createApp({{
           mainImportIncludeStatus: this.mainImportIncludeStatus,
           mainImportIncludeCrds: this.mainImportIncludeCrds,
           mainImportYamlAnchors: this.mainImportYamlAnchors,
+          mainImportIncludeProfiles: this.mainImportIncludeProfiles,
           mainImportKubeVersion: this.mainImportKubeVersion,
           mainImportValuesFilesText: this.mainImportValuesFilesText,
           mainImportSetText: this.mainImportSetText,
@@ -6134,6 +6413,10 @@ const app = Vue.createApp({{
           mainImportChartValuesEditor: this.mainImportChartValuesEditor,
           mainImportLoadedChartValues: this.mainImportLoadedChartValues,
           mainImportUseChartValuesEditor: this.mainImportUseChartValuesEditor,
+          mainImportManifestsEditor: this.mainImportManifestsEditor,
+          mainImportLoadedManifests: this.mainImportLoadedManifests,
+          mainImportUseManifestsEditor: this.mainImportUseManifestsEditor,
+          mainImportManifestsInputOnly: this.mainImportManifestsInputOnly,
           mainImportSectionCollapsed: this.mainImportSectionCollapsed,
           mainImportOutChartDir: this.mainImportOutChartDir,
           mainImportOutChartName: this.mainImportOutChartName,
@@ -6432,6 +6715,13 @@ const app = Vue.createApp({{
       }}
       this.mainImportSectionCollapsed = out;
     }},
+    async loadMainImportSourceFromPath() {{
+      if (this.mainImportSourceType === 'manifests') {{
+        await this.loadManifestsFromPath();
+        return;
+      }}
+      await this.loadChartValuesFromPath();
+    }},
     async loadChartValuesFromPath() {{
       this.mainImportError = '';
       if (this.mainImportSourceType !== 'chart') {{
@@ -6473,21 +6763,86 @@ const app = Vue.createApp({{
         this.finishAbortableRequest('chart-values', ctrl);
       }}
     }},
+    async loadManifestsFromPath() {{
+      this.mainImportError = '';
+      if (this.mainImportSourceType !== 'manifests') {{
+        this.mainImportError = 'manifests loader is available only for sourceType=manifests';
+        return;
+      }}
+      if (!this.mainImportPath || !this.mainImportPath.trim()) {{
+        this.mainImportError = 'Select manifests path first';
+        return;
+      }}
+      const ctrl = this.beginAbortableRequest('manifests-source');
+      try {{
+        const res = await fetch('/api/manifests-source', {{
+          method: 'POST',
+          headers: {{ 'content-type': 'application/json' }},
+          body: JSON.stringify({{ path: this.mainImportPath }}),
+          signal: ctrl && ctrl.signal ? ctrl.signal : undefined,
+        }});
+        const raw = await res.text();
+        let data = null;
+        try {{
+          data = JSON.parse(raw);
+        }} catch(_) {{
+          throw new Error('manifests-source API returned non-JSON response: ' + raw.slice(0, 300));
+        }}
+        if (!res.ok) {{
+          throw new Error(data.message || ('manifests-source API HTTP ' + res.status));
+        }}
+        if (!data.ok) {{
+          throw new Error(data.message || 'Failed to load manifests source');
+        }}
+        this.mainImportLoadedManifests = data.manifestsYaml || '';
+        this.mainImportManifestsEditor = this.mainImportLoadedManifests;
+        this.mainImportUseManifestsEditor = false;
+      }} catch(e) {{
+        if (this.isAbortError(e)) return;
+        this.mainImportError = String(e);
+      }} finally {{
+        this.finishAbortableRequest('manifests-source', ctrl);
+      }}
+    }},
     resetChartValuesEditor() {{
       if (this.mainImportLoadedChartValues) {{
         this.mainImportChartValuesEditor = this.mainImportLoadedChartValues;
       }}
+    }},
+    resetMainImportSourceEditor() {{
+      if (this.mainImportSourceType === 'manifests') {{
+        if (this.mainImportLoadedManifests) {{
+          this.mainImportManifestsEditor = this.mainImportLoadedManifests;
+        }}
+        return;
+      }}
+      this.resetChartValuesEditor();
     }},
     clearChartValuesEditor() {{
       this.mainImportChartValuesEditor = '';
       this.mainImportUseChartValuesEditor = true;
       this.mainImportMessage = 'Source values editor cleared';
     }},
+    clearMainImportSourceEditor() {{
+      if (this.mainImportSourceType === 'manifests') {{
+        this.mainImportManifestsEditor = '';
+        this.mainImportUseManifestsEditor = true;
+        this.mainImportMessage = 'Source manifests editor cleared';
+        return;
+      }}
+      this.clearChartValuesEditor();
+    }},
     pasteMainImportFromStdin() {{
       if (!this.mainImportStdinText) return;
-      this.mainImportChartValuesEditor = String(this.mainImportStdinText);
-      this.mainImportUseChartValuesEditor = true;
-      this.mainImportMessage = 'Loaded values from stdin';
+      if (this.mainImportSourceType === 'manifests') {{
+        this.mainImportManifestsEditor = String(this.mainImportStdinText);
+        this.mainImportUseManifestsEditor = true;
+        this.mainImportMessage = 'Loaded manifests from stdin';
+      }} else {{
+        this.mainImportChartValuesEditor = String(this.mainImportStdinText);
+        this.mainImportUseChartValuesEditor = true;
+        this.mainImportMessage = 'Loaded values from stdin';
+      }}
       this.mainImportError = '';
     }},
     async copyMainImportOutput() {{
@@ -6544,6 +6899,9 @@ const app = Vue.createApp({{
       if (this.mainImportSourceType === 'compose') {{
         return !e.isDir && this.isComposeFile(e.name);
       }}
+      if (this.mainImportSourceType === 'manifests') {{
+        return !!e.isDir || this.isManifestFile(e.name);
+      }}
       return !!e.isDir;
     }},
     onFsRowActivate(e) {{
@@ -6598,6 +6956,10 @@ const app = Vue.createApp({{
       const s = String(name || '').toLowerCase();
       return s.endsWith('.yml') || s.endsWith('.yaml');
     }},
+    isManifestFile(name) {{
+      const s = String(name || '').toLowerCase();
+      return s.endsWith('.yml') || s.endsWith('.yaml');
+    }},
     selectFsPath(path) {{
       if (this.fsPickerTarget === 'chart-output') {{
         this.mainImportOutChartDir = path || '';
@@ -6609,6 +6971,11 @@ const app = Vue.createApp({{
       this.closeFsPicker();
       if (this.fsPickerTarget !== 'chart-output' && this.mainImportSourceType === 'chart') {{
         this.$nextTick(() => this.loadChartValuesFromPath());
+      }} else if (
+        this.fsPickerTarget !== 'chart-output' &&
+        this.mainImportSourceType === 'manifests'
+      ) {{
+        this.$nextTick(() => this.loadManifestsFromPath());
       }}
     }},
     clearMainImportSelection() {{
@@ -6646,6 +7013,7 @@ const app = Vue.createApp({{
             includeStatus: !!this.mainImportIncludeStatus,
             includeCrds: !!this.mainImportIncludeCrds,
             yamlAnchors: this.mainImportSourceType === 'chart' && !!this.mainImportYamlAnchors,
+            includeProfiles: this.mainImportSourceType === 'chart' && !!this.mainImportIncludeProfiles,
             kubeVersion: this.mainImportKubeVersion,
             valuesFiles: this.parseLines(this.mainImportValuesFilesText),
             setValues: this.parseLines(this.mainImportSetText),
@@ -6655,7 +7023,13 @@ const app = Vue.createApp({{
             apiVersions: this.parseLines(this.mainImportApiVersionsText),
             allowTemplateIncludes: this.parseLines(this.mainImportAllowTemplateIncludesText),
             unsupportedTemplateMode: this.mainImportUnsupportedTemplateMode || 'error',
-            chartValuesYaml: this.mainImportUseChartValuesEditor ? (this.mainImportChartValuesEditor || '') : undefined,
+            chartValuesYaml: (this.mainImportSourceType === 'chart' && this.mainImportUseChartValuesEditor)
+              ? (this.mainImportChartValuesEditor || '')
+              : undefined,
+            manifestsYaml: (this.mainImportSourceType === 'manifests' && this.mainImportUseManifestsEditor)
+              ? (this.mainImportManifestsEditor || '')
+              : undefined,
+            manifestsInputOnly: this.mainImportSourceType === 'manifests' && !!this.mainImportManifestsInputOnly,
           }}),
           signal: ctrl && ctrl.signal ? ctrl.signal : undefined,
         }});
@@ -6805,7 +7179,9 @@ const app = Vue.createApp({{
             chartName: this.mainImportOutChartName || undefined,
             libraryChartPath: this.mainImportLibraryChartPath || undefined,
             valuesYaml: this.mainImportOutput,
+            minIncludeBytes: Number(this.mainImportMinIncludeBytes || 24),
             yamlAnchors: this.mainImportSourceType === 'chart' && !!this.mainImportYamlAnchors,
+            includeProfiles: this.mainImportSourceType === 'chart' && !!this.mainImportIncludeProfiles,
           }}),
           signal: ctrl && ctrl.signal ? ctrl.signal : undefined,
         }});
@@ -6847,6 +7223,7 @@ const app = Vue.createApp({{
       this.mainImportIncludeStatus = false;
       this.mainImportIncludeCrds = false;
       this.mainImportYamlAnchors = false;
+      this.mainImportIncludeProfiles = false;
       this.mainImportKubeVersion = '';
       this.mainImportValuesFilesText = '';
       this.mainImportSetText = '';
@@ -6854,6 +7231,10 @@ const app = Vue.createApp({{
       this.mainImportApiVersionsText = '';
       this.mainImportAllowTemplateIncludesText = '';
       this.mainImportUnsupportedTemplateMode = 'error';
+      this.mainImportManifestsEditor = '';
+      this.mainImportLoadedManifests = '';
+      this.mainImportUseManifestsEditor = false;
+      this.mainImportManifestsInputOnly = false;
     }},
     resetMainImportConfig() {{
       this.mainImportSourceType = 'chart';
@@ -6869,6 +7250,7 @@ const app = Vue.createApp({{
       this.mainImportIncludeStatus = false;
       this.mainImportIncludeCrds = false;
       this.mainImportYamlAnchors = false;
+      this.mainImportIncludeProfiles = false;
       this.mainImportKubeVersion = '';
       this.mainImportValuesFilesText = '';
       this.mainImportSetText = '';
@@ -6877,6 +7259,10 @@ const app = Vue.createApp({{
       this.mainImportAllowTemplateIncludesText = '';
       this.mainImportUnsupportedTemplateMode = 'error';
       this.mainImportLibraryChartPath = '';
+      this.mainImportManifestsEditor = '';
+      this.mainImportLoadedManifests = '';
+      this.mainImportUseManifestsEditor = false;
+      this.mainImportManifestsInputOnly = false;
     }},
     decodeBase64Url(s) {{
       const text = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
@@ -7831,8 +8217,9 @@ const app = Vue.createApp({{
       }});
     }},
     onMainImportSelection(sel) {{
-      const info = this.makeSelectionInfo(this.mainImportChartValuesEditor || '', sel || {{}});
-      info.sourceText = this.mainImportChartValuesEditor || '';
+      const sourceText = this.mainImportSourceEditorContent || '';
+      const info = this.makeSelectionInfo(sourceText, sel || {{}});
+      info.sourceText = sourceText;
       this.mainImportSelection = info;
       this.applyMainImportSelectionSync();
     }},
@@ -7867,7 +8254,9 @@ const app = Vue.createApp({{
       this.applyDyffSelectionSync();
     }},
     onMainImportTextareaSelect(ev) {{
-      this.onMainImportSelection(this.selectionFromEventTextArea(ev, this.mainImportChartValuesEditor || ''));
+      this.onMainImportSelection(
+        this.selectionFromEventTextArea(ev, this.mainImportSourceEditorContent || '')
+      );
     }},
     onConverterTextareaSelect(ev) {{
       this.onConverterSelection(this.selectionFromEventTextArea(ev, this.converterInput || ''));
@@ -9095,10 +9484,243 @@ text: |-
             Vec::new(),
             "error",
             None,
+            None,
+            false,
+            false,
             false,
         )
         .expect_err("expected error");
         assert!(err.contains("path is required"));
+    }
+
+    #[test]
+    fn import_payload_accepts_inline_manifests_without_path() {
+        let inline = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: default
+data:
+  key: value
+"#;
+        let (values, message, count) = import_payload(
+            "manifests",
+            "",
+            "dev",
+            "apps-k8s-manifests",
+            "apps-k8s-manifests",
+            "raw",
+            "imported",
+            None,
+            24,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            false,
+            Vec::new(),
+            "error",
+            None,
+            Some(inline.to_string()),
+            false,
+            false,
+            false,
+        )
+        .expect("inline manifests import");
+        assert_eq!(count, 1);
+        assert!(message.contains("Imported 1 document(s) from manifests"));
+        assert!(values.contains("apps-k8s-manifests:"));
+    }
+
+    #[test]
+    fn import_payload_rejects_manifests_without_path_or_inline() {
+        let err = import_payload(
+            "manifests",
+            "",
+            "dev",
+            "apps-k8s-manifests",
+            "apps-k8s-manifests",
+            "raw",
+            "imported",
+            None,
+            24,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            false,
+            Vec::new(),
+            "error",
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect_err("expected error");
+        assert!(err.contains("path is required or provide inline manifests"));
+    }
+
+    #[test]
+    fn import_payload_rejects_manifests_input_only_without_inline() {
+        let td = tempfile::tempdir().expect("tmpdir");
+        let path_manifest = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: path-only
+"#;
+        std::fs::write(td.path().join("path.yaml"), path_manifest).expect("write path manifest");
+        let err = import_payload(
+            "manifests",
+            td.path().to_str().expect("path"),
+            "dev",
+            "apps-k8s-manifests",
+            "apps-k8s-manifests",
+            "raw",
+            "imported",
+            None,
+            24,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            false,
+            Vec::new(),
+            "error",
+            None,
+            None,
+            true,
+            false,
+            false,
+        )
+        .expect_err("expected error");
+        assert!(err.contains("input-only mode"));
+    }
+
+    #[test]
+    fn import_payload_merges_path_and_inline_manifests() {
+        let td = tempfile::tempdir().expect("tmpdir");
+        let path_manifest = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: path-config
+  namespace: default
+data:
+  key: path
+"#;
+        std::fs::write(td.path().join("path.yaml"), path_manifest).expect("write path manifest");
+        let inline_manifest = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stdin-config
+  namespace: default
+data:
+  key: stdin
+"#;
+        let (values, message, count) = import_payload(
+            "manifests",
+            td.path().to_str().expect("path"),
+            "dev",
+            "apps-k8s-manifests",
+            "apps-k8s-manifests",
+            "raw",
+            "imported",
+            None,
+            24,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            false,
+            Vec::new(),
+            "error",
+            None,
+            Some(inline_manifest.to_string()),
+            false,
+            false,
+            false,
+        )
+        .expect("manifests merged import");
+        assert_eq!(count, 2);
+        assert!(message.contains("Imported 2 document(s) from manifests"));
+        assert!(values.contains("path-config"));
+        assert!(values.contains("stdin-config"));
+    }
+
+    #[test]
+    fn import_payload_input_only_ignores_path_manifests() {
+        let td = tempfile::tempdir().expect("tmpdir");
+        let path_manifest = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: path-only
+  namespace: default
+data:
+  key: path
+"#;
+        std::fs::write(td.path().join("path.yaml"), path_manifest).expect("write path manifest");
+        let inline_manifest = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stdin-only
+  namespace: default
+data:
+  key: stdin
+"#;
+        let (values, message, count) = import_payload(
+            "manifests",
+            td.path().to_str().expect("path"),
+            "dev",
+            "apps-k8s-manifests",
+            "apps-k8s-manifests",
+            "raw",
+            "imported",
+            None,
+            24,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            false,
+            Vec::new(),
+            "error",
+            None,
+            Some(inline_manifest.to_string()),
+            true,
+            false,
+            false,
+        )
+        .expect("manifests input-only import");
+        assert_eq!(count, 1);
+        assert!(message.contains("Imported 1 document(s) from manifests"));
+        assert!(values.contains("stdin-only"));
+        assert!(!values.contains("path-only"));
     }
 
     #[test]
@@ -9125,6 +9747,9 @@ text: |-
             Vec::new(),
             "error",
             None,
+            None,
+            false,
+            false,
             false,
         )
         .expect_err("expected error");
@@ -9211,6 +9836,8 @@ text: |-
             None,
             None,
             "global:\n  env: dev\n",
+            24,
+            false,
             false,
         )
         .expect_err("error");
@@ -9228,6 +9855,8 @@ text: |-
             Some("demo"),
             None,
             "global:\n  env: dev\napps-stateless:\n  app:\n    enabled: true\n    containers:\n      app:\n        image:\n          name: nginx\n",
+            24,
+            false,
             false,
         )
         .expect("saved");
@@ -9235,6 +9864,48 @@ text: |-
         assert!(out.join("Chart.yaml").exists());
         assert!(out.join("values.yaml").exists());
         assert!(out.join("templates/init-helm-apps-library.yaml").exists());
+    }
+
+    #[test]
+    fn save_chart_payload_include_profiles_optimization_writes_includes() {
+        let td = TempDir::new().expect("tmp");
+        let out = td.path().join("generated-chart");
+        let msg = save_chart_payload(
+            "chart",
+            td.path().to_str().expect("source"),
+            out.to_str().expect("path"),
+            Some("demo"),
+            None,
+            r#"
+global:
+  env: dev
+apps-stateless:
+  api:
+    enabled: true
+    replicas: 2
+    containers:
+      app:
+        image:
+          name: nginx
+          tag: "1.2.3"
+  web:
+    enabled: true
+    replicas: 1
+    containers:
+      app:
+        image:
+          name: nginx
+          tag: "1.2.3"
+"#,
+            24,
+            false,
+            true,
+        )
+        .expect("saved");
+        assert!(msg.contains("_include profiles added"));
+        let values = std::fs::read_to_string(out.join("values.yaml")).expect("read values");
+        assert!(values.contains("_includes:"));
+        assert!(values.contains("_include:"));
     }
 
     #[test]
@@ -9256,6 +9927,8 @@ text: |-
             Some("demo"),
             None,
             "global:\n  env: dev\napps-stateless:\n  app:\n    enabled: true\n    containers:\n      app:\n        image:\n          name: nginx\n",
+            24,
+            false,
             false,
         )
         .expect("save");
@@ -9289,6 +9962,8 @@ text: |-
             Some("demo"),
             None,
             "global:\n  env: dev\napps-k8s-manifests:\n  job-a:\n    spec: |\n      serviceAccountName: '{{ include \"opensearch-cluster.serviceAccountName\" . }}'\n",
+            24,
+            false,
             false,
         )
         .expect("save");
