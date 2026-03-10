@@ -347,28 +347,28 @@ jobs:
           TAP_DIR="${TMP_DIR}/homebrew-tap"
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/alvnukov/homebrew-tap.git" "${TAP_DIR}"
 
-          cat > "${TAP_DIR}/Formula/happ.rb" <<EOF
-class Happ < Formula
-  desc "Helm chart and manifest importer/converter for helm-apps"
-  homepage "https://github.com/alvnukov/happ"
-  url "https://github.com/alvnukov/happ/archive/refs/tags/v${VERSION}.tar.gz"
-  sha256 "${SHA256}"
-  license "Apache-2.0"
-  head "https://github.com/alvnukov/happ.git", branch: "main"
-
-  depends_on "rust" => :build
-
-  def install
-    system "cargo", "install", *std_cargo_args(path: ".")
-  end
-
-  test do
-    output = shell_output("#{bin}/happ --help")
-    assert_match "happ", output
-    assert_match "jq", output
-  end
-end
-EOF
+          cat <<EOF | sed 's/^          //' > "${TAP_DIR}/Formula/happ.rb"
+          class Happ < Formula
+            desc "Helm chart and manifest importer/converter for helm-apps"
+            homepage "https://github.com/alvnukov/happ"
+            url "https://github.com/alvnukov/happ/archive/refs/tags/v${VERSION}.tar.gz"
+            sha256 "${SHA256}"
+            license "Apache-2.0"
+            head "https://github.com/alvnukov/happ.git", branch: "main"
+          
+            depends_on "rust" => :build
+          
+            def install
+              system "cargo", "install", *std_cargo_args(path: ".")
+            end
+          
+            test do
+              output = shell_output("#{bin}/happ --help")
+              assert_match "happ", output
+              assert_match "jq", output
+            end
+          end
+          EOF
 
           cd "${TAP_DIR}"
           if git diff --quiet -- Formula/happ.rb; then
