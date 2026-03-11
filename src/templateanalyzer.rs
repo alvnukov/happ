@@ -82,7 +82,9 @@ pub fn analyze_template(src: &str) -> TemplateAnalysis {
                 "nested_action_before_close",
                 "found new '{{' before closing current template action".to_string(),
             ));
-            let nested_fragment = &action[nested_offset..];
+            let Some(nested_fragment) = action.get(nested_offset..) else {
+                continue;
+            };
             for name in collect_include_names_in_template(nested_fragment) {
                 let _ = include_names.insert(name);
             }
@@ -171,9 +173,10 @@ pub fn analyze_chart_templates(files: &BTreeMap<String, String>) -> ChartTemplat
 pub fn collect_include_names_in_action(action: &str) -> Vec<String> {
     let bytes = action.as_bytes();
     let mut out = Vec::new();
+    let include = b"include";
     let mut i = 0usize;
-    while i + "include".len() <= bytes.len() {
-        if !action[i..].starts_with("include") {
+    while i + include.len() <= bytes.len() {
+        if !bytes_starts_with_at(bytes, i, include) {
             i += 1;
             continue;
         }
@@ -182,7 +185,7 @@ pub fn collect_include_names_in_action(action: &str) -> Vec<String> {
             continue;
         }
 
-        let mut j = i + "include".len();
+        let mut j = i + include.len();
         while j < bytes.len() && bytes[j].is_ascii_whitespace() {
             j += 1;
         }
@@ -201,7 +204,9 @@ pub fn collect_include_names_in_action(action: &str) -> Vec<String> {
             end += 1;
         }
         if end < bytes.len() {
-            out.push(action[start..end].to_string());
+            if let Some(name) = action.get(start..end) {
+                out.push(name.to_string());
+            }
             i = end + 1;
             continue;
         }
@@ -226,12 +231,15 @@ pub fn collect_values_paths_in_action(action: &str) -> Vec<Vec<String>> {
     for marker in ["$.Values.", ".Values."] {
         let mut cursor = 0usize;
         while cursor < action.len() {
-            let Some(rel) = action[cursor..].find(marker) else {
+            let Some(slice) = action.get(cursor..) else {
+                break;
+            };
+            let Some(rel) = slice.find(marker) else {
                 break;
             };
             let marker_pos = cursor + rel;
             if !is_values_marker_boundary(bytes, marker_pos) {
-                cursor = marker_pos + marker.len();
+                cursor = next_char_boundary(action, marker_pos + marker.len());
                 continue;
             }
             let start = marker_pos + marker.len();
@@ -245,7 +253,10 @@ pub fn collect_values_paths_in_action(action: &str) -> Vec<Vec<String>> {
                 break;
             }
             if end > start {
-                let raw = &action[start..end];
+                let Some(raw) = action.get(start..end) else {
+                    cursor = next_char_boundary(action, end.max(start.saturating_add(1)));
+                    continue;
+                };
                 if !raw.starts_with('.') && !raw.ends_with('.') && !raw.contains("..") {
                     let segs: Vec<String> = raw
                         .split('.')
@@ -257,7 +268,7 @@ pub fn collect_values_paths_in_action(action: &str) -> Vec<Vec<String>> {
                     }
                 }
             }
-            cursor = end.max(start + 1);
+            cursor = next_char_boundary(action, end.max(start.saturating_add(1)));
         }
     }
     out.into_iter()
@@ -282,7 +293,10 @@ pub fn extract_define_blocks(src: &str) -> BTreeMap<String, String> {
     let mut stack: Vec<TemplateBlockFrame> = Vec::new();
     let mut cursor = 0usize;
     while cursor < src.len() {
-        let Some(open_rel) = src[cursor..].find("{{") else {
+        let Some(slice) = src.get(cursor..) else {
+            break;
+        };
+        let Some(open_rel) = slice.find("{{") else {
             break;
         };
         let open = cursor + open_rel;
@@ -429,6 +443,22 @@ fn is_include_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'
 }
 
+fn bytes_starts_with_at(bytes: &[u8], offset: usize, needle: &[u8]) -> bool {
+    bytes
+        .get(offset..offset.saturating_add(needle.len()))
+        .is_some_and(|slice| slice == needle)
+}
+
+fn next_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
 fn is_values_marker_boundary(bytes: &[u8], marker_pos: usize) -> bool {
     if marker_pos == 0 {
         return true;
@@ -550,9 +580,10 @@ fn collect_include_names_in_action_with_diagnostics(
     let bytes = action.as_bytes();
     let mut out = Vec::new();
     let mut diagnostics = Vec::new();
+    let include = b"include";
     let mut i = 0usize;
-    while i + "include".len() <= bytes.len() {
-        if !action[i..].starts_with("include") {
+    while i + include.len() <= bytes.len() {
+        if !bytes_starts_with_at(bytes, i, include) {
             i += 1;
             continue;
         }
@@ -561,7 +592,7 @@ fn collect_include_names_in_action_with_diagnostics(
             continue;
         }
 
-        let mut j = i + "include".len();
+        let mut j = i + include.len();
         while j < bytes.len() && bytes[j].is_ascii_whitespace() {
             j += 1;
         }
@@ -592,7 +623,9 @@ fn collect_include_names_in_action_with_diagnostics(
             end += 1;
         }
         if end < bytes.len() {
-            out.push(action[start..end].to_string());
+            if let Some(name) = action.get(start..end) {
+                out.push(name.to_string());
+            }
             i = end + 1;
             continue;
         }
@@ -669,6 +702,14 @@ global:
     }
 
     #[test]
+    fn include_extraction_handles_unicode_action_without_panicking() {
+        let names = collect_include_names_in_action(
+            r#"{{- fail (printf "Не установлены лимиты по памяти %s" $.CurrentApp.name) }}"#,
+        );
+        assert!(names.is_empty());
+    }
+
+    #[test]
     fn include_extraction_template_dedupes_and_sorts_names() {
         let names = collect_include_names_in_template(
             r#"
@@ -724,6 +765,12 @@ global:
         let paths = collect_values_paths_in_action(
             r#"{{ .Values..broken }} {{ .Values.good..bad }} {{ .Values.also-bad. }}"#,
         );
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn values_paths_handle_non_ascii_segment_without_panicking() {
+        let paths = collect_values_paths_in_action(r#"{{ .Values.Ж }}"#);
         assert!(paths.is_empty());
     }
 
@@ -881,6 +928,14 @@ data:
             .diagnostics
             .iter()
             .any(|d| d.code == "unterminated_action" && d.line == 4 && d.column == 8));
+    }
+
+    #[test]
+    fn analyze_template_with_unicode_action_does_not_panic() {
+        let analyzed = analyze_template(
+            r#"{{- fail (printf "Не установлены лимиты по памяти %s" $.CurrentApp.name) }}"#,
+        );
+        assert!(analyzed.include_names.is_empty());
     }
 
     #[test]

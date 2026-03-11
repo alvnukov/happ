@@ -1,3 +1,5 @@
+use crate::go_compat::parse::parse_action_compat;
+use crate::gotemplates::{scan_template_actions, GoTemplateScanError};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response, ResponseError};
 use lsp_types::{
     notification::{Notification as LspNotificationTrait, PublishDiagnostics},
@@ -7,7 +9,9 @@ use lsp_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 use serde_yaml::{Mapping as YamlMapping, Number as YamlNumber, Value as YamlValue};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::thread;
@@ -32,6 +36,32 @@ struct ServerState {
 #[derive(Clone)]
 struct DocumentState {
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListEntitiesParams {
+    uri: Option<String>,
+    text: Option<String>,
+    env: Option<String>,
+    apply_includes: Option<bool>,
+    apply_env_resolution: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListEntitiesResult {
+    groups: Vec<EntityGroup>,
+    default_env: String,
+    used_env: String,
+    env_discovery: EnvironmentDiscovery,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EntityGroup {
+    name: String,
+    apps: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +104,33 @@ struct RenderEntityManifestResult {
     default_env: String,
     used_env: String,
     env_discovery: EnvironmentDiscovery,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TemplateAssistParams {
+    uri: Option<String>,
+    text: Option<String>,
+    line: u32,
+    character: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TemplateAssistResult {
+    inside_template: bool,
+    completions: Vec<TemplateAssistCompletion>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TemplateAssistCompletion {
+    label: String,
+    insert_text: String,
+    detail: String,
+    kind: String,
+    replace_start: u32,
+    replace_end: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,7 +205,13 @@ pub fn run(args: crate::cli::LspArgs) -> Result<(), Error> {
         "experimental": {
             "helmAppsFullLanguageFeatures": false,
             "status": "in-progress",
-            "customMethods": ["happ/resolveEntity", "happ/renderEntityManifest", "happ/getPreviewTheme"]
+            "customMethods": [
+                "happ/listEntities",
+                "happ/resolveEntity",
+                "happ/renderEntityManifest",
+                "happ/getPreviewTheme",
+                "happ/templateAssist"
+            ]
         }
     });
     let _initialize_params = connection.initialize(server_capabilities)?;
@@ -214,6 +277,26 @@ fn handle_request(
     req: &Request,
 ) -> Result<(), Error> {
     match req.method.as_str() {
+        "happ/listEntities" => {
+            let params: ListEntitiesParams = match serde_json::from_value(req.params.clone()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return send_error(
+                        connection,
+                        req.id.clone(),
+                        -32602,
+                        format!("invalid params for happ/listEntities: {err}"),
+                    );
+                }
+            };
+            match list_entities_request(state, params) {
+                Ok(result) => {
+                    let value = serde_json::to_value(result).unwrap_or(JsonValue::Null);
+                    send_ok(connection, req.id.clone(), value)
+                }
+                Err(err) => send_error(connection, req.id.clone(), -32001, err),
+            }
+        }
         "happ/resolveEntity" => {
             let params: ResolveEntityParams = match serde_json::from_value(req.params.clone()) {
                 Ok(v) => v,
@@ -258,6 +341,26 @@ fn handle_request(
         "happ/getPreviewTheme" => {
             let value = serde_json::to_value(preview_theme_request()).unwrap_or(JsonValue::Null);
             send_ok(connection, req.id.clone(), value)
+        }
+        "happ/templateAssist" => {
+            let params: TemplateAssistParams = match serde_json::from_value(req.params.clone()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return send_error(
+                        connection,
+                        req.id.clone(),
+                        -32602,
+                        format!("invalid params for happ/templateAssist: {err}"),
+                    );
+                }
+            };
+            match template_assist_request(state, params) {
+                Ok(result) => {
+                    let value = serde_json::to_value(result).unwrap_or(JsonValue::Null);
+                    send_ok(connection, req.id.clone(), value)
+                }
+                Err(err) => send_error(connection, req.id.clone(), -32001, err),
+            }
         }
         _ => send_error(
             connection,
@@ -318,6 +421,54 @@ fn handle_notification(
         }
     }
     Ok(())
+}
+
+fn list_entities_request(
+    state: &ServerState,
+    params: ListEntitiesParams,
+) -> Result<ListEntitiesResult, String> {
+    let text = if let Some(text) = params.text {
+        text
+    } else if let Some(uri) = params.uri.as_ref() {
+        state
+            .documents
+            .get(uri)
+            .map(|d| d.text.clone())
+            .ok_or_else(|| format!("document not found in LSP state: {uri}"))?
+    } else {
+        return Err("either 'text' or 'uri' must be provided".to_string());
+    };
+
+    let request_uri = params
+        .uri
+        .as_ref()
+        .and_then(|value| value.parse::<Uri>().ok());
+    let apply_includes = params.apply_includes.unwrap_or(true);
+    let apply_env = params.apply_env_resolution.unwrap_or(true);
+
+    let root_map = if apply_includes {
+        parse_and_expand_values_root(request_uri.as_ref(), &text)
+            .ok_or_else(|| "failed to parse values root with include expansion".to_string())?
+    } else {
+        parse_yaml_map_to_json_map(&text)?
+    };
+
+    let values = JsonValue::Object(root_map);
+    let env_discovery = discover_environments(&values);
+    let default_env = detect_default_env(&values, &env_discovery);
+    let used_env = params.env.unwrap_or_else(|| default_env.clone());
+    let visible_values = if apply_env {
+        resolve_env_maps(&values, &used_env)
+    } else {
+        values
+    };
+
+    Ok(ListEntitiesResult {
+        groups: collect_entity_groups(&visible_values),
+        default_env,
+        used_env,
+        env_discovery,
+    })
 }
 
 fn resolve_entity_request(
@@ -430,20 +581,20 @@ fn resolve_entity_context(
         return Err("either 'text' or 'uri' must be provided".to_string());
     };
 
-    let yaml_value: serde_yaml::Value =
-        serde_yaml::from_str(&text).map_err(|e| format!("yaml parse error: {e}"))?;
-    let root_json: JsonValue =
-        serde_json::to_value(yaml_value).map_err(|e| format!("json conversion error: {e}"))?;
-    let root_map = as_obj(&root_json).ok_or_else(|| "values document must be a map".to_string())?;
-
     let apply_includes = apply_includes.unwrap_or(true);
     let apply_env = apply_env_resolution.unwrap_or(true);
+    let request_uri = uri
+        .as_ref()
+        .and_then(|value| value.parse::<Uri>().ok());
 
-    let expanded = if apply_includes {
-        JsonValue::Object(expand_includes_in_values(root_map)?)
+    let root_map = if apply_includes {
+        parse_and_expand_values_root(request_uri.as_ref(), &text)
+            .ok_or_else(|| "failed to parse values root with include expansion".to_string())?
     } else {
-        JsonValue::Object(root_map.clone())
+        parse_yaml_map_to_json_map(&text)?
     };
+
+    let expanded = JsonValue::Object(root_map.clone());
 
     let env_discovery = discover_environments(&expanded);
     let default_env = detect_default_env(&expanded, &env_discovery);
@@ -470,6 +621,42 @@ fn resolve_entity_context(
         used_env,
         env_discovery,
     })
+}
+
+fn collect_entity_groups(values: &JsonValue) -> Vec<EntityGroup> {
+    let Some(root) = as_obj(values) else {
+        return Vec::new();
+    };
+    let mut group_names: Vec<String> = root.keys().cloned().collect();
+    group_names.sort();
+
+    let mut groups = Vec::new();
+    for group_name in group_names {
+        if group_name == "global" {
+            continue;
+        }
+        let Some(group_map) = root.get(&group_name).and_then(as_obj) else {
+            continue;
+        };
+        let mut apps: Vec<String> = group_map
+            .iter()
+            .filter_map(|(name, value)| {
+                if name == "__GroupVars__" || !value.is_object() {
+                    return None;
+                }
+                Some(name.clone())
+            })
+            .collect();
+        apps.sort();
+        if apps.is_empty() {
+            continue;
+        }
+        groups.push(EntityGroup {
+            name: group_name,
+            apps,
+        });
+    }
+    groups
 }
 
 fn render_manifest_for_entity(
@@ -614,11 +801,7 @@ fn build_manifest_preview_values(
     ]);
     collect_global_keys_referenced(entity, &mut required_keys);
 
-    if !apply_includes {
-        required_keys.insert("_includes".to_string());
-        required_keys.insert("_include_from_file".to_string());
-        required_keys.insert("_include_files".to_string());
-    }
+    let _ = apply_includes; // preserved for API compatibility
 
     let mut global_map = JsonMap::new();
     for key in required_keys {
@@ -626,6 +809,9 @@ fn build_manifest_preview_values(
             global_map.insert(key, value.clone());
         }
     }
+    // Manifest preview receives already-resolved entity; keep include storage minimal
+    // to avoid unrelated include payload validation side-effects.
+    global_map.insert("_includes".to_string(), JsonValue::Object(JsonMap::new()));
     global_map.insert("env".to_string(), JsonValue::String(env.to_string()));
 
     let mut app_map = JsonMap::new();
@@ -634,7 +820,35 @@ fn build_manifest_preview_values(
     let mut values_map = JsonMap::new();
     values_map.insert("global".to_string(), JsonValue::Object(global_map));
     values_map.insert(group.to_string(), JsonValue::Object(app_map));
-    JsonValue::Object(values_map)
+    let mut out = JsonValue::Object(values_map);
+    normalize_include_fields_for_render(&mut out);
+    out
+}
+
+fn normalize_include_fields_for_render(value: &mut JsonValue) {
+    match value {
+        JsonValue::Array(items) => {
+            for item in items {
+                normalize_include_fields_for_render(item);
+            }
+        }
+        JsonValue::Object(map) => {
+            for (key, nested) in map.iter_mut() {
+                if matches!(key.as_str(), "_include" | "_include_files")
+                    && matches!(nested, JsonValue::String(_))
+                {
+                    let raw = nested.as_str().unwrap_or_default().trim();
+                    if !raw.is_empty() {
+                        *nested = JsonValue::Array(vec![JsonValue::String(raw.to_string())]);
+                    } else {
+                        *nested = JsonValue::Array(Vec::new());
+                    }
+                }
+                normalize_include_fields_for_render(nested);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_global_keys_referenced(value: &JsonValue, out: &mut HashSet<String>) {
@@ -707,14 +921,9 @@ fn build_diagnostics(uri: &Uri, text: &str) -> Vec<Diagnostic> {
     let local_defs = collect_local_include_definitions(&lines);
     let usages = collect_include_usages(&lines);
     let include_file_refs = collect_include_file_refs(&lines);
-    let file_include_names: HashSet<String> = include_file_refs
-        .iter()
-        .filter(|r| r.kind == IncludeFileRefKind::IncludeFiles)
-        .map(|r| include_name_from_path(&r.path))
-        .collect();
-
+    let stitched_names = collect_stitched_include_name_context(uri, text);
     let mut defined_names: HashSet<String> = local_defs.iter().map(|d| d.name.clone()).collect();
-    defined_names.extend(file_include_names.iter().cloned());
+    defined_names.extend(stitched_names.defined_names);
 
     for usage in &usages {
         if defined_names.contains(&usage.name) {
@@ -730,8 +939,12 @@ fn build_diagnostics(uri: &Uri, text: &str) -> Vec<Diagnostic> {
         ));
     }
 
-    let used_names: HashSet<String> = usages.iter().map(|u| u.name.clone()).collect();
+    let mut used_names: HashSet<String> = usages.iter().map(|u| u.name.clone()).collect();
+    used_names.extend(stitched_names.used_names);
     for def in &local_defs {
+        if !def.emit_unused_diagnostic {
+            continue;
+        }
         if used_names.contains(&def.name) {
             continue;
         }
@@ -765,7 +978,1986 @@ fn build_diagnostics(uri: &Uri, text: &str) -> Vec<Diagnostic> {
         ));
     }
 
+    diagnostics.extend(build_template_diagnostics(uri, text, &lines));
+
     diagnostics
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplatePathRoot {
+    Values,
+    CurrentApp,
+    Release,
+    Chart,
+    Capabilities,
+    Werf,
+}
+
+#[derive(Debug, Clone)]
+struct TemplatePathRef {
+    root: TemplatePathRoot,
+    segments: Vec<String>,
+    full: String,
+}
+
+#[derive(Debug, Clone)]
+struct TemplatePathCompletionContext {
+    root: TemplatePathRoot,
+    parent_segments: Vec<String>,
+    query: String,
+    replace_start_byte: usize,
+    replace_end_byte: usize,
+}
+
+#[derive(Debug, Clone)]
+struct IncludeCallRef {
+    name: String,
+    list_arg_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IncludeArity {
+    min: usize,
+    max: Option<usize>,
+}
+
+fn template_assist_request(
+    state: &ServerState,
+    params: TemplateAssistParams,
+) -> Result<TemplateAssistResult, String> {
+    let request_uri = params
+        .uri
+        .as_ref()
+        .and_then(|value| value.parse::<Uri>().ok());
+    let text = if let Some(text) = params.text {
+        text
+    } else if let Some(uri) = params.uri.as_ref() {
+        state
+            .documents
+            .get(uri)
+            .map(|d| d.text.clone())
+            .ok_or_else(|| format!("document not found in LSP state: {uri}"))?
+    } else {
+        return Err("either 'text' or 'uri' must be provided".to_string());
+    };
+
+    let line_index = TextLineIndex::new(&text);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let line = params.line as usize;
+    let line_text = lines.get(line).copied().unwrap_or_default();
+    let cursor_col_utf16 = params.character as usize;
+    let cursor_offset = line_index.offset_for_line_utf16(line_text, line, cursor_col_utf16);
+
+    let Some((action_start, action_end)) = find_template_action_at_cursor(&text, cursor_offset)
+    else {
+        return Ok(TemplateAssistResult {
+            inside_template: false,
+            completions: Vec::new(),
+        });
+    };
+
+    let action_text = &text[action_start..action_end];
+    let cursor_in_action = cursor_offset.saturating_sub(action_start);
+
+    let expanded_values =
+        parse_and_expand_values_root(request_uri.as_ref(), &text).map(JsonValue::Object);
+    let mut completions = Vec::new();
+
+    if let Some(path_ctx) = find_template_path_completion_context(action_text, cursor_in_action) {
+        let replace_start_abs = action_start + path_ctx.replace_start_byte;
+        let replace_end_abs = action_start + path_ctx.replace_end_byte;
+        let replace_start = line_index.utf16_col_for_offset(line_text, line, replace_start_abs);
+        let replace_end = line_index.utf16_col_for_offset(line_text, line, replace_end_abs);
+
+        let candidate_keys = match path_ctx.root {
+            TemplatePathRoot::Values => expanded_values.as_ref().map_or_else(Vec::new, |root| {
+                keys_for_values_path(root, &path_ctx.parent_segments)
+            }),
+            TemplatePathRoot::CurrentApp => {
+                expanded_values.as_ref().map_or_else(Vec::new, |root| {
+                    resolve_current_app_value_at_line(root, &lines, line)
+                        .as_ref()
+                        .and_then(|app_obj| object_at_path(app_obj, &path_ctx.parent_segments))
+                        .map(sorted_keys)
+                        .map(|mut keys| {
+                            if path_ctx.parent_segments.is_empty() {
+                                add_missing_keys(&mut keys, CURRENT_APP_RUNTIME_KEYS);
+                            }
+                            keys
+                        })
+                        .unwrap_or_else(|| {
+                            if path_ctx.parent_segments.is_empty() {
+                                CURRENT_APP_RUNTIME_KEYS
+                                    .iter()
+                                    .map(|key| (*key).to_string())
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            }
+                        })
+                })
+            }
+            TemplatePathRoot::Release => {
+                keys_for_builtin_root_path(TemplatePathRoot::Release, &path_ctx.parent_segments)
+            }
+            TemplatePathRoot::Chart => {
+                keys_for_builtin_root_path(TemplatePathRoot::Chart, &path_ctx.parent_segments)
+            }
+            TemplatePathRoot::Capabilities => keys_for_builtin_root_path(
+                TemplatePathRoot::Capabilities,
+                &path_ctx.parent_segments,
+            ),
+            TemplatePathRoot::Werf => {
+                keys_for_builtin_root_path(TemplatePathRoot::Werf, &path_ctx.parent_segments)
+            }
+        };
+
+        for key in candidate_keys {
+            if !path_ctx.query.is_empty() && !key.starts_with(&path_ctx.query) {
+                continue;
+            }
+            completions.push(TemplateAssistCompletion {
+                label: key.clone(),
+                insert_text: key,
+                detail: match path_ctx.root {
+                    TemplatePathRoot::Values => "$.Values".to_string(),
+                    TemplatePathRoot::CurrentApp => "$.CurrentApp".to_string(),
+                    TemplatePathRoot::Release => "$.Release".to_string(),
+                    TemplatePathRoot::Chart => "$.Chart".to_string(),
+                    TemplatePathRoot::Capabilities => "$.Capabilities".to_string(),
+                    TemplatePathRoot::Werf => "$.werf".to_string(),
+                },
+                kind: "property".to_string(),
+                replace_start,
+                replace_end,
+            });
+        }
+    } else {
+        let cursor_utf16 = params.character;
+        completions.push(TemplateAssistCompletion {
+            label: "fl.value".to_string(),
+            insert_text: "include \"fl.value\" (list $ . ${1:value})".to_string(),
+            detail: "Render template-aware value".to_string(),
+            kind: "snippet".to_string(),
+            replace_start: cursor_utf16,
+            replace_end: cursor_utf16,
+        });
+        completions.push(TemplateAssistCompletion {
+            label: "fl.valueQuoted".to_string(),
+            insert_text: "include \"fl.valueQuoted\" (list $ . ${1:value})".to_string(),
+            detail: "Render value and quote result".to_string(),
+            kind: "snippet".to_string(),
+            replace_start: cursor_utf16,
+            replace_end: cursor_utf16,
+        });
+        completions.push(TemplateAssistCompletion {
+            label: "$.Values".to_string(),
+            insert_text: "$.Values".to_string(),
+            detail: "Root values map".to_string(),
+            kind: "keyword".to_string(),
+            replace_start: cursor_utf16,
+            replace_end: cursor_utf16,
+        });
+        completions.push(TemplateAssistCompletion {
+            label: "$.CurrentApp".to_string(),
+            insert_text: "$.CurrentApp".to_string(),
+            detail: "Current app map".to_string(),
+            kind: "keyword".to_string(),
+            replace_start: cursor_utf16,
+            replace_end: cursor_utf16,
+        });
+        completions.push(TemplateAssistCompletion {
+            label: "$.Release".to_string(),
+            insert_text: "$.Release".to_string(),
+            detail: "Helm release metadata".to_string(),
+            kind: "keyword".to_string(),
+            replace_start: cursor_utf16,
+            replace_end: cursor_utf16,
+        });
+        completions.push(TemplateAssistCompletion {
+            label: "$.Chart".to_string(),
+            insert_text: "$.Chart".to_string(),
+            detail: "Helm chart metadata".to_string(),
+            kind: "keyword".to_string(),
+            replace_start: cursor_utf16,
+            replace_end: cursor_utf16,
+        });
+        completions.push(TemplateAssistCompletion {
+            label: "$.Capabilities".to_string(),
+            insert_text: "$.Capabilities".to_string(),
+            detail: "Helm cluster capabilities".to_string(),
+            kind: "keyword".to_string(),
+            replace_start: cursor_utf16,
+            replace_end: cursor_utf16,
+        });
+        completions.push(TemplateAssistCompletion {
+            label: "$.werf".to_string(),
+            insert_text: "$.werf".to_string(),
+            detail: "Werf runtime context".to_string(),
+            kind: "keyword".to_string(),
+            replace_start: cursor_utf16,
+            replace_end: cursor_utf16,
+        });
+    }
+
+    Ok(TemplateAssistResult {
+        inside_template: true,
+        completions,
+    })
+}
+
+fn build_template_diagnostics(_uri: &Uri, text: &str, lines: &[&str]) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let line_index = TextLineIndex::new(text);
+    let expanded_values = parse_and_expand_values_root(Some(_uri), text).map(JsonValue::Object);
+
+    let (spans, scan_errors) = scan_template_actions(text);
+    for err in scan_errors {
+        let line = line_index.line_for_offset(err.offset);
+        diagnostics.push(make_diagnostic(
+            line,
+            lines,
+            "{{",
+            DiagnosticSeverity::WARNING,
+            format!("Template syntax error: {}", err.message),
+            Some("E_TPL_PARSE".to_string()),
+            ));
+    }
+
+    for typo in collect_single_left_delim_typos(text, &spans) {
+        diagnostics.push(make_diagnostic_at_offset(
+            &line_index,
+            lines,
+            typo.offset,
+            typo.len,
+            DiagnosticSeverity::WARNING,
+            "Possible template typo: expected '{{ ... }}', found '{ ... }}'".to_string(),
+            Some("E_TPL_SINGLE_LEFT_DELIM".to_string()),
+        ));
+    }
+
+    for span in &spans {
+        let action = &text[span.start..span.end];
+        let line = line_index.line_for_offset(span.start);
+
+        if let Err(err) = parse_action_rust_native(action, span.start) {
+            diagnostics.push(make_diagnostic(
+                line,
+                lines,
+                "{{",
+                DiagnosticSeverity::WARNING,
+                format!(
+                    "Possible template issue: {} (soft check for values rendered via fl.value)",
+                    err.message
+                ),
+                Some("E_TPL_SOFT_PARSE".to_string()),
+            ));
+        }
+
+        for local_values_ref in collect_local_values_refs_in_action(action) {
+            diagnostics.push(make_diagnostic(
+                line,
+                lines,
+                &local_values_ref,
+                DiagnosticSeverity::WARNING,
+                format!(
+                    "Local template path '{}' is not supported in library context; use '$.Values...'",
+                    local_values_ref
+                ),
+                Some("E_TPL_LOCAL_VALUES_CONTEXT".to_string()),
+            ));
+        }
+
+        for include_call in collect_include_calls_in_action(action) {
+            let Some(signature) = library_include_arity(&include_call.name) else {
+                continue;
+            };
+            let Some(argc) = include_call.list_arg_count else {
+                continue;
+            };
+            if argc < signature.min || signature.max.is_some_and(|max| argc > max) {
+                let expected = match signature.max {
+                    Some(max) if max == signature.min => format!("exactly {}", signature.min),
+                    Some(max) => format!("{}..{}", signature.min, max),
+                    None => format!("at least {}", signature.min),
+                };
+                diagnostics.push(make_diagnostic(
+                    line,
+                    lines,
+                    &include_call.name,
+                    DiagnosticSeverity::WARNING,
+                    format!(
+                        "Library include '{}' expects list args count {}, got {}",
+                        include_call.name, expected, argc
+                    ),
+                    Some("E_INCLUDE_ARGC".to_string()),
+                ));
+            }
+        }
+
+        let Some(root_value) = expanded_values.as_ref() else {
+            continue;
+        };
+        for path_ref in collect_template_path_refs_in_action(action) {
+            match path_ref.root {
+                TemplatePathRoot::Values => {
+                    if !value_has_path_or_virtual(
+                        root_value,
+                        TemplatePathRoot::Values,
+                        &path_ref.segments,
+                    ) {
+                        diagnostics.push(make_diagnostic(
+                            line,
+                            lines,
+                            &path_ref.full,
+                            DiagnosticSeverity::WARNING,
+                            format!(
+                                "Unknown template path: {} (not found in $.Values)",
+                                path_ref.full
+                            ),
+                            Some("E_TPL_UNKNOWN_VALUES_PATH".to_string()),
+                        ));
+                    }
+                }
+                TemplatePathRoot::CurrentApp => {
+                    let Some(current_app) =
+                        resolve_current_app_value_at_line(root_value, lines, line)
+                    else {
+                        diagnostics.push(make_diagnostic(
+                            line,
+                            lines,
+                            &path_ref.full,
+                            DiagnosticSeverity::WARNING,
+                            format!(
+                                "Template path {} uses $.CurrentApp outside app scope",
+                                path_ref.full
+                            ),
+                            Some("E_TPL_CURRENT_APP_SCOPE".to_string()),
+                        ));
+                        continue;
+                    };
+                    if !value_has_path_or_virtual(
+                        &current_app,
+                        TemplatePathRoot::CurrentApp,
+                        &path_ref.segments,
+                    ) {
+                        diagnostics.push(make_diagnostic(
+                            line,
+                            lines,
+                            &path_ref.full,
+                            DiagnosticSeverity::WARNING,
+                            format!(
+                                "Unknown template path: {} (not found in $.CurrentApp)",
+                                path_ref.full
+                            ),
+                            Some("E_TPL_UNKNOWN_CURRENT_APP_PATH".to_string()),
+                        ));
+                    }
+                }
+                TemplatePathRoot::Release
+                | TemplatePathRoot::Chart
+                | TemplatePathRoot::Capabilities
+                | TemplatePathRoot::Werf => {
+                    if !builtin_root_has_path(path_ref.root, &path_ref.segments) {
+                        let root_name = template_root_label(path_ref.root);
+                        diagnostics.push(make_diagnostic(
+                            line,
+                            lines,
+                            &path_ref.full,
+                            DiagnosticSeverity::WARNING,
+                            format!(
+                                "Unknown template path: {} (not found in {})",
+                                path_ref.full, root_name
+                            ),
+                            Some("E_TPL_UNKNOWN_BUILTIN_PATH".to_string()),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    diagnostics
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SingleLeftDelimTypo {
+    offset: usize,
+    len: usize,
+}
+
+fn collect_single_left_delim_typos(text: &str, spans: &[crate::gotemplates::GoTemplateActionSpan]) -> Vec<SingleLeftDelimTypo> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut span_idx = 0usize;
+
+    while i + 1 < bytes.len() {
+        while span_idx < spans.len() && i >= spans[span_idx].end {
+            span_idx += 1;
+        }
+        if span_idx < spans.len() && i >= spans[span_idx].start && i < spans[span_idx].end {
+            i = spans[span_idx].end;
+            continue;
+        }
+
+        if bytes[i] != b'{' || bytes[i + 1] == b'{' {
+            i += 1;
+            continue;
+        }
+
+        let search_from = i + 1;
+        let Some(close_rel) = text[search_from..].find("}}") else {
+            i += 1;
+            continue;
+        };
+        let close_start = search_from + close_rel;
+        let close_end = close_start + 2;
+        let Some(inner) = text.get(search_from..close_start) else {
+            i += 1;
+            continue;
+        };
+        let synthesized = format!("{{{{{inner}}}}}");
+        if parse_action_rust_native(&synthesized, i).is_ok() {
+            out.push(SingleLeftDelimTypo {
+                offset: i,
+                len: close_end.saturating_sub(i),
+            });
+            i = close_end;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    out
+}
+
+fn parse_action_rust_native(
+    action: &str,
+    action_start: usize,
+) -> Result<(), GoTemplateScanError> {
+    // LSP soft diagnostics use Rust-native parser only (no Go FFI runtime).
+    parse_action_compat(action, action_start).map(|_| ())
+}
+
+fn library_include_arity(name: &str) -> Option<IncludeArity> {
+    match name {
+        "fl.value" | "fl.valueQuoted" | "fl.valueSingleQuoted" | "fl.isTrue" | "fl.isFalse" => {
+            Some(IncludeArity {
+                min: 3,
+                max: Some(4),
+            })
+        }
+        "fl.currentEnv" => Some(IncludeArity {
+            min: 1,
+            max: Some(1),
+        }),
+        "fl.expandIncludesInValues" => Some(IncludeArity {
+            min: 2,
+            max: Some(2),
+        }),
+        "apps-utils.error" => Some(IncludeArity {
+            min: 5,
+            max: Some(6),
+        }),
+        _ => None,
+    }
+}
+
+const CURRENT_APP_RUNTIME_KEYS: &[&str] = &[
+    "CurrentAppVersion",
+    "CurrentReleaseVersion",
+    "__AppName__",
+    "__Rendered__",
+    "_currentContainersType",
+    "__annotations__",
+    "_options",
+];
+
+const VALUES_RUNTIME_ROOT_KEYS: &[&str] = &[
+    "werf",
+    "deploy",
+    "releases",
+    "global",
+    "enabled",
+    "helm-apps",
+];
+
+fn template_root_label(root: TemplatePathRoot) -> &'static str {
+    match root {
+        TemplatePathRoot::Values => "$.Values",
+        TemplatePathRoot::CurrentApp => "$.CurrentApp",
+        TemplatePathRoot::Release => "$.Release",
+        TemplatePathRoot::Chart => "$.Chart",
+        TemplatePathRoot::Capabilities => "$.Capabilities",
+        TemplatePathRoot::Werf => "$.werf",
+    }
+}
+
+fn builtin_root_has_path(root: TemplatePathRoot, segments: &[String]) -> bool {
+    let Some(schema) = builtin_root_schema(root) else {
+        return false;
+    };
+    value_has_path(schema, segments)
+}
+
+fn keys_for_builtin_root_path(root: TemplatePathRoot, parent_segments: &[String]) -> Vec<String> {
+    let Some(schema) = builtin_root_schema(root) else {
+        return Vec::new();
+    };
+    object_at_path(schema, parent_segments)
+        .map(sorted_keys)
+        .unwrap_or_default()
+}
+
+fn builtin_root_schema(root: TemplatePathRoot) -> Option<&'static JsonValue> {
+    match root {
+        TemplatePathRoot::Release => {
+            static RELEASE: std::sync::OnceLock<JsonValue> = std::sync::OnceLock::new();
+            Some(RELEASE.get_or_init(|| {
+                json!({
+                    "Name": "",
+                    "Namespace": "",
+                    "Service": "",
+                    "IsInstall": true,
+                    "IsUpgrade": false,
+                    "Revision": 1
+                })
+            }))
+        }
+        TemplatePathRoot::Chart => {
+            static CHART: std::sync::OnceLock<JsonValue> = std::sync::OnceLock::new();
+            Some(CHART.get_or_init(|| {
+                json!({
+                    "Name": "",
+                    "Version": "",
+                    "AppVersion": "",
+                    "Type": "",
+                    "Description": "",
+                    "Home": "",
+                    "Icon": "",
+                    "ApiVersion": "",
+                    "Keywords": [],
+                    "Sources": [],
+                    "Maintainers": [],
+                    "Annotations": {}
+                })
+            }))
+        }
+        TemplatePathRoot::Capabilities => {
+            static CAPABILITIES: std::sync::OnceLock<JsonValue> = std::sync::OnceLock::new();
+            Some(CAPABILITIES.get_or_init(|| {
+                json!({
+                    "KubeVersion": {
+                        "Version": "",
+                        "Major": "",
+                        "Minor": "",
+                        "GitVersion": "",
+                        "GitCommit": "",
+                        "GitTreeState": "",
+                        "BuildDate": "",
+                        "GoVersion": "",
+                        "Compiler": "",
+                        "Platform": ""
+                    },
+                    "HelmVersion": {
+                        "Version": "",
+                        "GitCommit": "",
+                        "GitTreeState": "",
+                        "GoVersion": ""
+                    },
+                    "APIVersions": {
+                        "Has": ""
+                    }
+                })
+            }))
+        }
+        TemplatePathRoot::Werf => {
+            static WERF: std::sync::OnceLock<JsonValue> = std::sync::OnceLock::new();
+            Some(WERF.get_or_init(|| {
+                json!({
+                    "env": "",
+                    "namespace": "",
+                    "name": "",
+                    "repo": "",
+                    "tag": "",
+                    "commit": ""
+                })
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn parse_and_expand_values_root(
+    uri: Option<&Uri>,
+    text: &str,
+) -> Option<JsonMap<String, JsonValue>> {
+    let mut overrides: HashMap<PathBuf, String> = HashMap::new();
+    let mut current_base_dir: Option<PathBuf> = None;
+
+    if let Some(uri) = uri {
+        if let Some(current_path) = file_path_from_uri_string(&uri.to_string()) {
+            current_base_dir = current_path.parent().map(Path::to_path_buf);
+            overrides.insert(normalize_fs_path(&current_path), text.to_string());
+
+            if let Some(chart_root) = find_chart_root_from_path(&current_path) {
+                if let Some(root_values_path) = find_primary_values_file(&chart_root) {
+                    let root_text =
+                        read_text_from_path_with_overrides(&root_values_path, &overrides).ok()?;
+                    if let Ok(root_map) = parse_yaml_map_to_json_map(&root_text) {
+                        if let Ok(with_files) = expand_values_with_file_includes(
+                            &root_map,
+                            root_values_path.parent(),
+                            &overrides,
+                        ) {
+                            if let Ok(expanded) = expand_includes_in_values(&with_files) {
+                                return Some(expanded);
+                            }
+                            return Some(with_files);
+                        }
+                        return Some(root_map);
+                    }
+                }
+            }
+        }
+    }
+
+    let root_map = parse_yaml_map_to_json_map(text).ok()?;
+    let with_files =
+        expand_values_with_file_includes(&root_map, current_base_dir.as_deref(), &overrides)
+            .ok()?;
+    expand_includes_in_values(&with_files).ok()
+}
+
+fn parse_yaml_map_to_json_map(text: &str) -> Result<JsonMap<String, JsonValue>, String> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(text).map_err(|err| err.to_string())?;
+    let root_json: JsonValue = serde_json::to_value(yaml).map_err(|err| err.to_string())?;
+    as_obj(&root_json)
+        .cloned()
+        .ok_or_else(|| "values document must be a YAML map".to_string())
+}
+
+fn normalize_fs_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn find_chart_root_from_path(path: &Path) -> Option<PathBuf> {
+    let mut current = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    loop {
+        if current.join("Chart.yaml").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn find_primary_values_file(chart_root: &Path) -> Option<PathBuf> {
+    let candidates = [
+        chart_root.join("values.yaml"),
+        chart_root.join("values.yml"),
+    ];
+    for candidate in candidates {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn expand_values_with_file_includes(
+    values: &JsonMap<String, JsonValue>,
+    include_base_dir: Option<&Path>,
+    overrides: &HashMap<PathBuf, String>,
+) -> Result<JsonMap<String, JsonValue>, String> {
+    let mut injected_includes: JsonMap<String, JsonValue> = JsonMap::new();
+    let mut file_stack: HashSet<PathBuf> = HashSet::new();
+    let processed = process_file_include_node(
+        &JsonValue::Object(values.clone()),
+        include_base_dir,
+        &[],
+        &mut injected_includes,
+        overrides,
+        &mut file_stack,
+    )?;
+    let mut root = as_obj(&processed)
+        .cloned()
+        .ok_or_else(|| "expanded values must stay a YAML map".to_string())?;
+    ensure_global_includes_map(&mut root);
+    if !injected_includes.is_empty() {
+        let global = root
+            .entry("global".to_string())
+            .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+        if let Some(global_map) = as_obj(global).cloned() {
+            let mut global_map_mut = global_map;
+            let includes = global_map_mut
+                .entry("_includes".to_string())
+                .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+            if let Some(includes_map) = as_obj(includes).cloned() {
+                let mut includes_map_mut = includes_map;
+                for (name, payload) in injected_includes {
+                    includes_map_mut.insert(name, payload);
+                }
+                global_map_mut.insert("_includes".to_string(), JsonValue::Object(includes_map_mut));
+            }
+            root.insert("global".to_string(), JsonValue::Object(global_map_mut));
+        }
+    }
+    Ok(root)
+}
+
+fn process_file_include_node(
+    node: &JsonValue,
+    include_base_dir: Option<&Path>,
+    path_segments: &[String],
+    injected_includes: &mut JsonMap<String, JsonValue>,
+    overrides: &HashMap<PathBuf, String>,
+    file_stack: &mut HashSet<PathBuf>,
+) -> Result<JsonValue, String> {
+    match node {
+        JsonValue::Array(items) => Ok(JsonValue::Array(items.clone())),
+        JsonValue::Object(map) => {
+            let mut current = map.clone();
+
+            let include_from_file = current
+                .get("_include_from_file")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            if let Some(raw_path) = include_from_file {
+                current.remove("_include_from_file");
+                let loaded =
+                    load_yaml_map_from_file(&raw_path, include_base_dir, overrides, file_stack).ok();
+                if let Some((_loaded_path, loaded_map)) = loaded.flatten() {
+                    let loaded_processed = process_file_include_node(
+                        &JsonValue::Object(loaded_map),
+                        include_base_dir,
+                        path_segments,
+                        injected_includes,
+                        overrides,
+                        file_stack,
+                    )?;
+                    let mut include_payload =
+                        as_obj(&loaded_processed).cloned().unwrap_or_default();
+                    if is_direct_global_includes_path(path_segments) {
+                        include_payload = normalize_global_includes_payload(&include_payload);
+                    }
+                    current = merge_maps(&include_payload, &current);
+                }
+            } else {
+                current.remove("_include_from_file");
+            }
+
+            if current.contains_key("_include_files") {
+                let file_refs = normalize_include_files(current.get("_include_files"));
+                let mut include_names: Vec<String> = Vec::new();
+                for raw_path_value in file_refs {
+                    let raw_path = raw_path_value.trim();
+                    let include_name = include_name_from_path(raw_path);
+                    let loaded =
+                        load_yaml_map_from_file(raw_path, include_base_dir, overrides, file_stack).ok();
+                    if let Some((_loaded_path, loaded_map)) = loaded.flatten() {
+                        let loaded_processed = process_file_include_node(
+                            &JsonValue::Object(loaded_map),
+                            include_base_dir,
+                            &[],
+                            injected_includes,
+                            overrides,
+                            file_stack,
+                        )?;
+                        if let Some(processed_map) = as_obj(&loaded_processed).cloned() {
+                            injected_includes
+                                .insert(include_name.clone(), JsonValue::Object(processed_map));
+                            include_names.push(include_name);
+                        }
+                    }
+                }
+                let mut merged_include = include_names;
+                merged_include.extend(normalize_include(current.get("_include")));
+                if !merged_include.is_empty() {
+                    current.insert(
+                        "_include".to_string(),
+                        JsonValue::Array(
+                            merged_include
+                                .into_iter()
+                                .map(JsonValue::String)
+                                .collect::<Vec<JsonValue>>(),
+                        ),
+                    );
+                }
+                current.remove("_include_files");
+            }
+
+            let mut out = JsonMap::new();
+            for (key, value) in current {
+                if let JsonValue::Object(_) = value {
+                    let mut next_path = path_segments.to_vec();
+                    next_path.push(key.clone());
+                    out.insert(
+                        key,
+                        process_file_include_node(
+                            &value,
+                            include_base_dir,
+                            &next_path,
+                            injected_includes,
+                            overrides,
+                            file_stack,
+                        )?,
+                    );
+                    continue;
+                }
+                out.insert(key, value);
+            }
+            Ok(JsonValue::Object(out))
+        }
+        _ => Ok(node.clone()),
+    }
+}
+
+fn ensure_global_includes_map(root: &mut JsonMap<String, JsonValue>) {
+    let global = root
+        .entry("global".to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    if !global.is_object() {
+        *global = JsonValue::Object(JsonMap::new());
+    }
+    if let JsonValue::Object(global_map) = global {
+        if !global_map
+            .get("_includes")
+            .is_some_and(|value| value.is_object())
+        {
+            global_map.insert("_includes".to_string(), JsonValue::Object(JsonMap::new()));
+        }
+    }
+}
+
+fn normalize_global_includes_payload(
+    loaded_map: &JsonMap<String, JsonValue>,
+) -> JsonMap<String, JsonValue> {
+    if let Some(includes) = loaded_map
+        .get("global")
+        .and_then(as_obj)
+        .and_then(|global| global.get("_includes"))
+        .and_then(as_obj)
+    {
+        return includes.clone();
+    }
+    loaded_map.clone()
+}
+
+fn read_text_from_path_with_overrides(
+    path: &Path,
+    overrides: &HashMap<PathBuf, String>,
+) -> Result<String, String> {
+    let normalized = normalize_fs_path(path);
+    if let Some(text) = overrides.get(&normalized) {
+        return Ok(text.clone());
+    }
+    std::fs::read_to_string(path)
+        .map_err(|err| format!("read include file '{}': {}", path.display(), err))
+}
+
+fn load_yaml_map_from_file(
+    raw_path: &str,
+    base_dir: Option<&Path>,
+    overrides: &HashMap<PathBuf, String>,
+    file_stack: &mut HashSet<PathBuf>,
+) -> Result<Option<(PathBuf, JsonMap<String, JsonValue>)>, String> {
+    if is_templated_include_path(raw_path) {
+        return Ok(None);
+    }
+    let candidates = build_include_candidates(raw_path, base_dir);
+    for candidate in candidates {
+        let normalized = normalize_fs_path(&candidate);
+        if file_stack.contains(&normalized) {
+            return Err(format!(
+                "_include file cycle detected: {}",
+                normalized.display()
+            ));
+        }
+        file_stack.insert(normalized.clone());
+        let loaded = read_text_from_path_with_overrides(&candidate, overrides);
+        file_stack.remove(&normalized);
+        let text = match loaded {
+            Ok(value) => value,
+            Err(message) => {
+                let is_not_found = message.contains("No such file")
+                    || message.contains("not a directory")
+                    || message.contains("os error 2")
+                    || message.contains("os error 20");
+                if is_not_found {
+                    continue;
+                }
+                return Err(message);
+            }
+        };
+        let parsed = parse_yaml_map_to_json_map(&text)?;
+        return Ok(Some((candidate, parsed)));
+    }
+    Ok(None)
+}
+
+fn keys_for_values_path(value: &JsonValue, parent_segments: &[String]) -> Vec<String> {
+    if let Some(map) = object_at_path(value, parent_segments) {
+        let mut keys = sorted_keys(map);
+        if parent_segments.is_empty() {
+            add_missing_keys(&mut keys, VALUES_RUNTIME_ROOT_KEYS);
+        }
+        return keys;
+    }
+    if parent_segments.is_empty() {
+        return VALUES_RUNTIME_ROOT_KEYS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect();
+    }
+    Vec::new()
+}
+
+fn add_missing_keys(keys: &mut Vec<String>, extra: &[&str]) {
+    let mut seen: HashSet<String> = keys.iter().cloned().collect();
+    for key in extra {
+        if seen.insert((*key).to_string()) {
+            keys.push((*key).to_string());
+        }
+    }
+    keys.sort();
+}
+
+fn value_has_path_or_virtual(
+    value: &JsonValue,
+    root: TemplatePathRoot,
+    segments: &[String],
+) -> bool {
+    if segments.is_empty() {
+        return true;
+    }
+    if value_has_path(value, segments) {
+        return true;
+    }
+    let Some(first) = segments.first().map(String::as_str) else {
+        return false;
+    };
+    match root {
+        TemplatePathRoot::Values => {
+            if is_dynamic_values_path(segments) {
+                return true;
+            }
+            let top_exists = has_top_level_key(value, first);
+            if top_exists {
+                return segments.len() == 1;
+            }
+            VALUES_RUNTIME_ROOT_KEYS.iter().any(|key| *key == first) && segments.len() == 1
+        }
+        TemplatePathRoot::CurrentApp => {
+            if matches!(
+                first,
+                "CurrentAppVersion"
+                    | "CurrentReleaseVersion"
+                    | "__AppName__"
+                    | "__Rendered__"
+                    | "_currentContainersType"
+                    | "__annotations__"
+                    | "_options"
+            ) {
+                return true;
+            }
+            if is_dynamic_current_app_key(first) {
+                return true;
+            }
+            let top_exists = has_top_level_key(value, first);
+            if top_exists {
+                return segments.len() == 1;
+            }
+            false
+        }
+        TemplatePathRoot::Release
+        | TemplatePathRoot::Chart
+        | TemplatePathRoot::Capabilities
+        | TemplatePathRoot::Werf => false,
+    }
+}
+
+fn has_top_level_key(value: &JsonValue, key: &str) -> bool {
+    as_obj(value).is_some_and(|map| map.contains_key(key))
+}
+
+fn is_dynamic_values_path(segments: &[String]) -> bool {
+    segments.len() == 2 && segments[0] == "global" && segments[1] == "env"
+}
+
+fn is_dynamic_current_app_key(key: &str) -> bool {
+    matches!(
+        key,
+        // Runtime/default keys provided by library flow and pre-render hooks.
+        "name"
+            | "service"
+            | "ingress"
+            | "labels"
+            | "annotations"
+            | "werfSkipLogs"
+            | "restartOnDeploy"
+            | "randomName"
+            | "_options"
+    )
+}
+
+fn resolve_current_app_value_at_line(
+    root: &JsonValue,
+    lines: &[&str],
+    line: usize,
+) -> Option<JsonValue> {
+    let path = key_path_at_line(lines, line);
+    if path.len() >= 2 && path[0] != "global" && path[1] != "__GroupVars__" {
+        if let Some(value) = as_obj(root)
+            .and_then(|root_map| root_map.get(&path[0]))
+            .and_then(as_obj)
+            .and_then(|group_map| group_map.get(&path[1]))
+            .cloned()
+        {
+            return Some(value);
+        }
+    }
+    if path.len() >= 3 && path[0] == "global" && path[1] == "_includes" {
+        return resolve_include_profile_from_root(root, &path[2]).or_else(|| {
+            as_obj(root)
+                .and_then(|root_map| root_map.get("global"))
+                .and_then(as_obj)
+                .and_then(|global_map| global_map.get("_includes"))
+                .and_then(as_obj)
+                .and_then(|includes_map| includes_map.get(&path[2]))
+                .cloned()
+        });
+    }
+    if let Some(top_key) = path.first() {
+        if !is_reserved_top_level_key(top_key) {
+            if let Some(top_level) = as_obj(root)
+                .and_then(|root_map| root_map.get(top_key))
+                .cloned()
+            {
+                return Some(top_level);
+            }
+            if let Some(include_profile) = resolve_include_profile_from_root(root, top_key) {
+                return Some(include_profile);
+            }
+            if let Some(include_profile) = as_obj(root)
+                .and_then(|root_map| root_map.get("global"))
+                .and_then(as_obj)
+                .and_then(|global_map| global_map.get("_includes"))
+                .and_then(as_obj)
+                .and_then(|includes_map| includes_map.get(top_key))
+                .cloned()
+            {
+                return Some(include_profile);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_include_profile_from_root(root: &JsonValue, profile_name: &str) -> Option<JsonValue> {
+    let includes_map = as_obj(root)
+        .and_then(|root_map| root_map.get("global"))
+        .and_then(as_obj)
+        .and_then(|global_map| global_map.get("_includes"))
+        .and_then(as_obj)?;
+    let resolved = resolve_profile(
+        profile_name,
+        includes_map,
+        &mut HashMap::new(),
+        &mut Vec::new(),
+    )
+    .ok()?;
+    Some(JsonValue::Object(resolved))
+}
+
+fn key_path_at_line(lines: &[&str], line: usize) -> Vec<String> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let blocked = block_scalar_content_lines(lines);
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let end = line.min(lines.len().saturating_sub(1));
+    for (index, current_line) in lines.iter().enumerate().take(end + 1) {
+        if blocked.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        let trimmed = current_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((indent, key, _)) = parse_key_line(current_line) else {
+            continue;
+        };
+        while stack
+            .last()
+            .is_some_and(|(stack_indent, _)| *stack_indent >= indent)
+        {
+            stack.pop();
+        }
+        stack.push((indent, key.to_string()));
+        if index == end {
+            break;
+        }
+    }
+    stack.into_iter().map(|(_, key)| key).collect()
+}
+
+fn find_template_action_at_cursor(text: &str, cursor_offset: usize) -> Option<(usize, usize)> {
+    let (spans, _errors) = scan_template_actions(text);
+    for span in spans {
+        if cursor_offset >= span.start && cursor_offset <= span.end {
+            return Some((span.start, span.end));
+        }
+    }
+    if cursor_offset > text.len() {
+        return None;
+    }
+    let before = text.get(..cursor_offset)?;
+    let open = before.rfind("{{")?;
+    if before.get(open..).is_some_and(|tail| tail.contains("}}")) {
+        return None;
+    }
+    Some((open, cursor_offset))
+}
+
+fn find_template_path_completion_context(
+    action: &str,
+    cursor_in_action: usize,
+) -> Option<TemplatePathCompletionContext> {
+    if cursor_in_action > action.len() {
+        return None;
+    }
+    let before = action.get(..cursor_in_action)?;
+    let candidates = [
+        ("$.Values", TemplatePathRoot::Values),
+        ("$.CurrentApp", TemplatePathRoot::CurrentApp),
+        ("$.Release", TemplatePathRoot::Release),
+        ("$.Chart", TemplatePathRoot::Chart),
+        ("$.Capabilities", TemplatePathRoot::Capabilities),
+        ("$.werf", TemplatePathRoot::Werf),
+        (".CurrentApp", TemplatePathRoot::CurrentApp),
+    ];
+
+    let mut best: Option<(usize, TemplatePathCompletionContext)> = None;
+    for (marker, root) in candidates {
+        let Some(pos) = before.rfind(marker) else {
+            continue;
+        };
+        if !is_path_marker_boundary(action.as_bytes(), pos) {
+            continue;
+        }
+        let tail = &before[pos + marker.len()..];
+        if !tail.is_empty() && !tail.starts_with('.') {
+            continue;
+        }
+        let raw_path = tail.strip_prefix('.').unwrap_or("");
+        if raw_path.starts_with('.') || raw_path.contains("..") {
+            continue;
+        }
+        if !raw_path
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
+        {
+            continue;
+        }
+
+        let (parent_segments, query, replace_start_byte) =
+            if raw_path.is_empty() || raw_path.ends_with('.') {
+                (
+                    split_path_segments(raw_path.trim_end_matches('.')),
+                    String::new(),
+                    cursor_in_action,
+                )
+            } else if let Some(last_dot) = raw_path.rfind('.') {
+                let parent = &raw_path[..last_dot];
+                let query = &raw_path[last_dot + 1..];
+                (
+                    split_path_segments(parent),
+                    query.to_string(),
+                    pos + marker.len() + 1 + last_dot + 1,
+                )
+            } else {
+                (Vec::new(), raw_path.to_string(), pos + marker.len() + 1)
+            };
+
+        let ctx = TemplatePathCompletionContext {
+            root,
+            parent_segments,
+            query,
+            replace_start_byte,
+            replace_end_byte: cursor_in_action,
+        };
+        if best.as_ref().is_none_or(|(best_pos, _)| pos > *best_pos) {
+            best = Some((pos, ctx));
+        }
+    }
+
+    best.map(|(_, ctx)| ctx)
+}
+
+fn collect_template_path_refs_in_action(action: &str) -> Vec<TemplatePathRef> {
+    let mut out = Vec::new();
+    let markers = [
+        ("$.Values.", TemplatePathRoot::Values),
+        ("$.CurrentApp.", TemplatePathRoot::CurrentApp),
+        ("$.Release.", TemplatePathRoot::Release),
+        ("$.Chart.", TemplatePathRoot::Chart),
+        ("$.Capabilities.", TemplatePathRoot::Capabilities),
+        ("$.werf.", TemplatePathRoot::Werf),
+        (".CurrentApp.", TemplatePathRoot::CurrentApp),
+    ];
+    let bytes = action.as_bytes();
+
+    for (marker, root) in markers {
+        let mut cursor = 0usize;
+        while cursor < action.len() {
+            let Some(slice) = action.get(cursor..) else {
+                break;
+            };
+            let Some(rel) = slice.find(marker) else {
+                break;
+            };
+            let marker_pos = cursor + rel;
+            if !is_path_marker_boundary(bytes, marker_pos) {
+                cursor = next_char_boundary(action, marker_pos + marker.len());
+                continue;
+            }
+
+            let start = marker_pos;
+            let mut end = marker_pos + marker.len();
+            while end < action.len() {
+                let b = action.as_bytes()[end];
+                if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.' {
+                    end += 1;
+                    continue;
+                }
+                break;
+            }
+            if end <= marker_pos + marker.len() {
+                cursor = next_char_boundary(action, end.max(marker_pos + marker.len()));
+                continue;
+            }
+            let Some(raw) = action.get(marker_pos + marker.len()..end) else {
+                cursor = next_char_boundary(action, end.max(marker_pos + marker.len()));
+                continue;
+            };
+            if raw.starts_with('.') || raw.ends_with('.') || raw.contains("..") {
+                cursor = next_char_boundary(action, end.max(marker_pos + marker.len()));
+                continue;
+            }
+            let segments = split_path_segments(raw);
+            if segments.is_empty() {
+                cursor = next_char_boundary(action, end.max(marker_pos + marker.len()));
+                continue;
+            }
+            out.push(TemplatePathRef {
+                root,
+                segments,
+                full: action
+                    .get(start..end)
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            });
+            cursor = next_char_boundary(action, end.max(marker_pos + marker.len()));
+        }
+    }
+
+    out
+}
+
+fn collect_local_values_refs_in_action(action: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let marker = ".Values";
+    let bytes = action.as_bytes();
+    let mut cursor = 0usize;
+
+    while cursor < action.len() {
+        let Some(slice) = action.get(cursor..) else {
+            break;
+        };
+        let Some(rel) = slice.find(marker) else {
+            break;
+        };
+        let marker_pos = cursor + rel;
+        if !is_path_marker_boundary(bytes, marker_pos) {
+            cursor = next_char_boundary(action, marker_pos + marker.len());
+            continue;
+        }
+        let marker_end = marker_pos + marker.len();
+        if marker_end < action.len() {
+            let next = action.as_bytes()[marker_end];
+            if next != b'.' {
+                cursor = next_char_boundary(action, marker_end);
+                continue;
+            }
+        }
+        let mut end = marker_end;
+        while end < action.len() {
+            let b = action.as_bytes()[end];
+            if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.' {
+                end += 1;
+                continue;
+            }
+            break;
+        }
+        if let Some(path) = action.get(marker_pos..end) {
+            out.push(path.to_string());
+        }
+        cursor = next_char_boundary(action, end.max(marker_pos + marker.len()));
+    }
+
+    out
+}
+
+fn next_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn collect_include_calls_in_action(action: &str) -> Vec<IncludeCallRef> {
+    let mut out = Vec::new();
+    let bytes = action.as_bytes();
+    let include = b"include";
+    let mut i = 0usize;
+    while i + include.len() <= bytes.len() {
+        if !bytes_starts_with_at(bytes, i, include) {
+            i += 1;
+            continue;
+        }
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-' || prev == b'.' {
+                i += 1;
+                continue;
+            }
+        }
+        let mut j = i + include.len();
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let quote = bytes[j];
+        if quote != b'"' && quote != b'\'' {
+            i += 1;
+            continue;
+        }
+        let start_name = j + 1;
+        let mut end_name = start_name;
+        while end_name < bytes.len() && bytes[end_name] != quote {
+            end_name += 1;
+        }
+        if end_name >= bytes.len() {
+            break;
+        }
+        let Some(name) = action.get(start_name..end_name).map(ToString::to_string) else {
+            i = end_name.saturating_add(1);
+            continue;
+        };
+        j = end_name + 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let list_arg_count = if j < bytes.len() && bytes[j] == b'(' {
+            parse_list_arg_count_from_parenthesized_expr(action, j).map(|(_, count)| count)
+        } else {
+            None
+        };
+        out.push(IncludeCallRef {
+            name,
+            list_arg_count,
+        });
+        i = end_name + 1;
+    }
+    out
+}
+
+fn parse_list_arg_count_from_parenthesized_expr(
+    action: &str,
+    open_paren: usize,
+) -> Option<(usize, usize)> {
+    if action.as_bytes().get(open_paren).copied() != Some(b'(') {
+        return None;
+    }
+    let close = find_matching_paren(action, open_paren)?;
+    let inner = action.get(open_paren + 1..close)?.trim();
+    if !inner.starts_with("list") {
+        return None;
+    }
+    let rest = inner.get("list".len()..)?.trim();
+    if rest.is_empty() {
+        return Some((close + 1, 0));
+    }
+    Some((close + 1, count_top_level_tokens(rest)))
+}
+
+fn find_matching_paren(src: &str, open_paren: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open_paren;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\\' {
+                i = i.saturating_add(2);
+                continue;
+            }
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if b == b'\\' {
+                i = i.saturating_add(2);
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_backtick {
+            if b == b'`' {
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'`' => in_backtick = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn count_top_level_tokens(src: &str) -> usize {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut count = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\\' {
+                i = i.saturating_add(2);
+                continue;
+            }
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if b == b'\\' {
+                i = i.saturating_add(2);
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_backtick {
+            if b == b'`' {
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b.is_ascii_whitespace() && depth == 0 {
+            i += 1;
+            continue;
+        }
+        count += 1;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_single {
+                if b == b'\\' {
+                    i = i.saturating_add(2);
+                    continue;
+                }
+                if b == b'\'' {
+                    in_single = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_double {
+                if b == b'\\' {
+                    i = i.saturating_add(2);
+                    continue;
+                }
+                if b == b'"' {
+                    in_double = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_backtick {
+                if b == b'`' {
+                    in_backtick = false;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'`' => in_backtick = true,
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            if b.is_ascii_whitespace() && depth == 0 {
+                break;
+            }
+            i += 1;
+        }
+    }
+    count
+}
+
+fn is_path_marker_boundary(bytes: &[u8], marker_pos: usize) -> bool {
+    if marker_pos == 0 {
+        return true;
+    }
+    let prev = bytes[marker_pos - 1];
+    !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'.' || prev == b'$')
+}
+
+fn bytes_starts_with_at(bytes: &[u8], offset: usize, needle: &[u8]) -> bool {
+    bytes
+        .get(offset..offset.saturating_add(needle.len()))
+        .is_some_and(|slice| slice == needle)
+}
+
+fn split_path_segments(path: &str) -> Vec<String> {
+    path.split('.')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string())
+        .collect()
+}
+
+fn value_has_path(value: &JsonValue, segments: &[String]) -> bool {
+    let mut current = value;
+    for segment in segments {
+        let Some(map) = as_obj(current) else {
+            return false;
+        };
+        let Some(next) = map.get(segment) else {
+            return false;
+        };
+        current = next;
+    }
+    true
+}
+
+fn object_at_path<'a>(
+    value: &'a JsonValue,
+    segments: &[String],
+) -> Option<&'a JsonMap<String, JsonValue>> {
+    let mut current = value;
+    for segment in segments {
+        let map = as_obj(current)?;
+        current = map.get(segment)?;
+    }
+    as_obj(current)
+}
+
+fn sorted_keys(map: &JsonMap<String, JsonValue>) -> Vec<String> {
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+#[derive(Debug, Clone)]
+struct TextLineIndex {
+    starts: Vec<usize>,
+}
+
+impl TextLineIndex {
+    fn new(text: &str) -> Self {
+        let mut starts = vec![0usize];
+        for (idx, b) in text.as_bytes().iter().enumerate() {
+            if *b == b'\n' {
+                starts.push(idx + 1);
+            }
+        }
+        Self { starts }
+    }
+
+    fn line_start(&self, line: usize) -> usize {
+        *self
+            .starts
+            .get(line)
+            .unwrap_or_else(|| self.starts.last().unwrap_or(&0))
+    }
+
+    fn line_for_offset(&self, offset: usize) -> usize {
+        self.starts
+            .partition_point(|line_start| *line_start <= offset)
+            .saturating_sub(1)
+    }
+
+    fn utf16_col_for_offset(&self, line_text: &str, line: usize, offset: usize) -> u32 {
+        let line_start = self.line_start(line);
+        let in_line = offset.saturating_sub(line_start).min(line_text.len());
+        utf16_len(char_boundary_prefix(line_text, in_line)) as u32
+    }
+
+    fn offset_for_line_utf16(&self, line_text: &str, line: usize, utf16_col: usize) -> usize {
+        self.line_start(line) + utf16_col_to_byte(line_text, utf16_col)
+    }
+}
+
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+fn char_boundary_prefix(text: &str, mut end: usize) -> &str {
+    if end > text.len() {
+        end = text.len();
+    }
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or("")
+}
+
+fn utf16_col_to_byte(s: &str, utf16_col: usize) -> usize {
+    let mut col = 0usize;
+    for (idx, ch) in s.char_indices() {
+        if col >= utf16_col {
+            return idx;
+        }
+        col += ch.len_utf16();
+        if col > utf16_col {
+            return idx + ch.len_utf8();
+        }
+    }
+    s.len()
+}
+
+fn collect_stitched_include_name_context(uri: &Uri, text: &str) -> StitchedIncludeNameContext {
+    let context = build_stitched_values_context(uri, text);
+    let mut unique_defs: HashSet<(String, PathBuf, usize)> = HashSet::new();
+    let mut unique_usages: HashSet<(String, PathBuf, usize)> = HashSet::new();
+    let mut defined_names = HashSet::new();
+    let mut used_names = HashSet::new();
+
+    for definition in context.include_definitions {
+        if !unique_defs.insert((
+            definition.name.clone(),
+            definition.source_file.clone(),
+            definition.source_line,
+        )) {
+            continue;
+        }
+        defined_names.insert(definition.name);
+    }
+    for usage in context.include_usages {
+        if !unique_usages.insert((
+            usage.name.clone(),
+            usage.source_file.clone(),
+            usage.source_line,
+        )) {
+            continue;
+        }
+        used_names.insert(usage.name);
+    }
+
+    StitchedIncludeNameContext {
+        defined_names,
+        used_names,
+    }
+}
+
+#[derive(Debug, Default)]
+struct StitchedIncludeNameContext {
+    defined_names: HashSet<String>,
+    used_names: HashSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct StitchedValuesContext {
+    include_definitions: Vec<StitchedIncludeDefinition>,
+    include_usages: Vec<StitchedIncludeUsage>,
+}
+
+#[derive(Debug, Clone)]
+struct StitchedIncludeDefinition {
+    name: String,
+    source_file: PathBuf,
+    source_line: usize,
+}
+
+#[derive(Debug, Clone)]
+struct StitchedIncludeUsage {
+    name: String,
+    source_file: PathBuf,
+    source_line: usize,
+}
+
+fn build_stitched_values_context(uri: &Uri, text: &str) -> StitchedValuesContext {
+    let mut context = StitchedValuesContext::default();
+    let mut file_stack = HashSet::new();
+    let mut overrides: HashMap<PathBuf, String> = HashMap::new();
+
+    if let Some(current_path) = file_path_from_uri_string(&uri.to_string()) {
+        let normalized_current = normalize_fs_path(&current_path);
+        overrides.insert(normalized_current, text.to_string());
+
+        if let Some(chart_root) = find_chart_root_from_path(&current_path) {
+            if let Some(root_values_path) = find_primary_values_file(&chart_root) {
+                if let Ok(root_text) =
+                    read_text_from_path_with_overrides(&root_values_path, &overrides)
+                {
+                    collect_stitched_data_from_text(
+                        &root_text,
+                        &root_values_path,
+                        &[],
+                        &mut context,
+                        &mut file_stack,
+                        &overrides,
+                    );
+                    return context;
+                }
+            }
+        }
+
+        collect_stitched_data_from_text(
+            text,
+            &current_path,
+            &[],
+            &mut context,
+            &mut file_stack,
+            &overrides,
+        );
+        return context;
+    }
+
+    let fallback_path = PathBuf::from("values.yaml");
+    collect_stitched_data_from_text(
+        text,
+        &fallback_path,
+        &[],
+        &mut context,
+        &mut file_stack,
+        &overrides,
+    );
+    context
+}
+
+fn collect_stitched_data_from_text(
+    text: &str,
+    source_path: &Path,
+    parent_path: &[String],
+    context: &mut StitchedValuesContext,
+    file_stack: &mut HashSet<PathBuf>,
+    overrides: &HashMap<PathBuf, String>,
+) {
+    let lines: Vec<&str> = text.split('\n').collect();
+    for usage in collect_include_usages(&lines) {
+        context.include_usages.push(StitchedIncludeUsage {
+            name: usage.name,
+            source_file: source_path.to_path_buf(),
+            source_line: usage.line,
+        });
+    }
+
+    let local_defs = if parent_path.is_empty() {
+        collect_local_include_definitions(&lines)
+    } else {
+        collect_include_defs_for_from_file_parent(&lines, parent_path)
+    };
+    for def in local_defs {
+        context.include_definitions.push(StitchedIncludeDefinition {
+            name: def.name,
+            source_file: source_path.to_path_buf(),
+            source_line: def.line,
+        });
+    }
+
+    let refs = collect_include_file_refs(&lines);
+    let base_dir = source_path.parent();
+    for mut file_ref in refs {
+        if !parent_path.is_empty() {
+            let mut effective_parent_path = parent_path.to_vec();
+            effective_parent_path.extend(file_ref.parent_path);
+            file_ref.parent_path = effective_parent_path;
+        }
+        collect_stitched_data_from_ref(&file_ref, base_dir, context, file_stack, overrides);
+    }
+}
+
+fn collect_include_defs_for_from_file_parent(
+    lines: &[&str],
+    parent_path: &[String],
+) -> Vec<IncludeDefinitionRef> {
+    if !is_direct_global_includes_path(parent_path) {
+        return Vec::new();
+    }
+
+    let (global_defs, has_global_includes_scope) = collect_global_include_definitions(lines);
+    if has_global_includes_scope {
+        return global_defs;
+    }
+    collect_top_level_map_entry_definitions(lines)
+}
+
+fn collect_stitched_data_from_ref(
+    file_ref: &IncludeFileRef,
+    base_dir: Option<&Path>,
+    context: &mut StitchedValuesContext,
+    file_stack: &mut HashSet<PathBuf>,
+    overrides: &HashMap<PathBuf, String>,
+) {
+    if is_templated_include_path(&file_ref.path) {
+        return;
+    }
+    let loaded = match load_include_text_from_file(&file_ref.path, base_dir, file_stack, overrides)
+    {
+        Ok(value) => value,
+        Err(_) => None,
+    };
+    let Some((loaded_path, loaded_text)) = loaded else {
+        return;
+    };
+
+    match file_ref.kind {
+        IncludeFileRefKind::FilesList => {
+            let include_name = include_name_from_path(&file_ref.path);
+            context.include_definitions.push(StitchedIncludeDefinition {
+                name: include_name.clone(),
+                source_file: loaded_path.clone(),
+                source_line: file_ref.line,
+            });
+
+            collect_stitched_data_from_text(
+                &loaded_text,
+                &loaded_path,
+                &["global".to_string(), "_includes".to_string(), include_name],
+                context,
+                file_stack,
+                overrides,
+            );
+        }
+        IncludeFileRefKind::FromFile => {
+            collect_stitched_data_from_text(
+                &loaded_text,
+                &loaded_path,
+                &file_ref.parent_path,
+                context,
+                file_stack,
+                overrides,
+            );
+        }
+    }
+}
+
+fn is_direct_global_includes_path(path: &[String]) -> bool {
+    path.len() == 2 && path[0] == "global" && path[1] == "_includes"
+}
+
+fn load_include_text_from_file(
+    raw_path: &str,
+    base_dir: Option<&Path>,
+    file_stack: &mut HashSet<PathBuf>,
+    overrides: &HashMap<PathBuf, String>,
+) -> Result<Option<(PathBuf, String)>, String> {
+    if is_templated_include_path(raw_path) {
+        return Ok(None);
+    }
+    let candidates = build_include_candidates(raw_path, base_dir);
+    for candidate in candidates {
+        match load_include_text_from_absolute_file(&candidate, file_stack, overrides) {
+            Ok(text) => return Ok(Some((candidate, text))),
+            Err(FileIncludeLoadError::NotFound) => continue,
+            Err(FileIncludeLoadError::Other(message)) => return Err(message),
+        }
+    }
+    Ok(None)
+}
+
+enum FileIncludeLoadError {
+    NotFound,
+    Other(String),
+}
+
+fn load_include_text_from_absolute_file(
+    file_path: &Path,
+    file_stack: &mut HashSet<PathBuf>,
+    overrides: &HashMap<PathBuf, String>,
+) -> Result<String, FileIncludeLoadError> {
+    let tracked = normalize_fs_path(file_path);
+    if file_stack.contains(&tracked) {
+        return Err(FileIncludeLoadError::Other(format!(
+            "_include file cycle detected: {}",
+            tracked.display()
+        )));
+    }
+    file_stack.insert(tracked.clone());
+    let load_result = (|| {
+        if let Some(override_text) = overrides.get(&tracked) {
+            return Ok(override_text.clone());
+        }
+        std::fs::read_to_string(file_path).map_err(|err| match err.kind() {
+            ErrorKind::NotFound | ErrorKind::NotADirectory => FileIncludeLoadError::NotFound,
+            _ => FileIncludeLoadError::Other(format!(
+                "read include file '{}': {}",
+                file_path.display(),
+                err
+            )),
+        })
+    })();
+    file_stack.remove(&tracked);
+    load_result
+}
+
+fn is_include_entry_helper_key(name: &str) -> bool {
+    matches!(name, "_include" | "_include_from_file" | "_include_files")
 }
 
 fn looks_like_helm_apps_values_text(text: &str) -> bool {
@@ -814,10 +3006,41 @@ fn make_diagnostic(
     }
 }
 
+fn make_diagnostic_at_offset(
+    line_index: &TextLineIndex,
+    lines: &[&str],
+    offset: usize,
+    len: usize,
+    severity: DiagnosticSeverity,
+    message: String,
+    code: Option<String>,
+) -> Diagnostic {
+    let line = line_index.line_for_offset(offset);
+    let line_text = lines.get(line).copied().unwrap_or_default();
+    let line_start = line_index.line_start(line);
+    let start_in_line = offset.saturating_sub(line_start).min(line_text.len());
+    let end_in_line = start_in_line.saturating_add(len).min(line_text.len());
+    Diagnostic {
+        range: Range::new(
+            Position::new(line as u32, start_in_line as u32),
+            Position::new(line as u32, end_in_line.max(start_in_line) as u32),
+        ),
+        severity: Some(severity),
+        code: code.map(lsp_types::NumberOrString::String),
+        code_description: None,
+        source: Some("happ".to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct IncludeDefinitionRef {
     name: String,
     line: usize,
+    emit_unused_diagnostic: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -826,25 +3049,52 @@ struct IncludeUsageRef {
     line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum IncludeFileRefKind {
-    IncludeFromFile,
-    IncludeFiles,
-}
-
 #[derive(Debug, Clone)]
 struct IncludeFileRef {
-    kind: IncludeFileRefKind,
     path: String,
     line: usize,
+    kind: IncludeFileRefKind,
+    parent_path: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncludeFileRefKind {
+    FromFile,
+    FilesList,
 }
 
 fn collect_local_include_definitions(lines: &[&str]) -> Vec<IncludeDefinitionRef> {
+    collect_include_definitions(lines, true)
+}
+
+fn collect_include_definitions(
+    lines: &[&str],
+    allow_top_level_profile_fallback: bool,
+) -> Vec<IncludeDefinitionRef> {
+    let (mut out, has_global_includes_scope) = collect_global_include_definitions(lines);
+    if !allow_top_level_profile_fallback || has_global_includes_scope {
+        return out;
+    }
+    for def in collect_top_level_include_definitions(lines) {
+        if out.iter().any(|current| current.name == def.name) {
+            continue;
+        }
+        out.push(def);
+    }
+    out
+}
+
+fn collect_global_include_definitions(lines: &[&str]) -> (Vec<IncludeDefinitionRef>, bool) {
     let mut out = Vec::new();
     let mut in_global = false;
     let mut in_includes = false;
+    let mut has_global_includes_scope = false;
+    let blocked = block_scalar_content_lines(lines);
 
     for (i, line) in lines.iter().enumerate() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -859,23 +3109,105 @@ fn collect_local_include_definitions(lines: &[&str]) -> Vec<IncludeDefinitionRef
         }
         if in_global && indent == 2 {
             in_includes = key == "_includes";
+            if in_includes {
+                has_global_includes_scope = true;
+            }
             continue;
         }
         if in_global && in_includes && indent == 4 {
+            if is_include_entry_helper_key(key) {
+                continue;
+            }
             out.push(IncludeDefinitionRef {
                 name: key.to_string(),
                 line: i,
+                emit_unused_diagnostic: true,
             });
         }
     }
 
+    (out, has_global_includes_scope)
+}
+
+fn collect_top_level_include_definitions(lines: &[&str]) -> Vec<IncludeDefinitionRef> {
+    let mut out = Vec::new();
+    let mut top_level_keys: Vec<(String, usize)> = Vec::new();
+    let mut has_profile_like_top_level = false;
+    let mut current_top_level: Option<String> = None;
+    let blocked = block_scalar_content_lines(lines);
+
+    for (i, line) in lines.iter().enumerate() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((indent, key, _value)) = parse_key_line(line) else {
+            continue;
+        };
+        if indent == 0 {
+            current_top_level = Some(key.to_string());
+            top_level_keys.push((key.to_string(), i));
+            continue;
+        }
+        if indent == 2 && current_top_level.is_some() && is_include_entry_helper_key(key) {
+            has_profile_like_top_level = true;
+        }
+    }
+    if has_profile_like_top_level {
+        for (name, line) in top_level_keys {
+            if is_include_entry_helper_key(&name) || is_reserved_top_level_key(&name) {
+                continue;
+            }
+            out.push(IncludeDefinitionRef {
+                name,
+                line,
+                emit_unused_diagnostic: false,
+            });
+        }
+    }
     out
+}
+
+fn collect_top_level_map_entry_definitions(lines: &[&str]) -> Vec<IncludeDefinitionRef> {
+    let mut out = Vec::new();
+    let blocked = block_scalar_content_lines(lines);
+    for (i, line) in lines.iter().enumerate() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some((indent, key, _value)) = parse_key_line(line) else {
+            continue;
+        };
+        if indent != 0 {
+            continue;
+        }
+        if is_include_entry_helper_key(key) {
+            continue;
+        }
+        out.push(IncludeDefinitionRef {
+            name: key.to_string(),
+            line: i,
+            emit_unused_diagnostic: false,
+        });
+    }
+    out
+}
+
+fn is_reserved_top_level_key(key: &str) -> bool {
+    matches!(key, "global" | "enabled" | "werf" | "helm-apps")
 }
 
 fn collect_include_usages(lines: &[&str]) -> Vec<IncludeUsageRef> {
     let mut out = Vec::new();
+    let blocked = block_scalar_content_lines(lines);
 
     for (i, line) in lines.iter().enumerate() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         if let Some((_indent, key, value)) = parse_key_line(line) {
             if key == "_include" {
                 let inline = value.trim();
@@ -900,7 +3232,7 @@ fn collect_include_usages(lines: &[&str]) -> Vec<IncludeUsageRef> {
         let Some((item_indent, item_value)) = parse_list_item_token(line) else {
             continue;
         };
-        let parent = find_parent_key(lines, i, item_indent);
+        let parent = find_parent_key_with_mask(lines, &blocked, i, item_indent);
         if parent.as_deref() == Some("_include") {
             out.push(IncludeUsageRef {
                 name: item_value,
@@ -914,18 +3246,36 @@ fn collect_include_usages(lines: &[&str]) -> Vec<IncludeUsageRef> {
 
 fn collect_include_file_refs(lines: &[&str]) -> Vec<IncludeFileRef> {
     let mut refs = Vec::new();
+    let mut key_stack: Vec<(usize, String)> = Vec::new();
+    let blocked = block_scalar_content_lines(lines);
 
     for (i, line) in lines.iter().enumerate() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         let Some((indent, key, value)) = parse_key_line(line) else {
             continue;
         };
+        while key_stack
+            .last()
+            .is_some_and(|(stack_indent, _)| *stack_indent >= indent)
+        {
+            key_stack.pop();
+        }
+        key_stack.push((indent, key.to_string()));
+        let parent_path: Vec<String> = key_stack[..key_stack.len() - 1]
+            .iter()
+            .map(|(_, current_key)| current_key.clone())
+            .collect();
+
         if key == "_include_from_file" {
             let path = unquote(value.trim());
             if !path.is_empty() {
                 refs.push(IncludeFileRef {
-                    kind: IncludeFileRefKind::IncludeFromFile,
                     path,
                     line: i,
+                    kind: IncludeFileRefKind::FromFile,
+                    parent_path: parent_path.clone(),
                 });
             }
             continue;
@@ -941,9 +3291,10 @@ fn collect_include_file_refs(lines: &[&str]) -> Vec<IncludeFileRef> {
                 let path = unquote(part.trim());
                 if !path.is_empty() {
                     refs.push(IncludeFileRef {
-                        kind: IncludeFileRefKind::IncludeFiles,
                         path,
                         line: i,
+                        kind: IncludeFileRefKind::FilesList,
+                        parent_path: parent_path.clone(),
                     });
                 }
             }
@@ -951,6 +3302,9 @@ fn collect_include_file_refs(lines: &[&str]) -> Vec<IncludeFileRef> {
         }
 
         for (j, sub_line) in lines.iter().enumerate().skip(i + 1) {
+            if blocked.get(j).copied().unwrap_or(false) {
+                continue;
+            }
             let t = sub_line.trim();
             if t.is_empty() || t.starts_with('#') {
                 continue;
@@ -963,9 +3317,10 @@ fn collect_include_file_refs(lines: &[&str]) -> Vec<IncludeFileRef> {
                 let path = unquote(raw.trim());
                 if !path.is_empty() {
                     refs.push(IncludeFileRef {
-                        kind: IncludeFileRefKind::IncludeFiles,
                         path,
                         line: j,
+                        kind: IncludeFileRefKind::FilesList,
+                        parent_path: parent_path.clone(),
                     });
                 }
             }
@@ -1015,8 +3370,22 @@ fn parse_list_item_raw(line: &str) -> Option<(usize, &str)> {
     Some((indent, value))
 }
 
+#[cfg(test)]
 fn find_parent_key(lines: &[&str], line: usize, indent: usize) -> Option<String> {
+    let blocked = block_scalar_content_lines(lines);
+    find_parent_key_with_mask(lines, &blocked, line, indent)
+}
+
+fn find_parent_key_with_mask(
+    lines: &[&str],
+    blocked: &[bool],
+    line: usize,
+    indent: usize,
+) -> Option<String> {
     for i in (0..line).rev() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         let Some((key_indent, key, _value)) = parse_key_line(lines[i]) else {
             continue;
         };
@@ -1039,6 +3408,60 @@ fn count_indent(line: &str) -> usize {
     line.chars().take_while(|ch| *ch == ' ').count()
 }
 
+fn block_scalar_content_lines(lines: &[&str]) -> Vec<bool> {
+    let mut blocked = vec![false; lines.len()];
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        let Some(header_indent) = line_starts_block_scalar(line) else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        while j < lines.len() {
+            let current = lines[j];
+            let trimmed = current.trim();
+            if trimmed.is_empty() {
+                blocked[j] = true;
+                j += 1;
+                continue;
+            }
+            let current_indent = count_indent(current);
+            if current_indent <= header_indent {
+                break;
+            }
+            blocked[j] = true;
+            j += 1;
+        }
+        i = j;
+    }
+    blocked
+}
+
+fn line_starts_block_scalar(line: &str) -> Option<usize> {
+    let indent = count_indent(line);
+    let rest = line.get(indent..)?.trim();
+    if rest.is_empty() || rest.starts_with('#') {
+        return None;
+    }
+    let colon = rest.find(':')?;
+    let after_colon = rest.get(colon + 1..)?.trim();
+    if after_colon.is_empty() {
+        return None;
+    }
+    let mut tokens = after_colon.split_whitespace();
+    let first = tokens.next()?;
+    let marker = if first.starts_with('&') || first.starts_with('!') {
+        tokens.next().unwrap_or("")
+    } else {
+        first
+    };
+    if marker.starts_with('|') || marker.starts_with('>') {
+        return Some(indent);
+    }
+    None
+}
+
 fn unquote(value: &str) -> String {
     let v = value.trim();
     if v.len() >= 2
@@ -1050,19 +3473,9 @@ fn unquote(value: &str) -> String {
 }
 
 fn include_name_from_path(path_value: &str) -> String {
-    let path = Path::new(path_value.trim());
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(path_value.trim());
-    let lower = file_name.to_ascii_lowercase();
-    if lower.ends_with(".yaml") {
-        return file_name[..file_name.len() - 5].to_string();
-    }
-    if lower.ends_with(".yml") {
-        return file_name[..file_name.len() - 4].to_string();
-    }
-    file_name.to_string()
+    let mut hasher = Sha256::new();
+    hasher.update(path_value.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn is_templated_include_path(path_value: &str) -> bool {
@@ -1170,9 +3583,11 @@ fn expand_node(
             if current.contains_key("_include") {
                 let mut merged: JsonMap<String, JsonValue> = JsonMap::new();
                 for include_name in normalize_include(current.get("_include")) {
-                    let profile =
-                        resolve_profile(&include_name, includes_map, cache, &mut Vec::new())?;
-                    merged = merge_maps(&merged, &profile);
+                    if let Ok(profile) =
+                        resolve_profile(&include_name, includes_map, cache, &mut Vec::new())
+                    {
+                        merged = merge_maps(&merged, &profile);
+                    }
                 }
                 current = merge_maps(&merged, &current);
                 current.remove("_include");
@@ -1214,8 +3629,9 @@ fn resolve_profile(
     stack.push(name.to_string());
     let mut merged = JsonMap::new();
     for child in normalize_include(profile.get("_include")) {
-        let child_map = resolve_profile(&child, includes_map, cache, stack)?;
-        merged = merge_maps(&merged, &child_map);
+        if let Ok(child_map) = resolve_profile(&child, includes_map, cache, stack) {
+            merged = merge_maps(&merged, &child_map);
+        }
     }
     stack.pop();
 
@@ -1226,6 +3642,32 @@ fn resolve_profile(
 }
 
 fn normalize_include(value: Option<&JsonValue>) -> Vec<String> {
+    match value {
+        Some(JsonValue::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                Vec::new()
+            } else {
+                vec![t.to_string()]
+            }
+        }
+        Some(JsonValue::Array(items)) => items
+            .iter()
+            .filter_map(|v| {
+                let s = v.as_str()?;
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn normalize_include_files(value: Option<&JsonValue>) -> Vec<String> {
     match value {
         Some(JsonValue::String(s)) => {
             let t = s.trim();
@@ -1543,6 +3985,55 @@ apps-stateless:
     }
 
     #[test]
+    fn manifest_preview_values_normalize_include_fields_and_skip_global_include_files() {
+        let entity = json!({
+            "containers": {
+                "main": {
+                    "_include_files": "configs/resource-assignment-kafka-consumer/ra_config.yaml"
+                }
+            }
+        });
+        let global = json!({
+            "_include_files": "must-not-be-forwarded",
+            "_includes": {},
+            "validation": {
+                "allowNativeListsInBuiltInListFields": true
+            }
+        });
+        let values = build_manifest_preview_values(
+            "apps-stateless",
+            "app-1",
+            &entity,
+            &global,
+            true,
+            "prod",
+        );
+        let include_files = values
+            .get("apps-stateless")
+            .and_then(as_obj)
+            .and_then(|group| group.get("app-1"))
+            .and_then(as_obj)
+            .and_then(|app| app.get("containers"))
+            .and_then(as_obj)
+            .and_then(|containers| containers.get("main"))
+            .and_then(as_obj)
+            .and_then(|main| main.get("_include_files"))
+            .and_then(JsonValue::as_array)
+            .expect("_include_files array");
+        assert_eq!(include_files.len(), 1);
+        assert_eq!(
+            include_files.first().and_then(JsonValue::as_str),
+            Some("configs/resource-assignment-kafka-consumer/ra_config.yaml")
+        );
+
+        let has_global_include_files = values
+            .get("global")
+            .and_then(as_obj)
+            .is_some_and(|global_map| global_map.contains_key("_include_files"));
+        assert!(!has_global_include_files);
+    }
+
+    #[test]
     fn parse_key_and_include_list_tokens_validate_shape() {
         assert_eq!(
             parse_key_line("  good-key_1: value"),
@@ -1566,6 +4057,56 @@ apps-stateless:
         ];
         assert_eq!(find_parent_key(&lines, 3, 6).as_deref(), Some("base"));
         assert_eq!(find_parent_key(&lines, 1, 2).as_deref(), Some("global"));
+    }
+
+    #[test]
+    fn block_scalar_content_mask_detects_pipe_and_anchor_headers() {
+        let lines = vec![
+            "root:",
+            "  plain: value",
+            "  one: |",
+            "    - a",
+            "    - b",
+            "  two: &anchored >-",
+            "    line1",
+            "    line2",
+            "  after: ok",
+        ];
+        let blocked = block_scalar_content_lines(&lines);
+        assert!(!blocked[0]);
+        assert!(!blocked[1]);
+        assert!(!blocked[2]);
+        assert!(blocked[3]);
+        assert!(blocked[4]);
+        assert!(!blocked[5]);
+        assert!(blocked[6]);
+        assert!(blocked[7]);
+        assert!(!blocked[8]);
+    }
+
+    #[test]
+    fn diagnostics_ignore_include_lookalikes_inside_block_scalar() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  _includes:
+    base:
+      enabled: true
+apps-stateless:
+  app-1:
+    _include:
+      - base
+    note: |
+      _include:
+        - fake-profile
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("fake-profile")),
+            "block scalar payload must not be parsed as include usage"
+        );
     }
 
     #[test]
@@ -1604,11 +4145,1039 @@ apps-stateless:
     }
 
     #[test]
-    fn include_name_from_path_strips_yaml_extensions_case_insensitively() {
-        assert_eq!(include_name_from_path("profiles/base.yaml"), "base");
-        assert_eq!(include_name_from_path("profiles/base.yml"), "base");
-        assert_eq!(include_name_from_path("profiles/UPPER.YAML"), "UPPER");
-        assert_eq!(include_name_from_path("profiles/noext"), "noext");
+    fn diagnostics_do_not_treat_block_scalar_lists_as_include_files() {
+        let td = TempDir::new().expect("tmp");
+        let values_path = td.path().join("values.yaml");
+        let defaults_path = td.path().join("defaults.yaml");
+        fs::write(&defaults_path, "enabled: true\n").expect("write defaults");
+        fs::write(&values_path, "global: {}\n").expect("write values");
+
+        let src = r#"
+apps-stateless:
+  app-1:
+    _include_files:
+      - defaults.yaml
+    ports: |
+      - containerPort: 8080
+        name: http
+"#;
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("containerPort")),
+            "block scalar list items must not be treated as include files"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("name: http")),
+            "block scalar list items must not be treated as include files"
+        );
+    }
+
+    #[test]
+    fn diagnostics_see_profiles_from_root_include_from_file_global_includes_wrapper() {
+        let td = TempDir::new().expect("tmp");
+        let defaults_path = td.path().join("helm-apps-defaults.yaml");
+        fs::write(
+            &defaults_path,
+            r#"
+global:
+  _includes:
+    apps-stateless-defaultApp:
+      enabled: true
+"#,
+        )
+        .expect("write defaults");
+        let values_path = td.path().join("values.yaml");
+        fs::write(&values_path, "global: {}\n").expect("write values");
+
+        let src = r#"
+_include_from_file: helm-apps-defaults.yaml
+apps-stateless:
+  api:
+    _include:
+      - apps-stateless-defaultApp
+"#;
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unresolved include profile: apps-stateless-defaultApp")));
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unused include profile: _include_from_file")));
+    }
+
+    #[test]
+    fn diagnostics_see_profiles_from_plain_top_level_include_file_map() {
+        let td = TempDir::new().expect("tmp");
+        let defaults_path = td.path().join("helm-apps-defaults.yaml");
+        fs::write(
+            &defaults_path,
+            r#"
+helm-apps-defaults:
+  enabled: false
+apps-default-library-app:
+  _include: ["helm-apps-defaults"]
+apps-stateless-defaultApp:
+  _include: ["apps-default-library-app"]
+"#,
+        )
+        .expect("write defaults");
+        let values_path = td.path().join("values.yaml");
+        fs::write(&values_path, "global: {}\n").expect("write values");
+
+        let src = r#"
+global:
+  _includes:
+    _include_from_file: helm-apps-defaults.yaml
+    default-app:
+      _include: ["apps-stateless-defaultApp"]
+"#;
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unresolved include profile: apps-stateless-defaultApp")));
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unused include profile: _include_from_file")));
+    }
+
+    #[test]
+    fn diagnostics_do_not_take_global_includes_from_nested_include_from_file_payload() {
+        let td = TempDir::new().expect("tmp");
+        let nested_path = td.path().join("nested.yaml");
+        fs::write(
+            &nested_path,
+            r#"
+global:
+  _includes:
+    from-nested:
+      enabled: true
+"#,
+        )
+        .expect("write nested");
+        let values_path = td.path().join("values.yaml");
+        fs::write(&values_path, "global: {}\n").expect("write values");
+
+        let src = r#"
+apps-stateless:
+  api:
+    _include_from_file: nested.yaml
+    _include:
+      - from-nested
+"#;
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(diagnostics.iter().any(|d| d
+            .message
+            .contains("Unresolved include profile: from-nested")));
+    }
+
+    #[test]
+    fn diagnostics_resolve_chain_of_global_includes_include_from_file() {
+        let td = TempDir::new().expect("tmp");
+        let level1_path = td.path().join("level1.yaml");
+        let level2_path = td.path().join("level2.yaml");
+        fs::write(
+            &level1_path,
+            r#"
+_include_from_file: level2.yaml
+apps-default:
+  enabled: true
+"#,
+        )
+        .expect("write level1");
+        fs::write(
+            &level2_path,
+            r#"
+apps-stateless-defaultApp:
+  _include: ["apps-default"]
+"#,
+        )
+        .expect("write level2");
+        let values_path = td.path().join("values.yaml");
+        fs::write(&values_path, "global: {}\n").expect("write values");
+
+        let src = r#"
+global:
+  _includes:
+    _include_from_file: level1.yaml
+apps-stateless:
+  api:
+    _include:
+      - apps-stateless-defaultApp
+"#;
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unresolved include profile: apps-stateless-defaultApp")));
+    }
+
+    #[test]
+    fn diagnostics_see_simple_top_level_profile_from_global_includes_include_from_file() {
+        let td = TempDir::new().expect("tmp");
+        let defaults_path = td.path().join("simple-defaults.yaml");
+        fs::write(
+            &defaults_path,
+            r#"
+simple-profile:
+  enabled: false
+"#,
+        )
+        .expect("write defaults");
+        let values_path = td.path().join("values.yaml");
+        fs::write(&values_path, "global: {}\n").expect("write values");
+
+        let src = r#"
+global:
+  _includes:
+    _include_from_file: simple-defaults.yaml
+apps-stateless:
+  api:
+    _include:
+      - simple-profile
+"#;
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unresolved include profile: simple-profile")));
+    }
+
+    #[test]
+    fn diagnostics_resolve_sha_profile_from_include_files() {
+        let td = TempDir::new().expect("tmp");
+        let include_path = td.path().join("defaults.yaml");
+        fs::write(&include_path, "enabled: true\n").expect("write include");
+        let values_path = td.path().join("values.yaml");
+        fs::write(&values_path, "global: {}\n").expect("write values");
+        let include_name = include_name_from_path("defaults.yaml");
+
+        let src = format!(
+            r#"
+apps-stateless:
+  api:
+    _include_files:
+      - defaults.yaml
+    _include:
+      - {include_name}
+"#
+        );
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, &src);
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains(&format!("Unresolved include profile: {include_name}"))));
+    }
+
+    #[test]
+    fn diagnostics_treat_top_level_include_file_keys_as_definitions() {
+        let td = TempDir::new().expect("tmp");
+        let include_path = td.path().join("helm-apps-defaults.yaml");
+        fs::write(&include_path, "x: 1\n").expect("touch file");
+        let src = r#"
+helm-apps-defaults:
+  enabled: false
+apps-default-library-app:
+  _include: ["helm-apps-defaults"]
+apps-stateless-defaultApp:
+  _include: ["apps-default-library-app"]
+"#;
+        let uri = format!("file://{}", include_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unresolved include profile: helm-apps-defaults")));
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unresolved include profile: apps-default-library-app")));
+    }
+
+    #[test]
+    fn diagnostics_do_not_report_unused_for_top_level_include_file_profiles() {
+        let td = TempDir::new().expect("tmp");
+        let include_path = td.path().join("helm-apps-defaults.yaml");
+        let src = r#"
+apps-cronjobs-defaultCronJob:
+  enabled: false
+apps-secrets-defaultSecret:
+  _include: ["apps-cronjobs-defaultCronJob"]
+"#;
+        fs::write(&include_path, src).expect("write include file");
+        let uri = format!("file://{}", include_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unused include profile: apps-cronjobs-defaultCronJob")));
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unused include profile: apps-secrets-defaultSecret")));
+    }
+
+    fn has_diagnostic_code(diagnostics: &[Diagnostic], code: &str) -> bool {
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_ref().is_some_and(|current| {
+                matches!(current, lsp_types::NumberOrString::String(current_code) if current_code == code)
+            })
+        })
+    }
+
+    #[test]
+    fn diagnostics_report_unknown_values_path_in_template_action() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    name: '{{ $.Values.global.missing }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(has_diagnostic_code(
+            &diagnostics,
+            "E_TPL_UNKNOWN_VALUES_PATH"
+        ));
+    }
+
+    #[test]
+    fn diagnostics_report_unknown_current_app_path_in_template_action() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    name: '{{ $.CurrentApp.missing }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(has_diagnostic_code(
+            &diagnostics,
+            "E_TPL_UNKNOWN_CURRENT_APP_PATH"
+        ));
+    }
+
+    #[test]
+    fn diagnostics_report_local_values_context_usage() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    name: '{{ .Values.global.env }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(has_diagnostic_code(
+            &diagnostics,
+            "E_TPL_LOCAL_VALUES_CONTEXT"
+        ));
+    }
+
+    #[test]
+    fn diagnostics_soft_validate_template_syntax_in_any_string_value() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    badExpr: '{{ $.Values.global..env }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(has_diagnostic_code(&diagnostics, "E_TPL_SOFT_PARSE"));
+    }
+
+    #[test]
+    fn diagnostics_detect_single_left_delimiter_template_typo() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    host: '*-{{ $.Values.global.env }}.apps.mrms.{ include "fl.value" (list $ . $.Values.global.base_url) }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(has_diagnostic_code(
+            &diagnostics,
+            "E_TPL_SINGLE_LEFT_DELIM"
+        ));
+    }
+
+    #[test]
+    fn diagnostics_do_not_flag_plain_curly_braces_as_template_typo() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    note: '{example payload: true}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(!has_diagnostic_code(
+            &diagnostics,
+            "E_TPL_SINGLE_LEFT_DELIM"
+        ));
+    }
+
+    #[test]
+    fn diagnostics_allow_global_env_as_ci_injected_value() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  baseUrl: example.local
+apps-stateless:
+  app-1:
+    enabled: true
+    envName: '{{ $.Values.global.env }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(!has_diagnostic_code(
+            &diagnostics,
+            "E_TPL_UNKNOWN_VALUES_PATH"
+        ));
+    }
+
+    #[test]
+    fn diagnostics_keep_enabled_path_validation_for_entities() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    shouldDeploy: '{{ $.Values.apps-stateless.app-2.enabled }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(has_diagnostic_code(
+            &diagnostics,
+            "E_TPL_UNKNOWN_VALUES_PATH"
+        ));
+    }
+
+    #[test]
+    fn diagnostics_report_wrong_arity_for_fl_value_include() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    name: '{{ include "fl.value" (list $ .) }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(has_diagnostic_code(&diagnostics, "E_INCLUDE_ARGC"));
+    }
+
+    #[test]
+    fn template_assist_completes_values_path() {
+        let src = r#"
+global:
+  env: dev
+  labels:
+    addEnv: false
+apps-stateless:
+  app-1:
+    enabled: true
+    name: '{{ $.Values.global. }}'
+"#;
+        let line = 8u32;
+        let marker = "$.Values.global.";
+        let line_text = src.lines().nth(line as usize).expect("line with marker");
+        let character = (line_text.find(marker).expect("marker offset") + marker.len()) as u32;
+
+        let result = template_assist_request(
+            &ServerState::default(),
+            TemplateAssistParams {
+                uri: None,
+                text: Some(src.to_string()),
+                line,
+                character,
+            },
+        )
+        .expect("template assist");
+
+        assert!(result.inside_template);
+        assert!(result.completions.iter().any(|it| it.label == "env"));
+        assert!(result.completions.iter().any(|it| it.label == "labels"));
+    }
+
+    #[test]
+    fn template_assist_completes_current_app_path() {
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    service:
+      enabled: true
+    note: '{{ $.CurrentApp. }}'
+"#;
+        let line = 8u32;
+        let marker = "$.CurrentApp.";
+        let line_text = src.lines().nth(line as usize).expect("line with marker");
+        let character = (line_text.find(marker).expect("marker offset") + marker.len()) as u32;
+
+        let result = template_assist_request(
+            &ServerState::default(),
+            TemplateAssistParams {
+                uri: None,
+                text: Some(src.to_string()),
+                line,
+                character,
+            },
+        )
+        .expect("template assist");
+
+        assert!(result.inside_template);
+        assert!(result.completions.iter().any(|it| it.label == "enabled"));
+        assert!(result.completions.iter().any(|it| it.label == "service"));
+    }
+
+    #[test]
+    fn template_assist_suggests_fl_value_snippet_inside_template_action() {
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    note: '{{ incl }}'
+"#;
+        let line = 6u32;
+        let marker = "incl";
+        let line_text = src.lines().nth(line as usize).expect("line with marker");
+        let character = (line_text.find(marker).expect("marker offset") + marker.len()) as u32;
+
+        let result = template_assist_request(
+            &ServerState::default(),
+            TemplateAssistParams {
+                uri: None,
+                text: Some(src.to_string()),
+                line,
+                character,
+            },
+        )
+        .expect("template assist");
+
+        assert!(result.inside_template);
+        assert!(result.completions.iter().any(|it| it.label == "fl.value"));
+        assert!(result
+            .completions
+            .iter()
+            .any(|it| it.label == "$.CurrentApp"));
+    }
+
+    #[test]
+    fn include_call_scanner_handles_unicode_actions_without_panicking() {
+        let action = r#"{{- fail (printf "Не установлены лимиты по памяти для приложения %s" $.CurrentApp.name) }}"#;
+        let calls = collect_include_calls_in_action(action);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn template_action_lookup_handles_non_char_boundary_cursor() {
+        let text = r#"value: '{{ "Ж" }}'"#;
+        let non_char_boundary = text.find('Ж').expect("unicode marker") + 1;
+        assert!(find_template_action_at_cursor(text, non_char_boundary).is_some());
+    }
+
+    #[test]
+    fn utf16_col_for_offset_handles_non_char_boundary_offsets() {
+        let text = "Жx";
+        let idx = TextLineIndex::new(text);
+        assert_eq!(idx.utf16_col_for_offset(text, 0, 1), 0);
+        assert_eq!(idx.utf16_col_for_offset(text, 0, text.len()), 2);
+    }
+
+    #[test]
+    fn diagnostics_validate_builtin_release_paths() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    installLabel: '{{ $.Release.IsInstall }}'
+    badLabel: '{{ $.Release.NotExists }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(has_diagnostic_code(
+            &diagnostics,
+            "E_TPL_UNKNOWN_BUILTIN_PATH"
+        ));
+    }
+
+    #[test]
+    fn template_assist_completes_release_builtin_paths() {
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    note: '{{ $.Release. }}'
+"#;
+        let line = 6u32;
+        let marker = "$.Release.";
+        let line_text = src.lines().nth(line as usize).expect("line with marker");
+        let character = (line_text.find(marker).expect("marker offset") + marker.len()) as u32;
+        let result = template_assist_request(
+            &ServerState::default(),
+            TemplateAssistParams {
+                uri: None,
+                text: Some(src.to_string()),
+                line,
+                character,
+            },
+        )
+        .expect("template assist");
+        assert!(result.inside_template);
+        assert!(result.completions.iter().any(|it| it.label == "IsInstall"));
+        assert!(result.completions.iter().any(|it| it.label == "Namespace"));
+    }
+
+    #[test]
+    fn diagnostics_for_include_file_use_chart_values_and_resolved_current_app_context() {
+        let td = TempDir::new().expect("tmp");
+        let chart_yaml = td.path().join("Chart.yaml");
+        fs::write(
+            &chart_yaml,
+            r#"
+apiVersion: v2
+name: test-chart
+version: 0.1.0
+"#,
+        )
+        .expect("write chart");
+        let values_path = td.path().join("values.yaml");
+        fs::write(
+            &values_path,
+            r#"
+global:
+  _includes:
+    _include_from_file: defaults.yaml
+deploy:
+  enabled: true
+apps-stateless:
+  app-1:
+    _include:
+      - default-app
+"#,
+        )
+        .expect("write values");
+        let defaults_path = td.path().join("defaults.yaml");
+        let defaults_text = r#"
+base:
+  _options:
+    partOf: core
+default-app:
+  _include: ["base"]
+  labels: |
+    app.kubernetes.io/part-of: "{{ $.CurrentApp._options.partOf }}"
+    app.kubernetes.io/version: "{{ $.CurrentApp.CurrentAppVersion }}"
+    deploy-enabled: "{{ $.Values.deploy.enabled }}"
+"#;
+        fs::write(&defaults_path, defaults_text).expect("write defaults");
+
+        let uri = format!("file://{}", defaults_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, defaults_text);
+
+        assert!(diagnostics
+            .iter()
+            .all(|d| !matches!(d.code, Some(lsp_types::NumberOrString::String(ref c)) if c == "E_TPL_UNKNOWN_VALUES_PATH")));
+        assert!(diagnostics
+            .iter()
+            .all(|d| !matches!(d.code, Some(lsp_types::NumberOrString::String(ref c)) if c == "E_TPL_UNKNOWN_CURRENT_APP_PATH")));
+        assert!(diagnostics
+            .iter()
+            .all(|d| !matches!(d.code, Some(lsp_types::NumberOrString::String(ref c)) if c == "E_TPL_CURRENT_APP_SCOPE")));
+    }
+
+    #[test]
+    fn template_assist_for_include_file_completes_values_from_primary_values_yaml() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        fs::write(
+            td.path().join("values.yaml"),
+            r#"
+global:
+  _includes:
+    _include_from_file: defaults.yaml
+deploy:
+  enabled: true
+"#,
+        )
+        .expect("write values");
+        let defaults_path = td.path().join("defaults.yaml");
+        let defaults_text = r#"
+default-app:
+  labels: |
+    deploy-enabled: "{{ $.Values.deploy. }}"
+"#;
+        fs::write(&defaults_path, defaults_text).expect("write defaults");
+
+        let line = 3u32;
+        let marker = "$.Values.deploy.";
+        let line_text = defaults_text
+            .lines()
+            .nth(line as usize)
+            .expect("marker line");
+        let character = (line_text.find(marker).expect("marker offset") + marker.len()) as u32;
+        let uri_text = format!("file://{}", defaults_path.to_string_lossy());
+
+        let result = template_assist_request(
+            &ServerState::default(),
+            TemplateAssistParams {
+                uri: Some(uri_text),
+                text: Some(defaults_text.to_string()),
+                line,
+                character,
+            },
+        )
+        .expect("template assist");
+
+        assert!(result.inside_template);
+        assert!(result.completions.iter().any(|it| it.label == "enabled"));
+    }
+
+    #[test]
+    fn list_entities_for_include_file_reads_root_values_context() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        fs::write(
+            td.path().join("values.yaml"),
+            r#"
+global:
+  _includes: {}
+_include_files:
+  - deployments-values.yaml
+apps-stateless:
+  root-app:
+    enabled: false
+"#,
+        )
+        .expect("write values");
+        let include_path = td.path().join("deployments-values.yaml");
+        let include_text = r#"
+apps-stateless:
+  include-app:
+    enabled: true
+"#;
+        fs::write(&include_path, include_text).expect("write include values");
+
+        let result = list_entities_request(
+            &ServerState::default(),
+            ListEntitiesParams {
+                uri: Some(format!("file://{}", include_path.to_string_lossy())),
+                text: Some(include_text.to_string()),
+                env: None,
+                apply_includes: Some(true),
+                apply_env_resolution: Some(true),
+            },
+        )
+        .expect("list entities");
+
+        let group = result
+            .groups
+            .iter()
+            .find(|group| group.name == "apps-stateless")
+            .expect("apps-stateless group");
+        assert!(group.apps.iter().any(|app| app == "include-app"));
+    }
+
+    #[test]
+    fn resolve_entity_for_include_file_reads_root_values_context() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        fs::write(
+            td.path().join("values.yaml"),
+            r#"
+global:
+  _includes: {}
+_include_files:
+  - deployments-values.yaml
+"#,
+        )
+        .expect("write values");
+        let include_path = td.path().join("deployments-values.yaml");
+        let include_text = r#"
+apps-stateless:
+  include-app:
+    enabled: true
+"#;
+        fs::write(&include_path, include_text).expect("write include values");
+
+        let result = resolve_entity_request(
+            &ServerState::default(),
+            ResolveEntityParams {
+                uri: Some(format!("file://{}", include_path.to_string_lossy())),
+                text: Some(include_text.to_string()),
+                group: "apps-stateless".to_string(),
+                app: "include-app".to_string(),
+                env: None,
+                apply_includes: Some(true),
+                apply_env_resolution: Some(true),
+            },
+        )
+        .expect("resolve entity");
+        assert_eq!(
+            result
+                .entity
+                .get("enabled")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn resolve_entity_expands_root_relative_nested_include_from_file_chain() {
+        let td = TempDir::new().expect("tmp");
+        fs::create_dir_all(td.path().join("profiles")).expect("mkdir profiles");
+        fs::create_dir_all(td.path().join("common")).expect("mkdir common");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        fs::write(
+            td.path().join("values.yaml"),
+            r#"
+global:
+  _includes:
+    _include_from_file: profiles/defaults.yaml
+apps-stateless:
+  app-1:
+    _include:
+      - default-app
+"#,
+        )
+        .expect("write values");
+        fs::write(
+            td.path().join("profiles/defaults.yaml"),
+            r#"
+default-app:
+  _include_from_file: common/default-app-base.yaml
+  enabled: true
+"#,
+        )
+        .expect("write defaults");
+        fs::write(
+            td.path().join("common/default-app-base.yaml"),
+            r#"
+image:
+  name: nginx
+"#,
+        )
+        .expect("write base");
+
+        let values_path = td.path().join("values.yaml");
+        let result = resolve_entity_request(
+            &ServerState::default(),
+            ResolveEntityParams {
+                uri: Some(format!("file://{}", values_path.to_string_lossy())),
+                text: None,
+                group: "apps-stateless".to_string(),
+                app: "app-1".to_string(),
+                env: None,
+                apply_includes: Some(true),
+                apply_env_resolution: Some(true),
+            },
+        )
+        .expect("resolve entity");
+
+        assert_eq!(
+            result
+                .entity
+                .get("image")
+                .and_then(as_obj)
+                .and_then(|image| image.get("name"))
+                .and_then(JsonValue::as_str),
+            Some("nginx")
+        );
+    }
+
+    #[test]
+    fn resolve_entity_accepts_scalar_include_files_and_loads_profile() {
+        let td = TempDir::new().expect("tmp");
+        fs::create_dir_all(td.path().join("profiles")).expect("mkdir profiles");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        fs::write(
+            td.path().join("values.yaml"),
+            r#"
+global:
+  _includes: {}
+apps-stateless:
+  app-1:
+    _include_files: profiles/default-app.yaml
+"#,
+        )
+        .expect("write values");
+        fs::write(
+            td.path().join("profiles/default-app.yaml"),
+            r#"
+labels: |
+  team: platform
+"#,
+        )
+        .expect("write include profile");
+
+        let values_path = td.path().join("values.yaml");
+        let result = resolve_entity_request(
+            &ServerState::default(),
+            ResolveEntityParams {
+                uri: Some(format!("file://{}", values_path.to_string_lossy())),
+                text: None,
+                group: "apps-stateless".to_string(),
+                app: "app-1".to_string(),
+                env: None,
+                apply_includes: Some(true),
+                apply_env_resolution: Some(true),
+            },
+        )
+        .expect("resolve entity");
+
+        assert_eq!(
+            result
+                .entity
+                .get("labels")
+                .and_then(JsonValue::as_str),
+            Some("team: platform\n")
+        );
+    }
+
+    #[test]
+    fn template_assist_for_include_file_completes_current_app_runtime_and_options() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        fs::write(
+            td.path().join("values.yaml"),
+            r#"
+global:
+  _includes:
+    _include_from_file: defaults.yaml
+apps-stateless:
+  app-1:
+    _include:
+      - default-app
+"#,
+        )
+        .expect("write values");
+        let defaults_path = td.path().join("defaults.yaml");
+        let defaults_text = r#"
+base:
+  _options:
+    partOf: core
+default-app:
+  _include: ["base"]
+  labels: |
+    app-part-of: "{{ $.CurrentApp. }}"
+"#;
+        fs::write(&defaults_path, defaults_text).expect("write defaults");
+
+        let line = 7u32;
+        let marker = "$.CurrentApp.";
+        let line_text = defaults_text
+            .lines()
+            .nth(line as usize)
+            .expect("marker line");
+        let character = (line_text.find(marker).expect("marker offset") + marker.len()) as u32;
+        let uri_text = format!("file://{}", defaults_path.to_string_lossy());
+
+        let result = template_assist_request(
+            &ServerState::default(),
+            TemplateAssistParams {
+                uri: Some(uri_text),
+                text: Some(defaults_text.to_string()),
+                line,
+                character,
+            },
+        )
+        .expect("template assist");
+
+        assert!(result.inside_template);
+        assert!(result.completions.iter().any(|it| it.label == "_options"));
+        assert!(result
+            .completions
+            .iter()
+            .any(|it| it.label == "CurrentAppVersion"));
+    }
+
+    #[test]
+    fn include_name_from_path_uses_sha256_of_raw_path() {
+        assert_eq!(
+            include_name_from_path("profiles/base.yaml"),
+            "d584b060afcc4eff599e85c6284eae0b9ffe50a198ccc65d569d6eb4649b72bc"
+        );
+        assert_eq!(
+            include_name_from_path("profiles/base.yml"),
+            "c0566af2c84897f26ba75f08af4537c6dd1997700e21c2477c66bb99a7ba8449"
+        );
+        assert_eq!(
+            include_name_from_path("profiles/UPPER.YAML"),
+            "99a95bc88e935f834b683d9271bbf171acb92b18f6b4323da00692fe08f41d51"
+        );
+        assert_eq!(
+            include_name_from_path("profiles/noext"),
+            "1ae2a0772f82af36af3295361b35b22ef532e9ac1ef727fc7c8957f88852c96b"
+        );
     }
 
     #[test]
