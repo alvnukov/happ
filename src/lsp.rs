@@ -423,21 +423,32 @@ fn handle_notification(
     Ok(())
 }
 
+fn resolve_request_text(
+    state: &ServerState,
+    uri: Option<&str>,
+    text: Option<String>,
+) -> Result<String, String> {
+    if let Some(text) = text {
+        return Ok(text);
+    }
+    let Some(uri) = uri else {
+        return Err("either 'text' or 'uri' must be provided".to_string());
+    };
+    if let Some(doc) = state.documents.get(uri) {
+        return Ok(doc.text.clone());
+    }
+    if let Some(path) = file_path_from_uri_string(uri) {
+        return std::fs::read_to_string(&path)
+            .map_err(|err| format!("read document from {uri}: {err}"));
+    }
+    Err(format!("document not found in LSP state: {uri}"))
+}
+
 fn list_entities_request(
     state: &ServerState,
     params: ListEntitiesParams,
 ) -> Result<ListEntitiesResult, String> {
-    let text = if let Some(text) = params.text {
-        text
-    } else if let Some(uri) = params.uri.as_ref() {
-        state
-            .documents
-            .get(uri)
-            .map(|d| d.text.clone())
-            .ok_or_else(|| format!("document not found in LSP state: {uri}"))?
-    } else {
-        return Err("either 'text' or 'uri' must be provided".to_string());
-    };
+    let text = resolve_request_text(state, params.uri.as_deref(), params.text)?;
 
     let request_uri = params
         .uri
@@ -569,23 +580,11 @@ fn resolve_entity_context(
     apply_includes: Option<bool>,
     apply_env_resolution: Option<bool>,
 ) -> Result<ResolvedEntityContext, String> {
-    let text = if let Some(text) = text {
-        text
-    } else if let Some(uri) = uri.as_ref() {
-        state
-            .documents
-            .get(uri)
-            .map(|d| d.text.clone())
-            .ok_or_else(|| format!("document not found in LSP state: {uri}"))?
-    } else {
-        return Err("either 'text' or 'uri' must be provided".to_string());
-    };
+    let text = resolve_request_text(state, uri.as_deref(), text)?;
 
     let apply_includes = apply_includes.unwrap_or(true);
     let apply_env = apply_env_resolution.unwrap_or(true);
-    let request_uri = uri
-        .as_ref()
-        .and_then(|value| value.parse::<Uri>().ok());
+    let request_uri = uri.as_ref().and_then(|value| value.parse::<Uri>().ok());
 
     let root_map = if apply_includes {
         parse_and_expand_values_root(request_uri.as_ref(), &text)
@@ -1029,17 +1028,7 @@ fn template_assist_request(
         .uri
         .as_ref()
         .and_then(|value| value.parse::<Uri>().ok());
-    let text = if let Some(text) = params.text {
-        text
-    } else if let Some(uri) = params.uri.as_ref() {
-        state
-            .documents
-            .get(uri)
-            .map(|d| d.text.clone())
-            .ok_or_else(|| format!("document not found in LSP state: {uri}"))?
-    } else {
-        return Err("either 'text' or 'uri' must be provided".to_string());
-    };
+    let text = resolve_request_text(state, params.uri.as_deref(), params.text)?;
 
     let line_index = TextLineIndex::new(&text);
     let lines: Vec<&str> = text.split('\n').collect();
@@ -1221,7 +1210,7 @@ fn build_template_diagnostics(_uri: &Uri, text: &str, lines: &[&str]) -> Vec<Dia
             DiagnosticSeverity::WARNING,
             format!("Template syntax error: {}", err.message),
             Some("E_TPL_PARSE".to_string()),
-            ));
+        ));
     }
 
     for typo in collect_single_left_delim_typos(text, &spans) {
@@ -1386,7 +1375,10 @@ struct SingleLeftDelimTypo {
     len: usize,
 }
 
-fn collect_single_left_delim_typos(text: &str, spans: &[crate::gotemplates::GoTemplateActionSpan]) -> Vec<SingleLeftDelimTypo> {
+fn collect_single_left_delim_typos(
+    text: &str,
+    spans: &[crate::gotemplates::GoTemplateActionSpan],
+) -> Vec<SingleLeftDelimTypo> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -1433,10 +1425,7 @@ fn collect_single_left_delim_typos(text: &str, spans: &[crate::gotemplates::GoTe
     out
 }
 
-fn parse_action_rust_native(
-    action: &str,
-    action_start: usize,
-) -> Result<(), GoTemplateScanError> {
+fn parse_action_rust_native(action: &str, action_start: usize) -> Result<(), GoTemplateScanError> {
     // LSP soft diagnostics use Rust-native parser only (no Go FFI runtime).
     parse_action_compat(action, action_start).map(|_| ())
 }
@@ -1736,7 +1725,8 @@ fn process_file_include_node(
             if let Some(raw_path) = include_from_file {
                 current.remove("_include_from_file");
                 let loaded =
-                    load_yaml_map_from_file(&raw_path, include_base_dir, overrides, file_stack).ok();
+                    load_yaml_map_from_file(&raw_path, include_base_dir, overrides, file_stack)
+                        .ok();
                 if let Some((_loaded_path, loaded_map)) = loaded.flatten() {
                     let loaded_processed = process_file_include_node(
                         &JsonValue::Object(loaded_map),
@@ -1764,7 +1754,8 @@ fn process_file_include_node(
                     let raw_path = raw_path_value.trim();
                     let include_name = include_name_from_path(raw_path);
                     let loaded =
-                        load_yaml_map_from_file(raw_path, include_base_dir, overrides, file_stack).ok();
+                        load_yaml_map_from_file(raw_path, include_base_dir, overrides, file_stack)
+                            .ok();
                     if let Some((_loaded_path, loaded_map)) = loaded.flatten() {
                         let loaded_processed = process_file_include_node(
                             &JsonValue::Object(loaded_map),
@@ -4527,10 +4518,7 @@ apps-stateless:
     host: '*-{{ $.Values.global.env }}.apps.mrms.{ include "fl.value" (list $ . $.Values.global.base_url) }}'
 "#;
         let diagnostics = build_diagnostics(&uri, src);
-        assert!(has_diagnostic_code(
-            &diagnostics,
-            "E_TPL_SINGLE_LEFT_DELIM"
-        ));
+        assert!(has_diagnostic_code(&diagnostics, "E_TPL_SINGLE_LEFT_DELIM"));
     }
 
     #[test]
@@ -5091,10 +5079,7 @@ labels: |
         .expect("resolve entity");
 
         assert_eq!(
-            result
-                .entity
-                .get("labels")
-                .and_then(JsonValue::as_str),
+            result.entity.get("labels").and_then(JsonValue::as_str),
             Some("team: platform\n")
         );
     }
