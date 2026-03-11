@@ -37,6 +37,117 @@ enum Frame {
     },
 }
 
+#[derive(Default)]
+struct HintCollector {
+    docs: Vec<MergeStyleHints>,
+    current_doc: Option<usize>,
+    stack: Vec<Frame>,
+}
+
+impl HintCollector {
+    fn into_docs(self) -> Vec<MergeStyleHints> {
+        self.docs
+    }
+
+    fn on_document_start(&mut self) {
+        self.docs.push(MergeStyleHints::default());
+        self.current_doc = Some(self.docs.len() - 1);
+        self.stack.clear();
+    }
+
+    fn on_document_end(&mut self) {
+        self.stack.clear();
+        self.current_doc = None;
+    }
+
+    fn on_mapping_start(&mut self) {
+        let child_path = begin_container(&mut self.stack);
+        self.stack.push(Frame::Mapping {
+            path: child_path,
+            expecting_key: true,
+            current_key: None,
+        });
+    }
+
+    fn on_mapping_end(&mut self) {
+        self.stack.pop();
+    }
+
+    fn on_sequence_start(&mut self) {
+        let child_path = begin_container(&mut self.stack);
+        self.stack.push(Frame::Sequence {
+            path: child_path,
+            next_index: 0,
+        });
+    }
+
+    fn on_sequence_end(&mut self) {
+        self.stack.pop();
+    }
+
+    unsafe fn on_scalar_event(&mut self, event: &yaml_event_t) {
+        let mut consumed_mapping_key = false;
+        let mut merge_hint: Option<(Path, yaml_scalar_style_t)> = None;
+
+        if let Some(Frame::Mapping {
+            path,
+            expecting_key,
+            current_key,
+        }) = self.stack.last_mut()
+        {
+            if *expecting_key {
+                let key = scalar_string(event);
+                if key == "<<" {
+                    merge_hint = Some((path.clone(), event.data.scalar.style));
+                }
+                *current_key = Some(key);
+                *expecting_key = false;
+                consumed_mapping_key = true;
+            }
+        }
+
+        if let Some((path, style)) = merge_hint {
+            self.record_merge_style(path, style);
+        }
+        if consumed_mapping_key {
+            return;
+        }
+
+        consume_scalar_or_alias_value(&mut self.stack);
+    }
+
+    fn on_alias_event(&mut self) {
+        let mut consumed_mapping_key = false;
+        if let Some(Frame::Mapping {
+            expecting_key,
+            current_key,
+            ..
+        }) = self.stack.last_mut()
+        {
+            if *expecting_key {
+                *expecting_key = false;
+                *current_key = None;
+                consumed_mapping_key = true;
+            }
+        }
+        if consumed_mapping_key {
+            return;
+        }
+        consume_scalar_or_alias_value(&mut self.stack);
+    }
+
+    fn record_merge_style(&mut self, path: Path, style: yaml_scalar_style_t) {
+        let Some(doc_idx) = self.current_doc else {
+            return;
+        };
+        if style == YAML_PLAIN_SCALAR_STYLE {
+            self.docs[doc_idx].plain_merge_paths.insert(path);
+        } else {
+            self.docs[doc_idx].nonplain_merge_paths.insert(path);
+        }
+    }
+}
+
 pub fn normalize_value(v: Value) -> Value {
     normalize_value_with_hints(v, None, &mut Vec::new())
 }
@@ -151,124 +262,63 @@ fn merge_mapping_into(target: &mut Mapping, source: Mapping) {
 
 fn collect_merge_style_hints(input: &str) -> Result<Vec<MergeStyleHints>, String> {
     unsafe {
-        let mut parser = std::mem::MaybeUninit::<yaml_parser_t>::zeroed().assume_init();
-        if !yaml_parser_initialize(&mut parser).ok {
-            return Err("yaml parser init failed".to_string());
-        }
-        yaml_parser_set_input_string(&mut parser, input.as_ptr(), input.len() as u64);
-
-        let mut all_hints: Vec<MergeStyleHints> = Vec::new();
-        let mut current_doc: Option<usize> = None;
-        let mut stack: Vec<Frame> = Vec::new();
-
-        loop {
-            let mut event = std::mem::MaybeUninit::<yaml_event_t>::zeroed().assume_init();
-            if !yaml_parser_parse(&mut parser, &mut event).ok {
-                let err = parser_error(&parser);
-                yaml_parser_delete(&mut parser);
-                return Err(err);
-            }
-            let t = event.type_;
-
-            match t {
-                YAML_DOCUMENT_START_EVENT => {
-                    all_hints.push(MergeStyleHints::default());
-                    current_doc = Some(all_hints.len() - 1);
-                    stack.clear();
-                }
-                YAML_DOCUMENT_END_EVENT => {
-                    stack.clear();
-                    current_doc = None;
-                }
-                YAML_MAPPING_START_EVENT => {
-                    let child_path = begin_container(&mut stack)?;
-                    stack.push(Frame::Mapping {
-                        path: child_path,
-                        expecting_key: true,
-                        current_key: None,
-                    });
-                }
-                YAML_MAPPING_END_EVENT => {
-                    stack.pop();
-                }
-                YAML_SEQUENCE_START_EVENT => {
-                    let child_path = begin_container(&mut stack)?;
-                    stack.push(Frame::Sequence {
-                        path: child_path,
-                        next_index: 0,
-                    });
-                }
-                YAML_SEQUENCE_END_EVENT => {
-                    stack.pop();
-                }
-                YAML_SCALAR_EVENT => {
-                    if let Some(Frame::Mapping {
-                        path,
-                        expecting_key,
-                        current_key,
-                    }) = stack.last_mut()
-                    {
-                        if *expecting_key {
-                            let k = scalar_string(&event);
-                            if k == "<<" {
-                                let style: yaml_scalar_style_t = event.data.scalar.style;
-                                if let Some(doc_idx) = current_doc {
-                                    if style == YAML_PLAIN_SCALAR_STYLE {
-                                        all_hints[doc_idx].plain_merge_paths.insert(path.clone());
-                                    } else {
-                                        all_hints[doc_idx]
-                                            .nonplain_merge_paths
-                                            .insert(path.clone());
-                                    }
-                                }
-                            }
-                            *current_key = Some(k);
-                            *expecting_key = false;
-                            yaml_event_delete(&mut event);
-                            if t == YAML_STREAM_END_EVENT {
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-                    consume_scalar_or_alias_value(&mut stack);
-                }
-                YAML_ALIAS_EVENT => {
-                    if let Some(Frame::Mapping {
-                        expecting_key,
-                        current_key,
-                        ..
-                    }) = stack.last_mut()
-                    {
-                        if *expecting_key {
-                            *expecting_key = false;
-                            *current_key = None;
-                            yaml_event_delete(&mut event);
-                            if t == YAML_STREAM_END_EVENT {
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-                    consume_scalar_or_alias_value(&mut stack);
-                }
-                _ => {}
-            }
-
-            yaml_event_delete(&mut event);
-            if t == YAML_STREAM_END_EVENT {
-                break;
-            }
-        }
-
-        yaml_parser_delete(&mut parser);
-        Ok(all_hints)
+        with_yaml_parser(input, |parser| {
+            collect_merge_style_hints_from_parser(parser)
+        })
     }
 }
 
-fn begin_container(stack: &mut [Frame]) -> Result<Path, String> {
+unsafe fn with_yaml_parser<T, F>(input: &str, parse: F) -> Result<T, String>
+where
+    F: FnOnce(&mut yaml_parser_t) -> Result<T, String>,
+{
+    let mut parser = std::mem::MaybeUninit::<yaml_parser_t>::uninit();
+    if !yaml_parser_initialize(parser.as_mut_ptr()).ok {
+        return Err("yaml parser init failed".to_string());
+    }
+    let mut parser = parser.assume_init();
+    yaml_parser_set_input_string(&mut parser, input.as_ptr(), input.len() as u64);
+    let result = parse(&mut parser);
+    yaml_parser_delete(&mut parser);
+    result
+}
+
+unsafe fn collect_merge_style_hints_from_parser(
+    parser: &mut yaml_parser_t,
+) -> Result<Vec<MergeStyleHints>, String> {
+    let mut collector = HintCollector::default();
+
+    loop {
+        let mut event = std::mem::MaybeUninit::<yaml_event_t>::zeroed().assume_init();
+        if !yaml_parser_parse(parser, &mut event).ok {
+            return Err(parser_error(parser));
+        }
+        let event_type = event.type_;
+
+        match event_type {
+            YAML_DOCUMENT_START_EVENT => collector.on_document_start(),
+            YAML_DOCUMENT_END_EVENT => collector.on_document_end(),
+            YAML_MAPPING_START_EVENT => collector.on_mapping_start(),
+            YAML_MAPPING_END_EVENT => collector.on_mapping_end(),
+            YAML_SEQUENCE_START_EVENT => collector.on_sequence_start(),
+            YAML_SEQUENCE_END_EVENT => collector.on_sequence_end(),
+            YAML_SCALAR_EVENT => collector.on_scalar_event(&event),
+            YAML_ALIAS_EVENT => collector.on_alias_event(),
+            _ => {}
+        }
+
+        yaml_event_delete(&mut event);
+        if event_type == YAML_STREAM_END_EVENT {
+            break;
+        }
+    }
+
+    Ok(collector.into_docs())
+}
+
+fn begin_container(stack: &mut [Frame]) -> Path {
     let Some(parent) = stack.last_mut() else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     match parent {
         Frame::Sequence { path, next_index } => {
@@ -276,7 +326,7 @@ fn begin_container(stack: &mut [Frame]) -> Result<Path, String> {
             *next_index += 1;
             let mut out = path.clone();
             out.push(PathSegment::Index(idx));
-            Ok(out)
+            out
         }
         Frame::Mapping {
             path,
@@ -288,7 +338,7 @@ fn begin_container(stack: &mut [Frame]) -> Result<Path, String> {
                 *current_key = None;
                 let mut out = path.clone();
                 out.push(PathSegment::Key("<complex-key>".to_string()));
-                return Ok(out);
+                return out;
             }
             let key = current_key
                 .take()
@@ -296,7 +346,7 @@ fn begin_container(stack: &mut [Frame]) -> Result<Path, String> {
             *expecting_key = true;
             let mut out = path.clone();
             out.push(PathSegment::Key(key));
-            Ok(out)
+            out
         }
     }
 }
@@ -351,6 +401,102 @@ unsafe fn parser_error(parser: &yaml_parser_t) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_merge_style_hints_tracks_plain_and_quoted_merge_keys() {
+        let src = r#"
+base: &base
+  x: 1
+plain:
+  <<: *base
+quoted:
+  "<<": *base
+single_quoted:
+  '<<': *base
+"#;
+        let hints = collect_merge_style_hints(src).expect("collect hints");
+        assert_eq!(hints.len(), 1);
+        let doc = &hints[0];
+
+        let plain_path = vec![PathSegment::Key("plain".to_string())];
+        let quoted_path = vec![PathSegment::Key("quoted".to_string())];
+        let single_quoted_path = vec![PathSegment::Key("single_quoted".to_string())];
+
+        assert!(doc.plain_merge_paths.contains(&plain_path));
+        assert!(doc.nonplain_merge_paths.contains(&quoted_path));
+        assert!(doc.nonplain_merge_paths.contains(&single_quoted_path));
+    }
+
+    #[test]
+    fn collect_merge_style_hints_reports_line_and_column_for_invalid_yaml() {
+        let src = "name: {{ $.Values.global.env }}-integration\n";
+        let err = collect_merge_style_hints(src).expect_err("must fail");
+        assert!(err.contains("line"), "err: {err}");
+        assert!(err.contains("column"), "err: {err}");
+    }
+
+    #[test]
+    fn normalize_value_from_source_falls_back_to_default_merge_when_hints_fail() {
+        let invalid_source = "name: {{ $.Values.global.env }}-integration\n";
+        let value: Value = serde_yaml::from_str(
+            r#"
+obj:
+  <<:
+    common: true
+  name: svc
+"#,
+        )
+        .expect("parse");
+        let normalized = normalize_value_from_source(invalid_source, value);
+        let json = serde_json::to_value(normalized).expect("json");
+        assert_eq!(json["obj"]["common"], true);
+        assert_eq!(json["obj"]["name"], "svc");
+        assert!(json["obj"].get("<<").is_none());
+    }
+
+    #[test]
+    fn begin_container_for_sequence_uses_next_index_and_increments_cursor() {
+        let mut stack = vec![Frame::Sequence {
+            path: vec![PathSegment::Key("root".to_string())],
+            next_index: 3,
+        }];
+        let child_path = begin_container(&mut stack);
+        assert_eq!(
+            child_path,
+            vec![PathSegment::Key("root".to_string()), PathSegment::Index(3)]
+        );
+        let Frame::Sequence { next_index, .. } = &stack[0] else {
+            panic!("expected sequence frame");
+        };
+        assert_eq!(*next_index, 4);
+    }
+
+    #[test]
+    fn begin_container_for_mapping_value_uses_current_key_and_resets_state() {
+        let mut stack = vec![Frame::Mapping {
+            path: vec![PathSegment::Key("root".to_string())],
+            expecting_key: false,
+            current_key: Some("spec".to_string()),
+        }];
+        let child_path = begin_container(&mut stack);
+        assert_eq!(
+            child_path,
+            vec![
+                PathSegment::Key("root".to_string()),
+                PathSegment::Key("spec".to_string())
+            ]
+        );
+        let Frame::Mapping {
+            expecting_key,
+            current_key,
+            ..
+        } = &stack[0]
+        else {
+            panic!("expected mapping frame");
+        };
+        assert!(*expecting_key);
+        assert!(current_key.is_none());
+    }
 
     #[test]
     fn resolves_inline_merge_map() {

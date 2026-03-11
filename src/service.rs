@@ -35,12 +35,40 @@ pub fn run() -> Result<(), Error> {
 }
 
 pub fn run_with(cli: Cli) -> Result<(), Error> {
+    if let Some(outcome) = handle_top_level_modes(&cli)? {
+        return Ok(outcome);
+    }
+
+    let web_open_browser = cli.web_open_browser;
+    let Some(command) = cli.command else {
+        return Err(Error::Convert(
+            "no command provided (use --help, --web or --studio)".to_string(),
+        ));
+    };
+
+    match command {
+        Command::Chart(args) => run_chart_command(&args),
+        Command::Batch(args) => run_batch_command(&args),
+        Command::Manifests(args) => run_manifests_command(&args),
+        Command::Compose(args) => run_compose_command(&args),
+        Command::Validate(args) => run_validate_command(&args),
+        Command::Lsp(args) => Ok(crate::lsp::run(args)?),
+        Command::Completion(args) => run_completion_command(&args),
+        Command::Jq(args) => run_jq_command(&args),
+        Command::Yq(args) => run_yq_command(&args),
+        Command::ComposeInspect(args) => run_compose_inspect_command(&args),
+        Command::Dyff(args) => run_dyff_command(&args),
+        Command::Inspect(args) => run_inspect_command(web_open_browser, &args),
+    }
+}
+
+fn handle_top_level_modes(cli: &Cli) -> Result<Option<()>, Error> {
     if cli.studio && cli.command.is_none() {
         crate::lsp::run(crate::cli::LspArgs {
             stdio: true,
             parent_pid: None,
         })?;
-        return Ok(());
+        return Ok(Some(()));
     }
     if cli.studio {
         return Err(Error::Convert(
@@ -53,270 +81,268 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
         } else {
             read_stdin_available_nonblocking()?
         };
-        return crate::inspectweb::serve_tools(&cli.web_addr, cli.web_open_browser, stdin_text)
-            .map_err(Error::Convert);
-    }
-    let Some(command) = cli.command else {
-        return Err(Error::Convert(
-            "no command provided (use --help, --web or --studio)".to_string(),
-        ));
-    };
-    match command {
-        Command::Chart(args) => run_chart_command(&args),
-        Command::Batch(args) => {
-            let report = crate::batch::run_batch_convert(&args, |import_args| {
-                run_chart_command(import_args).map_err(|e| e.to_string())
-            })
+        crate::inspectweb::serve_tools(&cli.web_addr, cli.web_open_browser, stdin_text)
             .map_err(Error::Convert)?;
-            eprintln!(
-                "batch convert: total={}, succeeded={}, failed={}",
-                report.total, report.succeeded, report.failed
-            );
-            Ok(())
-        }
-        Command::Manifests(args) => {
-            if args.verify_equivalence {
-                return Err(Error::Convert(
-                    "--verify-equivalence is supported only for chart source".to_string(),
-                ));
-            }
-            let docs = crate::source::load_documents_for_manifests(&args.path)?;
-            let values = crate::convert::build_values(&args, &docs).map_err(Error::Convert)?;
-            if let Some(out) = args.out_chart_dir.as_deref() {
-                crate::output::generate_consumer_chart(
-                    out,
-                    args.chart_name.as_deref(),
-                    &values,
-                    args.library_chart_path.as_deref(),
-                    false,
-                )?;
-            }
-            if args.out_chart_dir.is_none() || args.output.is_some() {
-                crate::output::write_values(args.output.as_deref(), &values)?;
-            }
-            Ok(())
-        }
-        Command::Compose(args) => {
-            if args.verify_equivalence {
-                return Err(Error::Convert(
-                    "--verify-equivalence is supported only for chart source".to_string(),
-                ));
-            }
-            let rep = crate::composeinspect::load(&args.path)?;
-            let values = crate::composeimport::build_values(&args, &rep);
-            if let Some(out) = args.out_chart_dir.as_deref() {
-                crate::output::generate_consumer_chart(
-                    out,
-                    args.chart_name.as_deref(),
-                    &values,
-                    args.library_chart_path.as_deref(),
-                    false,
-                )?;
-            }
-            if args.out_chart_dir.is_none() || args.output.is_some() {
-                crate::output::write_values(args.output.as_deref(), &values)?;
-            }
-            Ok(())
-        }
-        Command::Validate(args) => {
-            crate::source::validate_values_file(&args.values)?;
-            println!("OK");
-            Ok(())
-        }
-        Command::Lsp(args) => Ok(crate::lsp::run(args)?),
-        Command::Completion(args) => {
-            let shell_name = args
-                .shell_flag
-                .as_deref()
-                .or(args.shell.as_deref())
-                .ok_or_else(|| {
-                    Error::Convert(
-                        "missing shell, expected one of: bash,zsh,fish,powershell,elvish"
-                            .to_string(),
-                    )
-                })?;
-            let shell = match shell_name {
-                "bash" => Shell::Bash,
-                "zsh" => Shell::Zsh,
-                "fish" => Shell::Fish,
-                "powershell" => Shell::PowerShell,
-                "elvish" => Shell::Elvish,
-                _ => {
-                    return Err(Error::Convert(format!(
-                        "unsupported shell '{}', expected one of: bash,zsh,fish,powershell,elvish",
-                        shell_name
-                    )));
-                }
-            };
-            let mut cmd = Cli::command();
-            let bin_name = cmd.get_name().to_string();
-            let mut out = Vec::<u8>::new();
-            generate(shell, &mut cmd, bin_name, &mut out);
-            if let Some(path) = args.output.as_deref() {
-                fs::write(path, out)
-                    .map_err(|e| Error::Convert(format!("write completion to {path}: {e}")))?;
-            } else {
-                io::stdout()
-                    .write_all(&out)
-                    .map_err(|e| Error::Convert(format!("write completion to stdout: {e}")))?;
-            }
-            Ok(())
-        }
-        Command::Jq(args) => {
-            let input = crate::source::read_input(&args.input)?;
-            let mode = parse_doc_selection(&args)?;
-            let docs = crate::query::parse_input_docs_prefer_json(&input)
-                .map_err(|e| Error::Convert(format_query_error("jq", &args.query, &input, &e)))?;
-            let stream = select_docs(docs, mode, "jq")?;
-            let out = crate::query::run_query_stream(&args.query, stream)
-                .map_err(|e| Error::Convert(format_query_error("jq", &args.query, &input, &e)))?;
-            print_query_output(&out, args.compact, args.raw_output)?;
-            Ok(())
-        }
-        Command::Yq(args) => {
-            let input = crate::source::read_input(&args.input)?;
-            let mode = parse_doc_selection(&args)?;
-            let docs = crate::query::parse_input_docs_prefer_yaml(&input)
-                .map_err(|e| Error::Convert(format_query_error("yq", &args.query, &input, &e)))?;
-            let stream = select_docs(docs, mode, "yq")?;
-            let out = crate::query::run_query_stream(&args.query, stream)
-                .map_err(|e| Error::Convert(format_query_error("yq", &args.query, &input, &e)))?;
-            print_query_output(&out, args.compact, args.raw_output)?;
-            Ok(())
-        }
-        Command::ComposeInspect(args) => {
-            if args.web {
-                let report =
-                    crate::composeinspect::load(&args.path).map_err(Error::ComposeInspect)?;
-                let source_yaml = std::fs::read_to_string(&report.source_path)
-                    .map_err(crate::source::Error::Io)?;
-                let report_yaml =
-                    serde_yaml::to_string(&report).map_err(crate::source::Error::Yaml)?;
-                let import_args = crate::cli::ImportArgs {
-                    path: args.path.clone(),
-                    env: "dev".into(),
-                    group_name: "apps-k8s-manifests".into(),
-                    group_type: "apps-k8s-manifests".into(),
-                    min_include_bytes: 24,
-                    include_status: false,
-                    output: None,
-                    out_chart_dir: None,
-                    chart_name: None,
-                    library_chart_path: None,
-                    import_strategy: "raw".into(),
-                    allow_template_includes: Vec::new(),
-                    unsupported_template_mode: "error".into(),
-                    verify_equivalence: false,
-                    release_name: "imported".into(),
-                    namespace: None,
-                    values_files: Vec::new(),
-                    set_values: Vec::new(),
-                    set_string_values: Vec::new(),
-                    set_file_values: Vec::new(),
-                    set_json_values: Vec::new(),
-                    kube_version: None,
-                    api_versions: Vec::new(),
-                    include_crds: false,
-                    write_rendered_output: None,
-                };
-                let values = crate::composeimport::build_values(&import_args, &report);
-                let values_yaml = crate::output::values_yaml(&values)?;
-                return crate::inspectweb::serve_compose(
-                    &args.addr,
-                    args.open_browser,
-                    source_yaml,
-                    report_yaml,
-                    values_yaml,
-                )
-                .map_err(Error::Convert);
-            }
-            crate::composeinspect::resolve_and_write(
-                &args.path,
-                &args.format,
-                args.output.as_deref(),
+        return Ok(Some(()));
+    }
+    Ok(None)
+}
+
+fn run_batch_command(args: &crate::cli::BatchArgs) -> Result<(), Error> {
+    let report = crate::batch::run_batch_convert(args, |import_args| {
+        run_chart_command(import_args).map_err(|e| e.to_string())
+    })
+    .map_err(Error::Convert)?;
+    eprintln!(
+        "batch convert: total={}, succeeded={}, failed={}",
+        report.total, report.succeeded, report.failed
+    );
+    Ok(())
+}
+
+fn reject_verify_equivalence_for_non_chart(args: &crate::cli::ImportArgs) -> Result<(), Error> {
+    if args.verify_equivalence {
+        return Err(Error::Convert(
+            "--verify-equivalence is supported only for chart source".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_values_and_optional_chart(
+    args: &crate::cli::ImportArgs,
+    values: &serde_yaml::Value,
+) -> Result<(), Error> {
+    if let Some(out) = args.out_chart_dir.as_deref() {
+        crate::output::generate_consumer_chart(
+            out,
+            args.chart_name.as_deref(),
+            values,
+            args.library_chart_path.as_deref(),
+            false,
+        )?;
+    }
+    if args.out_chart_dir.is_none() || args.output.is_some() {
+        crate::output::write_values(args.output.as_deref(), values)?;
+    }
+    Ok(())
+}
+
+fn run_manifests_command(args: &crate::cli::ImportArgs) -> Result<(), Error> {
+    reject_verify_equivalence_for_non_chart(args)?;
+    let docs = crate::source::load_documents_for_manifests(&args.path)?;
+    let values = crate::convert::build_values(args, &docs).map_err(Error::Convert)?;
+    write_values_and_optional_chart(args, &values)
+}
+
+fn run_compose_command(args: &crate::cli::ImportArgs) -> Result<(), Error> {
+    reject_verify_equivalence_for_non_chart(args)?;
+    let report = crate::composeinspect::load(&args.path)?;
+    let values = crate::composeimport::build_values(args, &report);
+    write_values_and_optional_chart(args, &values)
+}
+
+fn run_validate_command(args: &crate::cli::ValidateArgs) -> Result<(), Error> {
+    crate::source::validate_values_file(&args.values)?;
+    println!("OK");
+    Ok(())
+}
+
+fn resolve_completion_shell(args: &crate::cli::CompletionArgs) -> Result<Shell, Error> {
+    let shell_name = args
+        .shell_flag
+        .as_deref()
+        .or(args.shell.as_deref())
+        .ok_or_else(|| {
+            Error::Convert(
+                "missing shell, expected one of: bash,zsh,fish,powershell,elvish".to_string(),
             )
-            .map_err(Error::ComposeInspect)
-        }
-        Command::Dyff(args) => {
-            let from = crate::source::read_input(&args.from)?;
-            let to = crate::source::read_input(&args.to)?;
-            let diff = crate::dyfflike::between_yaml(
-                &from,
-                &to,
-                crate::dyfflike::DiffOptions {
-                    ignore_order_changes: args.ignore_order,
-                    ignore_whitespace_change: args.ignore_whitespace,
-                },
-            )
-            .map_err(crate::source::Error::Yaml)?;
-            let entries = parse_diff_entries(&diff);
-            let has_diff = !entries.is_empty();
-            let rendered = format_dyff_output(&args, &entries, std::io::stdout().is_terminal())?;
-            if let Some(out) = args.output.as_deref() {
-                fs::write(out, rendered.as_bytes()).map_err(crate::output::Error::Io)?;
-            }
-            if !args.quiet {
-                if has_diff {
-                    println!("{rendered}");
-                } else {
-                    if args.format.eq_ignore_ascii_case("json") {
-                        println!("{rendered}");
-                    } else {
-                        println!("No differences.");
-                    }
-                }
-            }
-            if args.fail_on_diff && has_diff {
-                return Err(Error::DyffDifferent);
-            }
-            Ok(())
-        }
-        Command::Inspect(args) => {
-            let import_args = crate::cli::ImportArgs {
-                path: args.path.clone(),
-                env: "dev".into(),
-                group_name: "apps-k8s-manifests".into(),
-                group_type: "apps-k8s-manifests".into(),
-                min_include_bytes: 24,
-                include_status: false,
-                output: None,
-                out_chart_dir: None,
-                chart_name: None,
-                library_chart_path: None,
-                import_strategy: "helpers".into(),
-                allow_template_includes: Vec::new(),
-                unsupported_template_mode: "error".into(),
-                verify_equivalence: false,
-                release_name: args.release_name.clone(),
-                namespace: args.namespace.clone(),
-                values_files: args.values_files.clone(),
-                set_values: args.set_values.clone(),
-                set_string_values: args.set_string_values.clone(),
-                set_file_values: args.set_file_values.clone(),
-                set_json_values: args.set_json_values.clone(),
-                kube_version: args.kube_version.clone(),
-                api_versions: args.api_versions.clone(),
-                include_crds: args.include_crds,
-                write_rendered_output: None,
-            };
-            let rendered = crate::source::render_chart(&import_args, &args.path)?;
-            let docs = crate::source::parse_documents(&rendered)?;
-            let values =
-                crate::convert::build_values(&import_args, &docs).map_err(Error::Convert)?;
-            let values_yaml = crate::output::values_yaml(&values)?;
-            if args.web {
-                return crate::inspectweb::serve(
-                    &args.addr,
-                    cli.web_open_browser,
-                    rendered,
-                    values_yaml,
-                )
-                .map_err(Error::Convert);
-            }
-            println!("{values_yaml}");
-            Ok(())
+        })?;
+    match shell_name {
+        "bash" => Ok(Shell::Bash),
+        "zsh" => Ok(Shell::Zsh),
+        "fish" => Ok(Shell::Fish),
+        "powershell" => Ok(Shell::PowerShell),
+        "elvish" => Ok(Shell::Elvish),
+        _ => Err(Error::Convert(format!(
+            "unsupported shell '{}', expected one of: bash,zsh,fish,powershell,elvish",
+            shell_name
+        ))),
+    }
+}
+
+fn write_completion_output(output_path: Option<&str>, output: &[u8]) -> Result<(), Error> {
+    if let Some(path) = output_path {
+        fs::write(path, output)
+            .map_err(|e| Error::Convert(format!("write completion to {path}: {e}")))?;
+    } else {
+        io::stdout()
+            .write_all(output)
+            .map_err(|e| Error::Convert(format!("write completion to stdout: {e}")))?;
+    }
+    Ok(())
+}
+
+fn run_completion_command(args: &crate::cli::CompletionArgs) -> Result<(), Error> {
+    let shell = resolve_completion_shell(args)?;
+    let mut cmd = Cli::command();
+    let bin_name = cmd.get_name().to_string();
+    let mut output = Vec::<u8>::new();
+    generate(shell, &mut cmd, bin_name, &mut output);
+    write_completion_output(args.output.as_deref(), &output)
+}
+
+fn run_query_command(
+    args: &crate::cli::QueryArgs,
+    tool: &str,
+    parse_input_docs: fn(&str) -> Result<Vec<serde_json::Value>, crate::query::Error>,
+) -> Result<(), Error> {
+    let input = crate::source::read_input(&args.input)?;
+    let mode = parse_doc_selection(args)?;
+    let docs = parse_input_docs(&input)
+        .map_err(|e| Error::Convert(format_query_error(tool, &args.query, &input, &e)))?;
+    let stream = select_docs(docs, mode, tool)?;
+    let out = crate::query::run_query_stream(&args.query, stream)
+        .map_err(|e| Error::Convert(format_query_error(tool, &args.query, &input, &e)))?;
+    print_query_output(&out, args.compact, args.raw_output)?;
+    Ok(())
+}
+
+fn run_jq_command(args: &crate::cli::QueryArgs) -> Result<(), Error> {
+    run_query_command(args, "jq", crate::query::parse_input_docs_prefer_json)
+}
+
+fn run_yq_command(args: &crate::cli::QueryArgs) -> Result<(), Error> {
+    run_query_command(args, "yq", crate::query::parse_input_docs_prefer_yaml)
+}
+
+fn run_compose_inspect_command(args: &crate::cli::ComposeInspectArgs) -> Result<(), Error> {
+    if args.web {
+        let report = crate::composeinspect::load(&args.path).map_err(Error::ComposeInspect)?;
+        let source_yaml =
+            std::fs::read_to_string(&report.source_path).map_err(crate::source::Error::Io)?;
+        let report_yaml = serde_yaml::to_string(&report).map_err(crate::source::Error::Yaml)?;
+        let import_args = crate::cli::ImportArgs {
+            path: args.path.clone(),
+            env: "dev".into(),
+            group_name: "apps-k8s-manifests".into(),
+            group_type: "apps-k8s-manifests".into(),
+            min_include_bytes: 24,
+            include_status: false,
+            output: None,
+            out_chart_dir: None,
+            chart_name: None,
+            library_chart_path: None,
+            import_strategy: "raw".into(),
+            allow_template_includes: Vec::new(),
+            unsupported_template_mode: "error".into(),
+            verify_equivalence: false,
+            release_name: "imported".into(),
+            namespace: None,
+            values_files: Vec::new(),
+            set_values: Vec::new(),
+            set_string_values: Vec::new(),
+            set_file_values: Vec::new(),
+            set_json_values: Vec::new(),
+            kube_version: None,
+            api_versions: Vec::new(),
+            include_crds: false,
+            write_rendered_output: None,
+        };
+        let values = crate::composeimport::build_values(&import_args, &report);
+        let values_yaml = crate::output::values_yaml(&values)?;
+        crate::inspectweb::serve_compose(
+            &args.addr,
+            args.open_browser,
+            source_yaml,
+            report_yaml,
+            values_yaml,
+        )
+        .map_err(Error::Convert)?;
+        return Ok(());
+    }
+    crate::composeinspect::resolve_and_write(&args.path, &args.format, args.output.as_deref())
+        .map_err(Error::ComposeInspect)
+}
+
+fn run_dyff_command(args: &crate::cli::DyffArgs) -> Result<(), Error> {
+    let from = crate::source::read_input(&args.from)?;
+    let to = crate::source::read_input(&args.to)?;
+    let diff = crate::dyfflike::between_yaml(
+        &from,
+        &to,
+        crate::dyfflike::DiffOptions {
+            ignore_order_changes: args.ignore_order,
+            ignore_whitespace_change: args.ignore_whitespace,
+        },
+    )
+    .map_err(crate::source::Error::Yaml)?;
+    let entries = parse_diff_entries(&diff);
+    let has_diff = !entries.is_empty();
+    let rendered = format_dyff_output(args, &entries, std::io::stdout().is_terminal())?;
+
+    if let Some(out) = args.output.as_deref() {
+        fs::write(out, rendered.as_bytes()).map_err(crate::output::Error::Io)?;
+    }
+    if !args.quiet {
+        if has_diff || args.format.eq_ignore_ascii_case("json") {
+            println!("{rendered}");
+        } else {
+            println!("No differences.");
         }
     }
+    if args.fail_on_diff && has_diff {
+        return Err(Error::DyffDifferent);
+    }
+    Ok(())
+}
+
+fn build_inspect_import_args(args: &crate::cli::InspectArgs) -> crate::cli::ImportArgs {
+    crate::cli::ImportArgs {
+        path: args.path.clone(),
+        env: "dev".into(),
+        group_name: "apps-k8s-manifests".into(),
+        group_type: "apps-k8s-manifests".into(),
+        min_include_bytes: 24,
+        include_status: false,
+        output: None,
+        out_chart_dir: None,
+        chart_name: None,
+        library_chart_path: None,
+        import_strategy: "helpers".into(),
+        allow_template_includes: Vec::new(),
+        unsupported_template_mode: "error".into(),
+        verify_equivalence: false,
+        release_name: args.release_name.clone(),
+        namespace: args.namespace.clone(),
+        values_files: args.values_files.clone(),
+        set_values: args.set_values.clone(),
+        set_string_values: args.set_string_values.clone(),
+        set_file_values: args.set_file_values.clone(),
+        set_json_values: args.set_json_values.clone(),
+        kube_version: args.kube_version.clone(),
+        api_versions: args.api_versions.clone(),
+        include_crds: args.include_crds,
+        write_rendered_output: None,
+    }
+}
+
+fn run_inspect_command(
+    web_open_browser: bool,
+    args: &crate::cli::InspectArgs,
+) -> Result<(), Error> {
+    let import_args = build_inspect_import_args(args);
+    let rendered = crate::source::render_chart(&import_args, &args.path)?;
+    let docs = crate::source::parse_documents(&rendered)?;
+    let values = crate::convert::build_values(&import_args, &docs).map_err(Error::Convert)?;
+    let values_yaml = crate::output::values_yaml(&values)?;
+    if args.web {
+        crate::inspectweb::serve(&args.addr, web_open_browser, rendered, values_yaml)
+            .map_err(Error::Convert)?;
+        return Ok(());
+    }
+    println!("{values_yaml}");
+    Ok(())
 }
 
 fn run_chart_command(args: &crate::cli::ImportArgs) -> Result<(), Error> {
@@ -1123,6 +1149,63 @@ mod tests {
         assert!(
             matches!(result, Error::Convert(ref msg) if msg.contains("--verify-equivalence is supported only for chart source")),
             "unexpected error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn studio_with_subcommand_is_rejected() {
+        let cli = Cli {
+            web: false,
+            studio: true,
+            web_stdin: false,
+            web_addr: "127.0.0.1:8088".to_string(),
+            web_open_browser: true,
+            command: Some(Command::Validate(ValidateArgs {
+                values: "/tmp/values.yaml".to_string(),
+            })),
+        };
+        let err = run_with(cli).expect_err("must fail");
+        assert!(
+            matches!(err, Error::Convert(ref msg) if msg.contains("--studio cannot be combined with subcommands")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn no_command_without_modes_is_rejected() {
+        let cli = Cli {
+            web: false,
+            studio: false,
+            web_stdin: false,
+            web_addr: "127.0.0.1:8088".to_string(),
+            web_open_browser: true,
+            command: None,
+        };
+        let err = run_with(cli).expect_err("must fail");
+        assert!(
+            matches!(err, Error::Convert(ref msg) if msg.contains("no command provided")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn completion_command_without_shell_is_rejected() {
+        let cli = Cli {
+            web: false,
+            studio: false,
+            web_stdin: false,
+            web_addr: "127.0.0.1:8088".to_string(),
+            web_open_browser: true,
+            command: Some(Command::Completion(CompletionArgs {
+                shell: None,
+                shell_flag: None,
+                output: None,
+            })),
+        };
+        let err = run_with(cli).expect_err("must fail");
+        assert!(
+            matches!(err, Error::Convert(ref msg) if msg.contains("missing shell")),
+            "unexpected error: {err:?}"
         );
     }
 

@@ -273,6 +273,60 @@ struct ExtraObjectTemplate {
     value: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtraObjectIdentity {
+    kind: String,
+    name: Option<String>,
+}
+
+fn extra_object_identity(doc: &Value) -> Option<ExtraObjectIdentity> {
+    let kind = doc
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if kind.is_empty() {
+        return None;
+    }
+    let name = doc
+        .get("metadata")
+        .and_then(Value::as_mapping)
+        .and_then(|m| m.get(Value::String("name".to_string())))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    Some(ExtraObjectIdentity { kind, name })
+}
+
+fn find_matching_template_index(
+    templates: &[ExtraObjectTemplate],
+    used: &[bool],
+    identity: &ExtraObjectIdentity,
+) -> Option<usize> {
+    let exact = templates.iter().enumerate().find_map(|(idx, template)| {
+        if used[idx] || template.kind != identity.kind {
+            return None;
+        }
+        if let (Some(template_name), Some(doc_name)) =
+            (template.name.as_ref(), identity.name.as_ref())
+        {
+            if template_name == doc_name {
+                return Some(idx);
+            }
+        }
+        None
+    });
+    if exact.is_some() {
+        return exact;
+    }
+
+    templates.iter().enumerate().find_map(|(idx, template)| {
+        if used[idx] || template.kind != identity.kind || !template.has_templated_name {
+            return None;
+        }
+        Some(idx)
+    })
+}
+
 fn rehydrate_templated_extra_objects(args: &ImportArgs, docs: &mut [Value]) -> Result<(), Error> {
     let templates = load_templated_extra_objects_from_values_files(&args.values_files);
     if templates.is_empty() || docs.is_empty() {
@@ -291,39 +345,10 @@ fn rehydrate_templated_extra_objects(args: &ImportArgs, docs: &mut [Value]) -> R
 
     let mut used = vec![false; templates.len()];
     for doc in docs {
-        let kind = doc
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if kind.is_empty() {
+        let Some(identity) = extra_object_identity(doc) else {
             continue;
-        }
-        let name = doc
-            .get("metadata")
-            .and_then(Value::as_mapping)
-            .and_then(|m| m.get(Value::String("name".to_string())))
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-
-        let exact_idx = templates.iter().enumerate().find_map(|(i, t)| {
-            if used[i] || t.kind != kind {
-                return None;
-            }
-            if let (Some(tn), Some(dn)) = (t.name.as_ref(), name.as_ref()) {
-                if tn == dn {
-                    return Some(i);
-                }
-            }
-            None
-        });
-        let fallback_idx = templates.iter().enumerate().find_map(|(i, t)| {
-            if used[i] || t.kind != kind || !t.has_templated_name {
-                return None;
-            }
-            Some(i)
-        });
-        let Some(idx) = exact_idx.or(fallback_idx) else {
+        };
+        let Some(idx) = find_matching_template_index(&templates, &used, &identity) else {
             continue;
         };
         let mut path = Vec::new();
@@ -850,6 +875,102 @@ spec:
             normalized,
             "{{ \"{{\" }} include \"opensearch-cluster.cluster-name\" . {{ \"}}\" }}__happ_sep__{{ .Release.Name }}"
         );
+    }
+
+    #[test]
+    fn rehydrate_prefers_exact_name_match_over_templated_name_fallback() {
+        let td = TempDir::new().expect("tmp");
+        let values_path = td.path().join("values-extra.yaml");
+        fs::write(
+            &values_path,
+            r#"
+extraObjects:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: '{{ include "x.cmName" . }}'
+    data:
+      mode: '{{ .Values.global.fromFallback }}'
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: cm-prod
+    data:
+      mode: '{{ .Values.global.fromExact }}'
+"#,
+        )
+        .expect("write values");
+
+        let mut args = minimal_import_args();
+        args.values_files = vec![values_path.to_string_lossy().to_string()];
+        args.unsupported_template_mode = "escape".to_string();
+
+        let mut docs = vec![serde_yaml::from_str::<Value>(
+            r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-prod
+data:
+  mode: rendered
+"#,
+        )
+        .expect("doc")];
+
+        rehydrate_templated_extra_objects(&args, &mut docs).expect("rehydrate");
+
+        let mode = docs[0]
+            .get("data")
+            .and_then(Value::as_mapping)
+            .and_then(|m| m.get(Value::String("mode".to_string())))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(mode, "{{ $.Values.global.fromExact }}");
+    }
+
+    #[test]
+    fn rehydrate_uses_templated_name_fallback_when_exact_name_absent() {
+        let td = TempDir::new().expect("tmp");
+        let values_path = td.path().join("values-extra.yaml");
+        fs::write(
+            &values_path,
+            r#"
+extraObjects:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: '{{ include "x.cmName" . }}'
+    data:
+      mode: '{{ .Values.global.fromFallback }}'
+"#,
+        )
+        .expect("write values");
+
+        let mut args = minimal_import_args();
+        args.values_files = vec![values_path.to_string_lossy().to_string()];
+        args.unsupported_template_mode = "escape".to_string();
+
+        let mut docs = vec![serde_yaml::from_str::<Value>(
+            r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-stage
+data:
+  mode: rendered
+"#,
+        )
+        .expect("doc")];
+
+        rehydrate_templated_extra_objects(&args, &mut docs).expect("rehydrate");
+
+        let mode = docs[0]
+            .get("data")
+            .and_then(Value::as_mapping)
+            .and_then(|m| m.get(Value::String("mode".to_string())))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(mode, "{{ $.Values.global.fromFallback }}");
     }
 
     #[test]

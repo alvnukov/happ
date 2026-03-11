@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 use serde_yaml::{Mapping as YamlMapping, Number as YamlNumber, Value as YamlValue};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -583,8 +583,9 @@ fn optimize_values_includes_request(
         return Err("values document must be a YAML map".to_string());
     }
     let min_profile_bytes = params.min_profile_bytes.unwrap_or(24).max(1);
-    let (optimized, report) =
+    let (mut optimized, report) =
         crate::output::optimize_values_with_include_profiles(&values, min_profile_bytes);
+    normalize_include_fields_yaml(&mut optimized);
     let optimized_text = crate::output::values_yaml(&optimized)
         .map_err(|err| format!("serialize optimized values: {err}"))?;
     Ok(OptimizeValuesIncludesResult {
@@ -847,11 +848,18 @@ fn build_manifest_preview_values(
     app: &str,
     entity: &JsonValue,
     global: &JsonValue,
-    apply_includes: bool,
+    _apply_includes: bool,
     env: &str,
 ) -> JsonValue {
-    let source_global = as_obj(global).cloned().unwrap_or_default();
-    let mut required_keys: HashSet<String> = HashSet::from([
+    let required_keys = required_preview_global_keys(entity);
+    let global_map = build_preview_global_map(global, env, &required_keys);
+    let mut out = build_preview_values_tree(group, app, entity, global_map);
+    normalize_include_fields_for_render(&mut out);
+    out
+}
+
+fn required_preview_global_keys(entity: &JsonValue) -> BTreeSet<String> {
+    let mut required_keys = BTreeSet::from([
         "env".to_string(),
         "validation".to_string(),
         "labels".to_string(),
@@ -859,29 +867,41 @@ fn build_manifest_preview_values(
         "releases".to_string(),
     ]);
     collect_global_keys_referenced(entity, &mut required_keys);
+    required_keys
+}
 
-    let _ = apply_includes; // preserved for API compatibility
-
+fn build_preview_global_map(
+    global: &JsonValue,
+    env: &str,
+    required_keys: &BTreeSet<String>,
+) -> JsonMap<String, JsonValue> {
+    let source_global = as_obj(global).cloned().unwrap_or_default();
     let mut global_map = JsonMap::new();
     for key in required_keys {
-        if let Some(value) = source_global.get(&key) {
-            global_map.insert(key, value.clone());
+        if let Some(value) = source_global.get(key) {
+            global_map.insert(key.clone(), value.clone());
         }
     }
     // Manifest preview receives already-resolved entity; keep include storage minimal
     // to avoid unrelated include payload validation side-effects.
     global_map.insert("_includes".to_string(), JsonValue::Object(JsonMap::new()));
     global_map.insert("env".to_string(), JsonValue::String(env.to_string()));
+    global_map
+}
 
+fn build_preview_values_tree(
+    group: &str,
+    app: &str,
+    entity: &JsonValue,
+    global_map: JsonMap<String, JsonValue>,
+) -> JsonValue {
     let mut app_map = JsonMap::new();
     app_map.insert(app.to_string(), entity.clone());
 
     let mut values_map = JsonMap::new();
     values_map.insert("global".to_string(), JsonValue::Object(global_map));
     values_map.insert(group.to_string(), JsonValue::Object(app_map));
-    let mut out = JsonValue::Object(values_map);
-    normalize_include_fields_for_render(&mut out);
-    out
+    JsonValue::Object(values_map)
 }
 
 fn normalize_include_fields_for_render(value: &mut JsonValue) {
@@ -893,15 +913,10 @@ fn normalize_include_fields_for_render(value: &mut JsonValue) {
         }
         JsonValue::Object(map) => {
             for (key, nested) in map.iter_mut() {
-                if matches!(key.as_str(), "_include" | "_include_files")
-                    && matches!(nested, JsonValue::String(_))
+                if include_key_requires_list(key.as_str()) && matches!(nested, JsonValue::String(_))
                 {
-                    let raw = nested.as_str().unwrap_or_default().trim();
-                    if !raw.is_empty() {
-                        *nested = JsonValue::Array(vec![JsonValue::String(raw.to_string())]);
-                    } else {
-                        *nested = JsonValue::Array(Vec::new());
-                    }
+                    let values = normalized_include_entries(nested.as_str().unwrap_or_default());
+                    *nested = JsonValue::Array(values.into_iter().map(JsonValue::String).collect());
                 }
                 normalize_include_fields_for_render(nested);
             }
@@ -910,7 +925,43 @@ fn normalize_include_fields_for_render(value: &mut JsonValue) {
     }
 }
 
-fn collect_global_keys_referenced(value: &JsonValue, out: &mut HashSet<String>) {
+fn normalize_include_fields_yaml(value: &mut YamlValue) {
+    match value {
+        YamlValue::Sequence(items) => {
+            for item in items {
+                normalize_include_fields_yaml(item);
+            }
+        }
+        YamlValue::Mapping(map) => {
+            for (key, nested) in map.iter_mut() {
+                if key.as_str().is_some_and(include_key_requires_list)
+                    && matches!(nested, YamlValue::String(_))
+                {
+                    let values = normalized_include_entries(nested.as_str().unwrap_or_default());
+                    *nested =
+                        YamlValue::Sequence(values.into_iter().map(YamlValue::String).collect());
+                }
+                normalize_include_fields_yaml(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn include_key_requires_list(key: &str) -> bool {
+    matches!(key, "_include" | "_include_files")
+}
+
+fn normalized_include_entries(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        vec![trimmed.to_string()]
+    }
+}
+
+fn collect_global_keys_referenced(value: &JsonValue, out: &mut BTreeSet<String>) {
     match value {
         JsonValue::Array(items) => {
             for item in items {
@@ -927,7 +978,7 @@ fn collect_global_keys_referenced(value: &JsonValue, out: &mut HashSet<String>) 
     }
 }
 
-fn collect_global_keys_from_template_string(text: &str, out: &mut HashSet<String>) {
+fn collect_global_keys_from_template_string(text: &str, out: &mut BTreeSet<String>) {
     static GLOBAL_KEY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = GLOBAL_KEY_RE.get_or_init(|| {
         regex::Regex::new(r"(?:\$?\s*\.)?Values\.global\.([A-Za-z0-9_-]+)").expect("regex")
@@ -4037,25 +4088,25 @@ apps-stateless:
             serde_yaml::from_str(&out.optimized_text).expect("parse optimized yaml");
         let root = parsed.as_mapping().expect("root mapping");
         let global = root
-            .get(&serde_yaml::Value::String("global".into()))
+            .get(serde_yaml::Value::String("global".into()))
             .and_then(serde_yaml::Value::as_mapping)
             .expect("global mapping");
         let includes = global
-            .get(&serde_yaml::Value::String("_includes".into()))
+            .get(serde_yaml::Value::String("_includes".into()))
             .and_then(serde_yaml::Value::as_mapping)
             .expect("_includes mapping");
         assert!(!includes.is_empty());
 
         let apps_stateless = root
-            .get(&serde_yaml::Value::String("apps-stateless".into()))
+            .get(serde_yaml::Value::String("apps-stateless".into()))
             .and_then(serde_yaml::Value::as_mapping)
             .expect("apps-stateless mapping");
         let api = apps_stateless
-            .get(&serde_yaml::Value::String("api".into()))
+            .get(serde_yaml::Value::String("api".into()))
             .and_then(serde_yaml::Value::as_mapping)
             .expect("api mapping");
         let include_refs = api
-            .get(&serde_yaml::Value::String("_include".into()))
+            .get(serde_yaml::Value::String("_include".into()))
             .and_then(serde_yaml::Value::as_sequence)
             .expect("_include refs");
         assert!(!include_refs.is_empty());
@@ -4154,6 +4205,160 @@ apps-stateless:
             .and_then(as_obj)
             .is_some_and(|global_map| global_map.contains_key("_include_files"));
         assert!(!has_global_include_files);
+    }
+
+    #[test]
+    fn manifest_preview_values_normalize_include_strings_including_empty_values() {
+        let entity = json!({
+            "containers": {
+                "main": {
+                    "_include": "   ",
+                    "_include_files": " configs/a.yaml "
+                }
+            }
+        });
+        let global = json!({
+            "validation": {
+                "allowNativeListsInBuiltInListFields": true
+            }
+        });
+        let values = build_manifest_preview_values(
+            "apps-stateless",
+            "app-1",
+            &entity,
+            &global,
+            true,
+            "prod",
+        );
+        let main = values
+            .get("apps-stateless")
+            .and_then(as_obj)
+            .and_then(|group| group.get("app-1"))
+            .and_then(as_obj)
+            .and_then(|app| app.get("containers"))
+            .and_then(as_obj)
+            .and_then(|containers| containers.get("main"))
+            .and_then(as_obj)
+            .expect("main app");
+        let include_refs = main
+            .get("_include")
+            .and_then(JsonValue::as_array)
+            .expect("_include array");
+        assert!(include_refs.is_empty());
+        let include_files = main
+            .get("_include_files")
+            .and_then(JsonValue::as_array)
+            .expect("_include_files array");
+        assert_eq!(include_files.len(), 1);
+        assert_eq!(
+            include_files.first().and_then(JsonValue::as_str),
+            Some("configs/a.yaml")
+        );
+    }
+
+    #[test]
+    fn optimize_values_includes_request_normalizes_scalar_include_fields_to_arrays() {
+        let src = r#"
+global:
+  _includes: {}
+apps-stateless:
+  api:
+    _include: base
+    _include_files: "   "
+"#;
+        let out = optimize_values_includes_request(
+            &ServerState::default(),
+            OptimizeValuesIncludesParams {
+                uri: None,
+                text: Some(src.to_string()),
+                min_profile_bytes: Some(65_536),
+            },
+        )
+        .expect("optimize values");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&out.optimized_text).expect("parse optimized yaml");
+        let root = parsed.as_mapping().expect("root mapping");
+        let api = root
+            .get(serde_yaml::Value::String("apps-stateless".into()))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|apps| apps.get(serde_yaml::Value::String("api".into())))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("api mapping");
+        let include_refs = api
+            .get(serde_yaml::Value::String("_include".into()))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("_include array");
+        assert_eq!(include_refs.len(), 1);
+        assert_eq!(
+            include_refs.first().and_then(serde_yaml::Value::as_str),
+            Some("base")
+        );
+        let include_files = api
+            .get(serde_yaml::Value::String("_include_files".into()))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("_include_files array");
+        assert!(include_files.is_empty());
+    }
+
+    #[test]
+    fn manifest_preview_values_force_requested_env() {
+        let entity = json!({});
+        let global = json!({
+            "env": "dev",
+            "validation": {
+                "allowNativeListsInBuiltInListFields": true
+            }
+        });
+        let values = build_manifest_preview_values(
+            "apps-stateless",
+            "app-1",
+            &entity,
+            &global,
+            true,
+            "prod",
+        );
+        let env_value = values
+            .get("global")
+            .and_then(as_obj)
+            .and_then(|g| g.get("env"))
+            .and_then(JsonValue::as_str);
+        assert_eq!(env_value, Some("prod"));
+    }
+
+    #[test]
+    fn manifest_preview_values_keep_referenced_global_keys() {
+        let entity = json!({
+            "data": {
+                "token": "{{ .Values.global.authToken }}",
+                "region": "{{ $.Values.global.region }}"
+            }
+        });
+        let global = json!({
+            "authToken": "secret",
+            "region": "eu-west-1",
+            "unused": "x",
+            "validation": {
+                "allowNativeListsInBuiltInListFields": true
+            }
+        });
+        let values = build_manifest_preview_values(
+            "apps-stateless",
+            "app-1",
+            &entity,
+            &global,
+            true,
+            "prod",
+        );
+        let global_map = values.get("global").and_then(as_obj).expect("global map");
+        assert_eq!(
+            global_map.get("authToken").and_then(JsonValue::as_str),
+            Some("secret")
+        );
+        assert_eq!(
+            global_map.get("region").and_then(JsonValue::as_str),
+            Some("eu-west-1")
+        );
+        assert!(!global_map.contains_key("unused"));
     }
 
     #[test]
