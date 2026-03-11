@@ -122,6 +122,22 @@ struct TemplateAssistResult {
     completions: Vec<TemplateAssistCompletion>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OptimizeValuesIncludesParams {
+    uri: Option<String>,
+    text: Option<String>,
+    min_profile_bytes: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OptimizeValuesIncludesResult {
+    optimized_text: String,
+    profiles_added: usize,
+    changed: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TemplateAssistCompletion {
@@ -210,7 +226,8 @@ pub fn run(args: crate::cli::LspArgs) -> Result<(), Error> {
                 "happ/resolveEntity",
                 "happ/renderEntityManifest",
                 "happ/getPreviewTheme",
-                "happ/templateAssist"
+                "happ/templateAssist",
+                "happ/optimizeValuesIncludes"
             ]
         }
     });
@@ -355,6 +372,27 @@ fn handle_request(
                 }
             };
             match template_assist_request(state, params) {
+                Ok(result) => {
+                    let value = serde_json::to_value(result).unwrap_or(JsonValue::Null);
+                    send_ok(connection, req.id.clone(), value)
+                }
+                Err(err) => send_error(connection, req.id.clone(), -32001, err),
+            }
+        }
+        "happ/optimizeValuesIncludes" => {
+            let params: OptimizeValuesIncludesParams =
+                match serde_json::from_value(req.params.clone()) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return send_error(
+                            connection,
+                            req.id.clone(),
+                            -32602,
+                            format!("invalid params for happ/optimizeValuesIncludes: {err}"),
+                        );
+                    }
+                };
+            match optimize_values_includes_request(state, params) {
                 Ok(result) => {
                     let value = serde_json::to_value(result).unwrap_or(JsonValue::Null);
                     send_ok(connection, req.id.clone(), value)
@@ -531,6 +569,28 @@ fn render_entity_manifest_request(
         default_env: context.default_env,
         used_env: context.used_env,
         env_discovery: context.env_discovery,
+    })
+}
+
+fn optimize_values_includes_request(
+    state: &ServerState,
+    params: OptimizeValuesIncludesParams,
+) -> Result<OptimizeValuesIncludesResult, String> {
+    let text = resolve_request_text(state, params.uri.as_deref(), params.text)?;
+    let values: serde_yaml::Value =
+        serde_yaml::from_str(&text).map_err(|err| format!("parse values yaml: {err}"))?;
+    if !values.is_mapping() {
+        return Err("values document must be a YAML map".to_string());
+    }
+    let min_profile_bytes = params.min_profile_bytes.unwrap_or(24).max(1);
+    let (optimized, report) =
+        crate::output::optimize_values_with_include_profiles(&values, min_profile_bytes);
+    let optimized_text = crate::output::values_yaml(&optimized)
+        .map_err(|err| format!("serialize optimized values: {err}"))?;
+    Ok(OptimizeValuesIncludesResult {
+        optimized_text,
+        profiles_added: report.profiles_added,
+        changed: optimized != values,
     })
 }
 
@@ -3941,6 +4001,78 @@ apps-stateless:
             .and_then(as_obj)
             .expect("resources");
         assert_eq!(resources.get("cpu").and_then(|v| v.as_str()), Some("200m"));
+    }
+
+    #[test]
+    fn optimize_values_includes_request_extracts_common_payload() {
+        let src = r#"
+global:
+  _includes: {}
+apps-stateless:
+  api:
+    enabled: true
+    image:
+      name: nginx
+      staticTag: latest
+  web:
+    enabled: true
+    image:
+      name: nginx
+      staticTag: latest
+"#;
+        let out = optimize_values_includes_request(
+            &ServerState::default(),
+            OptimizeValuesIncludesParams {
+                uri: None,
+                text: Some(src.to_string()),
+                min_profile_bytes: Some(1),
+            },
+        )
+        .expect("optimize values");
+
+        assert!(out.changed);
+        assert!(out.profiles_added >= 1);
+
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&out.optimized_text).expect("parse optimized yaml");
+        let root = parsed.as_mapping().expect("root mapping");
+        let global = root
+            .get(&serde_yaml::Value::String("global".into()))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("global mapping");
+        let includes = global
+            .get(&serde_yaml::Value::String("_includes".into()))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("_includes mapping");
+        assert!(!includes.is_empty());
+
+        let apps_stateless = root
+            .get(&serde_yaml::Value::String("apps-stateless".into()))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("apps-stateless mapping");
+        let api = apps_stateless
+            .get(&serde_yaml::Value::String("api".into()))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("api mapping");
+        let include_refs = api
+            .get(&serde_yaml::Value::String("_include".into()))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("_include refs");
+        assert!(!include_refs.is_empty());
+    }
+
+    #[test]
+    fn optimize_values_includes_request_rejects_non_mapping_document() {
+        let err = optimize_values_includes_request(
+            &ServerState::default(),
+            OptimizeValuesIncludesParams {
+                uri: None,
+                text: Some("- one\n- two\n".to_string()),
+                min_profile_bytes: Some(24),
+            },
+        )
+        .expect_err("non-map must fail");
+        assert!(err.contains("values document must be a YAML map"));
     }
 
     #[test]
