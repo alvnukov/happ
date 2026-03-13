@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   analyze-interpreted:
+    if: ${{ github.event_name != 'pull_request' || github.actor != 'dependabot[bot]' }}
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +41,7 @@ jobs:
           category: "/language:${{ matrix.language }}"
 
   analyze-rust:
+    if: ${{ github.event_name != 'pull_request' || github.actor != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -73,6 +75,7 @@ jobs:
           category: "/language:rust"
 
   analyze-go:
+    if: ${{ github.event_name != 'pull_request' || github.actor != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

@@ -2,20 +2,36 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: "/"
+    open-pull-requests-limit: 2
     schedule:
-      interval: daily
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Europe/Moscow
 
   - package-ecosystem: gomod
     directory: "/src/go_compat/helm_ir_ffi_helper"
+    open-pull-requests-limit: 2
     schedule:
-      interval: daily
+      interval: weekly
+      day: tuesday
+      time: "04:00"
+      timezone: Europe/Moscow
 
   - package-ecosystem: npm
     directory: "/web"
+    open-pull-requests-limit: 2
     schedule:
-      interval: daily
+      interval: weekly
+      day: wednesday
+      time: "04:00"
+      timezone: Europe/Moscow
 
   - package-ecosystem: github-actions
     directory: "/"
+    open-pull-requests-limit: 2
     schedule:
-      interval: daily
+      interval: weekly
+      day: thursday
+      time: "04:00"
+      timezone: Europe/Moscow
