@@ -396,11 +396,10 @@ fn run_chart_command(args: &crate::cli::ImportArgs) -> Result<(), Error> {
             verify_chart_dir = Some(generated_chart_dir_text);
             verify_temp_dir = Some(tmp);
         }
-        let summary = verify_chart_equivalence(
-            args,
-            &docs,
-            verify_chart_dir.as_deref().expect("verify chart dir"),
-        )?;
+        let verify_chart_dir = verify_chart_dir.as_deref().ok_or_else(|| {
+            Error::Convert("internal error: verify chart dir is missing".to_string())
+        })?;
+        let summary = verify_chart_equivalence(args, &docs, verify_chart_dir)?;
         eprintln!("verify equivalence: {summary}");
     }
     if args.out_chart_dir.is_none() || args.output.is_some() {

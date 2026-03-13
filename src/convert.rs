@@ -1362,7 +1362,9 @@ fn attach_role_doc_to_service_account(
     } else {
         "roles"
     };
-    let roles_map = get_or_create_child_mapping(sa_app, roles_field);
+    let Some(roles_map) = get_or_create_child_mapping(sa_app, roles_field) else {
+        return false;
+    };
     let role_entry_key = dedupe_group_key(roles_map, &sanitize_key(role_key));
     roles_map.insert(k(&role_entry_key), Value::Mapping(role_app));
 
@@ -1997,7 +1999,9 @@ fn merge_top_level_values(dst: &mut Mapping, src: &Mapping) {
             continue;
         }
 
-        let dst_global = get_or_create_child_mapping(dst, "global");
+        let Some(dst_global) = get_or_create_child_mapping(dst, "global") else {
+            continue;
+        };
         let Some(src_global) = v0.as_mapping() else {
             continue;
         };
@@ -2012,7 +2016,9 @@ fn merge_top_level_values(dst: &mut Mapping, src: &Mapping) {
                 continue;
             }
 
-            let dst_includes = get_or_create_child_mapping(dst_global, "_includes");
+            let Some(dst_includes) = get_or_create_child_mapping(dst_global, "_includes") else {
+                continue;
+            };
             if let Some(src_includes) = gv.as_mapping() {
                 for (ik, iv) in src_includes {
                     dst_includes.insert(ik.clone(), iv.clone());
@@ -2046,16 +2052,13 @@ fn resource_uid(doc: &Value) -> String {
     format!("{}|{:x}", base, hasher.finish())
 }
 
-fn get_or_create_child_mapping<'a>(parent: &'a mut Mapping, key: &str) -> &'a mut Mapping {
+fn get_or_create_child_mapping<'a>(parent: &'a mut Mapping, key: &str) -> Option<&'a mut Mapping> {
     let key_value = k(key);
     let has_mapping = matches!(parent.get(&key_value), Some(Value::Mapping(_)));
     if !has_mapping {
         parent.insert(key_value.clone(), Value::Mapping(Mapping::new()));
     }
-    parent
-        .get_mut(&key_value)
-        .and_then(Value::as_mapping_mut)
-        .expect("mapping must exist")
+    parent.get_mut(&key_value).and_then(Value::as_mapping_mut)
 }
 
 fn dedupe_group_key(group: &Mapping, base: &str) -> String {

@@ -175,7 +175,11 @@ pub fn builtin_index(args: &[Option<Value>]) -> Result<Option<Value>, Collection
                     ),
                 });
             }
-            None => unreachable!("index cursor None is handled before match"),
+            None => {
+                return Err(CollectionsError {
+                    reason: "error calling index: nil cursor".to_string(),
+                });
+            }
         };
         cur = next;
     }

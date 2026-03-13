@@ -181,13 +181,9 @@ fn parse_list(
                     }
 
                     match control_action {
-                        ControlAction::Open(ControlKind::If)
-                        | ControlAction::Open(ControlKind::Range)
-                        | ControlAction::Open(ControlKind::With) => {
-                            let kind = match control_action {
-                                ControlAction::Open(kind) => kind,
-                                _ => unreachable!(),
-                            };
+                        ControlAction::Open(
+                            kind @ (ControlKind::If | ControlKind::Range | ControlKind::With),
+                        ) => {
                             let (node, next_idx) = parse_branch_node(
                                 kind,
                                 &canonical,

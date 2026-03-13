@@ -167,8 +167,9 @@ pub fn resolve_and_write(path: &str, format: &str, out: Option<&str>) -> Result<
     let report = load(path)?;
     let body = match format.trim().to_ascii_lowercase().as_str() {
         "" | "yaml" | "yml" => serde_yaml::to_string(&report)?,
-        "json" => serde_json::to_string_pretty(&report)
-            .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, e)))?,
+        "json" => {
+            serde_json::to_string_pretty(&report).map_err(|e| Error::Io(io::Error::other(e)))?
+        }
         other => return Err(Error::Format(other.to_string())),
     };
     if let Some(p) = out {

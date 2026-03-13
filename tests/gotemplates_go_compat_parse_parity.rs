@@ -113,7 +113,7 @@ fn go_compat_parse_matches_go_with_custom_delimiters_subset() {
     }
 
     let runner = GoParseRunner::new().expect("prepare go parser runner");
-    let cases = vec![
+    let cases = [
         (
             r#"<<if .X>>x<<end>>"#,
             "<<",

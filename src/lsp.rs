@@ -979,10 +979,12 @@ fn collect_global_keys_referenced(value: &JsonValue, out: &mut BTreeSet<String>)
 }
 
 fn collect_global_keys_from_template_string(text: &str, out: &mut BTreeSet<String>) {
-    static GLOBAL_KEY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = GLOBAL_KEY_RE.get_or_init(|| {
-        regex::Regex::new(r"(?:\$?\s*\.)?Values\.global\.([A-Za-z0-9_-]+)").expect("regex")
-    });
+    static GLOBAL_KEY_RE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let Some(re) = GLOBAL_KEY_RE
+        .get_or_init(|| regex::Regex::new(r"(?:\$?\s*\.)?Values\.global\.([A-Za-z0-9_-]+)").ok())
+    else {
+        return;
+    };
     for captures in re.captures_iter(text) {
         if let Some(m) = captures.get(1) {
             let key = m.as_str().trim();
@@ -998,11 +1000,20 @@ fn publish_document_diagnostics(
     uri: &Uri,
     text: &str,
 ) -> Result<(), Error> {
-    if !looks_like_helm_apps_values_text(text) {
+    if !is_helm_apps_values_source(uri, text) {
         return publish_diagnostics(connection, uri, Vec::new());
     }
     let diagnostics = build_diagnostics(uri, text);
     publish_diagnostics(connection, uri, diagnostics)
+}
+
+fn is_helm_apps_values_source(uri: &Uri, text: &str) -> bool {
+    if looks_like_helm_apps_values_text(text) {
+        return true;
+    }
+    file_path_from_uri_string(&uri.to_string())
+        .as_deref()
+        .is_some_and(is_werf_secret_values_file)
 }
 
 fn publish_diagnostics(
@@ -1696,6 +1707,8 @@ fn parse_and_expand_values_root(
 ) -> Option<JsonMap<String, JsonValue>> {
     let mut overrides: HashMap<PathBuf, String> = HashMap::new();
     let mut current_base_dir: Option<PathBuf> = None;
+    let mut root_source_path: Option<PathBuf> = None;
+    let mut root_map: Option<JsonMap<String, JsonValue>> = None;
 
     if let Some(uri) = uri {
         if let Some(current_path) = file_path_from_uri_string(&uri.to_string()) {
@@ -1706,28 +1719,44 @@ fn parse_and_expand_values_root(
                 if let Some(root_values_path) = find_primary_values_file(&chart_root) {
                     let root_text =
                         read_text_from_path_with_overrides(&root_values_path, &overrides).ok()?;
-                    if let Ok(root_map) = parse_yaml_map_to_json_map(&root_text) {
-                        if let Ok(with_files) = expand_values_with_file_includes(
-                            &root_map,
-                            root_values_path.parent(),
-                            &overrides,
-                        ) {
-                            if let Ok(expanded) = expand_includes_in_values(&with_files) {
-                                return Some(expanded);
-                            }
-                            return Some(with_files);
-                        }
-                        return Some(root_map);
+                    if let Ok(parsed_root_map) = parse_yaml_map_to_json_map(&root_text) {
+                        root_source_path = Some(root_values_path);
+                        root_map = Some(parsed_root_map);
+                    }
+                }
+
+                if root_map.is_none() {
+                    let parsed_current = parse_yaml_map_to_json_map(text).ok()?;
+                    root_source_path = Some(current_path.clone());
+                    root_map = Some(parsed_current);
+                }
+
+                if let Some(secret_values_path) = find_werf_secret_values_file(&chart_root) {
+                    let secret_path_norm = normalize_fs_path(&secret_values_path);
+                    let root_path_norm = root_source_path.as_deref().map(normalize_fs_path);
+                    if root_path_norm.as_ref() != Some(&secret_path_norm) {
+                        let secret_text =
+                            read_text_from_path_with_overrides(&secret_values_path, &overrides)
+                                .ok()?;
+                        let secret_map = parse_yaml_map_to_json_map(&secret_text).ok()?;
+                        let merged_base = root_map.take().unwrap_or_default();
+                        root_map = Some(merge_maps(&merged_base, &secret_map));
                     }
                 }
             }
         }
     }
 
-    let root_map = parse_yaml_map_to_json_map(text).ok()?;
+    let root_map = match root_map {
+        Some(root_map) => root_map,
+        None => parse_yaml_map_to_json_map(text).ok()?,
+    };
+    let include_base_dir = root_source_path
+        .as_deref()
+        .and_then(Path::parent)
+        .or(current_base_dir.as_deref());
     let with_files =
-        expand_values_with_file_includes(&root_map, current_base_dir.as_deref(), &overrides)
-            .ok()?;
+        expand_values_with_file_includes(&root_map, include_base_dir, &overrides).ok()?;
     expand_includes_in_values(&with_files).ok()
 }
 
@@ -1771,6 +1800,29 @@ fn find_primary_values_file(chart_root: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn find_werf_secret_values_file(chart_root: &Path) -> Option<PathBuf> {
+    let candidates = [
+        chart_root.join("secret-values.yaml"),
+        chart_root.join("secret-values.yml"),
+    ];
+    for candidate in candidates {
+        if candidate.exists() && is_werf_secret_values_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_werf_secret_values_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let normalized = name.to_ascii_lowercase();
+            normalized == "secret-values.yaml" || normalized == "secret-values.yml"
+        })
+        .unwrap_or(false)
 }
 
 fn expand_values_with_file_includes(
@@ -5154,6 +5206,126 @@ default-app:
         assert!(diagnostics
             .iter()
             .all(|d| !matches!(d.code, Some(lsp_types::NumberOrString::String(ref c)) if c == "E_TPL_CURRENT_APP_SCOPE")));
+    }
+
+    #[test]
+    fn secret_values_file_is_treated_as_helm_apps_values_source() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        let secret_path = td.path().join("secret-values.yaml");
+        let uri = format!("file://{}", secret_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+
+        assert!(is_helm_apps_values_source(
+            &uri,
+            "global:\n  minioSecrets:\n    accessKey: deadbeef\n",
+        ));
+    }
+
+    #[test]
+    fn parse_and_expand_values_root_merges_werf_secret_values_into_root_context() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        let values_path = td.path().join("values.yaml");
+        let values_text = r#"
+global:
+  _includes: {}
+apps-stateless:
+  app-1:
+    enabled: true
+"#;
+        fs::write(&values_path, values_text).expect("write values");
+        fs::write(
+            td.path().join("secret-values.yaml"),
+            r#"
+global:
+  minioSecrets:
+    accessKey:
+      _default: encrypted
+"#,
+        )
+        .expect("write secret values");
+
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let merged = parse_and_expand_values_root(Some(&uri), values_text).expect("merged root");
+
+        assert_eq!(
+            merged
+                .get("global")
+                .and_then(as_obj)
+                .and_then(|global| global.get("minioSecrets"))
+                .and_then(as_obj)
+                .and_then(|secrets| secrets.get("accessKey"))
+                .and_then(as_obj)
+                .and_then(|access_key| access_key.get("_default"))
+                .and_then(JsonValue::as_str),
+            Some("encrypted")
+        );
+    }
+
+    #[test]
+    fn parse_and_expand_values_root_prefers_open_secret_values_override() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        fs::write(
+            td.path().join("values.yaml"),
+            r#"
+global:
+  _includes: {}
+"#,
+        )
+        .expect("write values");
+        let secret_path = td.path().join("secret-values.yaml");
+        fs::write(
+            &secret_path,
+            r#"
+global:
+  apiTokens:
+    shared:
+      _default: old
+"#,
+        )
+        .expect("write secret values");
+
+        let secret_override = r#"
+global:
+  apiTokens:
+    shared:
+      _default: new
+"#;
+        let uri = format!("file://{}", secret_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let merged =
+            parse_and_expand_values_root(Some(&uri), secret_override).expect("merged root");
+
+        assert_eq!(
+            merged
+                .get("global")
+                .and_then(as_obj)
+                .and_then(|global| global.get("apiTokens"))
+                .and_then(as_obj)
+                .and_then(|tokens| tokens.get("shared"))
+                .and_then(as_obj)
+                .and_then(|shared| shared.get("_default"))
+                .and_then(JsonValue::as_str),
+            Some("new")
+        );
     }
 
     #[test]

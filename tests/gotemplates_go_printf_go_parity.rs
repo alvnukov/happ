@@ -132,7 +132,7 @@ fn compat_go_printf_matches_go_fmt_generated_matrix() {
 
     let runner = GoFmtRunner::new().expect("prepare go fmt runner");
 
-    let pool = vec![
+    let pool = [
         Arg::Int(-7),
         Arg::Uint(u64::MAX),
         Arg::Float(1.25),

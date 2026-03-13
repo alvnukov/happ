@@ -359,7 +359,11 @@ pub fn go_printf(fmt: &str, args: &[Option<Value>]) -> Result<String, String> {
                     push_with_width(&mut out, &rendered, width, false, left_align);
                 } else if matches!(arg, Some(Value::String(_))) && matches!(verb, 'x' | 'X') {
                     let Some(Value::String(s)) = arg.as_ref() else {
-                        unreachable!();
+                        out.push_str(&format_printf_mismatch_with_state(
+                            verb, arg, plus_flag, space_flag, alt_flag, zero_pad, left_align,
+                            width, precision,
+                        ));
+                        continue;
                     };
                     let rendered = format_bytes_hex_go(
                         s.as_bytes(),

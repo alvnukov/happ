@@ -100,13 +100,9 @@ mod tests {
         let nil_bytes = Some(encode_go_nil_bytes_value());
         let non_nil_bytes = Some(encode_go_bytes_value(b"x"));
 
-        assert_eq!(
-            builtin_eq("", &[nil_bytes.clone(), nil_bytes.clone()]).expect("eq must succeed"),
-            true
-        );
-        assert_eq!(
-            builtin_eq("", &[nil_bytes.clone(), non_nil_bytes.clone()]).expect("eq must succeed"),
-            false
+        assert!(builtin_eq("", &[nil_bytes.clone(), nil_bytes.clone()]).expect("eq must succeed"));
+        assert!(
+            !builtin_eq("", &[nil_bytes.clone(), non_nil_bytes.clone()]).expect("eq must succeed")
         );
 
         let nil_map = Some(encode_go_typed_map_value("int", None));
@@ -114,23 +110,14 @@ mod tests {
         entries.insert("a".to_string(), json!(1));
         let map = Some(encode_go_typed_map_value("int", Some(entries)));
 
-        assert_eq!(
-            builtin_eq("", &[nil_map.clone(), nil_map.clone()]).expect("eq must succeed"),
-            true
-        );
-        assert_eq!(
-            builtin_eq("", &[nil_map, map]).expect("eq must succeed"),
-            false
-        );
+        assert!(builtin_eq("", &[nil_map.clone(), nil_map.clone()]).expect("eq must succeed"));
+        assert!(!builtin_eq("", &[nil_map, map]).expect("eq must succeed"));
     }
 
     #[test]
     fn eq_with_nil_and_typed_nil_value_is_true_like_go() {
         let nil_map = Some(encode_go_typed_map_value("string", None));
-        assert_eq!(
-            builtin_eq("", &[None, nil_map]).expect("eq must succeed"),
-            true
-        );
+        assert!(builtin_eq("", &[None, nil_map]).expect("eq must succeed"));
     }
 
     #[test]
@@ -153,26 +140,11 @@ mod tests {
 
     #[test]
     fn lt_and_related_ops_follow_go_signed_unsigned_rules() {
-        assert_eq!(
-            builtin_lt("", &[Some(json!(-1)), Some(json!(1u64))]).expect("lt must succeed"),
-            true
-        );
-        assert_eq!(
-            builtin_lt("", &[Some(json!(1u64)), Some(json!(-1))]).expect("lt must succeed"),
-            false
-        );
-        assert_eq!(
-            builtin_le("", &[Some(json!(1)), Some(json!(1))]).expect("le must succeed"),
-            true
-        );
-        assert_eq!(
-            builtin_gt("", &[Some(json!(2)), Some(json!(1))]).expect("gt must succeed"),
-            true
-        );
-        assert_eq!(
-            builtin_ge("", &[Some(json!(2)), Some(json!(2))]).expect("ge must succeed"),
-            true
-        );
+        assert!(builtin_lt("", &[Some(json!(-1)), Some(json!(1u64))]).expect("lt must succeed"));
+        assert!(!builtin_lt("", &[Some(json!(1u64)), Some(json!(-1))]).expect("lt must succeed"));
+        assert!(builtin_le("", &[Some(json!(1)), Some(json!(1))]).expect("le must succeed"));
+        assert!(builtin_gt("", &[Some(json!(2)), Some(json!(1))]).expect("gt must succeed"));
+        assert!(builtin_ge("", &[Some(json!(2)), Some(json!(2))]).expect("ge must succeed"));
     }
 
     #[test]
@@ -195,9 +167,6 @@ mod tests {
     #[test]
     fn eq_handles_typed_nil_slice() {
         let nil_slice = Some(encode_go_typed_slice_value("int", None));
-        assert_eq!(
-            builtin_eq("", &[nil_slice.clone(), nil_slice]).expect("eq must succeed"),
-            true
-        );
+        assert!(builtin_eq("", &[nil_slice.clone(), nil_slice]).expect("eq must succeed"));
     }
 }

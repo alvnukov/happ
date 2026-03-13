@@ -212,11 +212,12 @@ impl<'a> Parser<'a> {
                 if tail.kind != TokKind::Eof {
                     return Err(self.unexpected_token(&tail, "command"));
                 }
-                Ok(match kw {
+                let action = match kw {
                     TokKind::KwBreak => ControlAction::Break,
                     TokKind::KwContinue => ControlAction::Continue,
-                    _ => unreachable!(),
-                })
+                    _ => return Err(self.unexpected_token(&tok, "command")),
+                };
+                Ok(action)
             }
             TokKind::KwElse => Ok(ControlAction::Else(self.parse_else_clause()?)),
             TokKind::KwDefine => {
@@ -235,10 +236,10 @@ impl<'a> Parser<'a> {
             TokKind::KwIf | TokKind::KwWith => {
                 let _ = self.next_non_space();
                 self.parse_pipeline("control", TokKind::Eof, false)?;
-                let kind = match tok.kind {
-                    TokKind::KwIf => ControlKind::If,
-                    TokKind::KwWith => ControlKind::With,
-                    _ => unreachable!(),
+                let kind = if tok.kind == TokKind::KwIf {
+                    ControlKind::If
+                } else {
+                    ControlKind::With
                 };
                 Ok(ControlAction::Open(kind))
             }
@@ -261,11 +262,14 @@ impl<'a> Parser<'a> {
             TokKind::KwIf | TokKind::KwWith => {
                 let kw = self.next_non_space().kind;
                 self.parse_pipeline("control", TokKind::Eof, false)?;
-                Ok(Some(match kw {
-                    TokKind::KwIf => ControlKind::If,
-                    TokKind::KwWith => ControlKind::With,
-                    _ => unreachable!(),
-                }))
+                let kind = if kw == TokKind::KwIf {
+                    ControlKind::If
+                } else if kw == TokKind::KwWith {
+                    ControlKind::With
+                } else {
+                    return Err(self.unexpected_token(&self.peek_non_space(), "else"));
+                };
+                Ok(Some(kind))
             }
             _ => Err(self.unexpected_token(&self.peek_non_space(), "else")),
         }

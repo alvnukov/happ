@@ -2193,10 +2193,10 @@ fn render_xml_doc_json(value: &serde_json::Value) -> Result<String, String> {
     let mut out = String::new();
     match value {
         serde_json::Value::Object(map) if map.len() == 1 => {
-            let (root, content) = map
-                .iter()
-                .next()
-                .expect("single-key object must have one entry");
+            let Some((root, content)) = map.iter().next() else {
+                write_xml_field_json(&mut out, "root", value)?;
+                return Ok(out);
+            };
             if root != "#text" && !root.starts_with('@') && is_valid_xml_name(root) {
                 write_xml_field_json(&mut out, root, content)?;
             } else {
@@ -2326,7 +2326,9 @@ fn is_valid_xml_name(name: &str) -> bool {
         return false;
     }
     let mut chars = name.chars();
-    let first = chars.next().expect("name is not empty");
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !(first == '_' || first.is_ascii_alphabetic()) {
         return false;
     }
@@ -9030,7 +9032,7 @@ mod tests {
         assert!(html.contains("Structured convert"));
         assert!(html.contains("localStorage"));
         assert!(html.contains("version-badge"));
-        assert!(html.contains(&format!("v{{{{ model.version || \"dev\" }}}}")));
+        assert!(html.contains("v{{ model.version || \"dev\" }}"));
         assert!(html.contains(HAPP_VERSION));
         assert!(html.contains("Copy values"));
         assert!(html.contains("Save as chart"));

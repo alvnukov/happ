@@ -42,8 +42,12 @@ pub fn equivalent(source_docs: &[YamlValue], generated_docs: &[YamlValue]) -> Eq
         }
     }
     for key in &src_keys {
-        let src = src_idx.get(key).expect("src key exists");
-        let generated = gen_idx.get(key).expect("generated key exists");
+        let (Some(src), Some(generated)) = (src_idx.get(key), gen_idx.get(key)) else {
+            return EquivalenceResult {
+                equal: false,
+                summary: format!("resource index mismatch for key: {key}"),
+            };
+        };
         if let Some((path, av, bv)) = first_diff_path(
             &JsonValue::Object(src.clone()),
             &JsonValue::Object(generated.clone()),
@@ -359,11 +363,10 @@ fn first_diff_path(
                         bv.cloned().unwrap_or(JsonValue::Null),
                     ));
                 }
-                if let Some(diff) = first_diff_path(
-                    av.expect("key exists"),
-                    bv.expect("key exists"),
-                    &join_path(path, &key),
-                ) {
+                let (Some(av), Some(bv)) = (av, bv) else {
+                    continue;
+                };
+                if let Some(diff) = first_diff_path(av, bv, &join_path(path, &key)) {
                     return Some(diff);
                 }
             }
@@ -420,8 +423,9 @@ fn sort_rec(v: &JsonValue) -> JsonValue {
             let mut out = JsonMap::new();
             let keys: BTreeSet<String> = map.keys().cloned().collect();
             for key in keys {
-                let value = map.get(&key).expect("key exists");
-                out.insert(key, sort_rec(value));
+                if let Some(value) = map.get(&key) {
+                    out.insert(key, sort_rec(value));
+                }
             }
             JsonValue::Object(out)
         }

@@ -277,22 +277,22 @@ mod tests {
         let nil_bytes = Some(encode_go_nil_bytes_value());
         let non_nil_bytes = Some(encode_go_bytes_value(b"x"));
 
-        assert_eq!(eq_values(&nil_bytes, &nil_bytes).expect("eq"), true);
-        assert_eq!(eq_values(&nil_bytes, &non_nil_bytes).expect("eq"), false);
+        assert!(eq_values(&nil_bytes, &nil_bytes).expect("eq"));
+        assert!(!eq_values(&nil_bytes, &non_nil_bytes).expect("eq"));
 
         let nil_map = Some(encode_go_typed_map_value("int", None));
         let mut entries = Map::new();
         entries.insert("a".to_string(), json!(1));
         let map = Some(encode_go_typed_map_value("int", Some(entries)));
 
-        assert_eq!(eq_values(&nil_map, &nil_map).expect("eq"), true);
-        assert_eq!(eq_values(&nil_map, &map).expect("eq"), false);
+        assert!(eq_values(&nil_map, &nil_map).expect("eq"));
+        assert!(!eq_values(&nil_map, &map).expect("eq"));
     }
 
     #[test]
     fn eq_with_nil_and_typed_nil_value_is_true_like_go() {
         let nil_map = Some(encode_go_typed_map_value("string", None));
-        assert_eq!(eq_values(&None, &nil_map).expect("eq"), true);
+        assert!(eq_values(&None, &nil_map).expect("eq"));
     }
 
     #[test]
@@ -310,18 +310,9 @@ mod tests {
 
     #[test]
     fn lt_and_related_ops_follow_go_signed_unsigned_rules() {
-        assert_eq!(
-            lt_values(&Some(json!(-1)), &Some(json!(1u64))).expect("lt"),
-            true
-        );
-        assert_eq!(
-            lt_values(&Some(json!(1u64)), &Some(json!(-1))).expect("lt"),
-            false
-        );
-        assert_eq!(
-            le_values(&Some(json!(1)), &Some(json!(1))).expect("le"),
-            true
-        );
+        assert!(lt_values(&Some(json!(-1)), &Some(json!(1u64))).expect("lt"));
+        assert!(!lt_values(&Some(json!(1u64)), &Some(json!(-1))).expect("lt"));
+        assert!(le_values(&Some(json!(1)), &Some(json!(1))).expect("le"));
     }
 
     #[test]
@@ -337,6 +328,6 @@ mod tests {
     #[test]
     fn eq_handles_typed_nil_slice() {
         let nil_slice = Some(encode_go_typed_slice_value("int", None));
-        assert_eq!(eq_values(&nil_slice, &nil_slice).expect("eq"), true);
+        assert!(eq_values(&nil_slice, &nil_slice).expect("eq"));
     }
 }
