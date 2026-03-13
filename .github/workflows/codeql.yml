@@ -1,0 +1,104 @@
+name: CodeQL
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "23 3 * * 1"
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze-interpreted:
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - actions
+          - javascript-typescript
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@dd677812177e0c29f9c970a6c58d8607ae1bfefd
+        with:
+          languages: ${{ matrix.language }}
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@dd677812177e0c29f9c970a6c58d8607ae1bfefd
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  analyze-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: stable
+
+      - name: Setup Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: "1.25.7"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@dd677812177e0c29f9c970a6c58d8607ae1bfefd
+        with:
+          languages: rust
+          build-mode: autobuild
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@dd677812177e0c29f9c970a6c58d8607ae1bfefd
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@dd677812177e0c29f9c970a6c58d8607ae1bfefd
+        with:
+          category: "/language:rust"
+
+  analyze-go:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Setup Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: "1.25.7"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@dd677812177e0c29f9c970a6c58d8607ae1bfefd
+        with:
+          languages: go
+          build-mode: manual
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Build Go helper
+        working-directory: src/go_compat/helm_ir_ffi_helper
+        run: |
+          set -euo pipefail
+          go build ./...
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@dd677812177e0c29f9c970a6c58d8607ae1bfefd
+        with:
+          category: "/language:go"

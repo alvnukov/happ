@@ -1546,8 +1546,8 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zq"
-version = "1.4.2"
-source = "git+https://github.com/alvnukov/zq?tag=v1.4.2#22813f993b6dcdd3bc1431670aa1d506af19f1e0"
+version = "1.5.1"
+source = "git+https://github.com/alvnukov/zq?tag=v1.5.1#c735e5dc235d4d8bd643f8f25607cb92de07055a"
 dependencies = [
  "base64",
  "clap",

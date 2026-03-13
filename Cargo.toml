@@ -22,7 +22,7 @@ tempfile = "3"
 include_dir = "0.7"
 lsp-server = "0.7"
 lsp-types = "0.97"
-zq = { git = "https://github.com/alvnukov/zq", tag = "v1.4.2" }
+zq = { git = "https://github.com/alvnukov/zq", tag = "v1.5.1" }
 libc = "0.2"
 zstd = "0.13"
 toml = "0.8"

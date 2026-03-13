@@ -1,0 +1,10 @@
+name: happ-codeql
+
+queries:
+  - uses: security-extended
+
+paths-ignore:
+  - assets/codemirror.bundle.js
+  - src/go_compat/helm_ir_ffi_helper/vendor
+  - target
+  - .tmp
