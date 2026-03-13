@@ -505,8 +505,10 @@ jobs:
             head "https://github.com/alvnukov/happ.git", branch: "main"
           
             depends_on "rust" => :build
+            depends_on "go" => :build
           
             def install
+              ENV["HAPP_GO_BIN"] = (Formula["go"].opt_bin/"go").to_s
               system "cargo", "install", *std_cargo_args(path: ".")
             end
           
