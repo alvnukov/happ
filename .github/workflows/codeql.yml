@@ -1,0 +1,52 @@
+name: CodeQL
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "41 4 * * 1"
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build_mode: none
+          - language: go
+            build_mode: manual
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go toolchain
+        if: ${{ matrix.language == 'go' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.7"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build_mode }}
+
+      - name: Build Go helper sources
+        if: ${{ matrix.language == 'go' }}
+        working-directory: src/go_compat/helm_ir_ffi_helper
+        run: |
+          set -euo pipefail
+          go build ./...
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
