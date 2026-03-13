@@ -64,7 +64,7 @@ jobs:
           tool: cargo-deny
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@de9faa98b1f383ab2d2c2bb9c002f9048f58d059
+        uses: taiki-e/install-action@7f8c46cb787815968435d46f3a3321ad221eeafb
         with:
           tool: cargo-audit
 
@@ -189,7 +189,7 @@ jobs:
           go-version: "1.25.8"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@3ba22c660d7a3fe71d40eeb5830575b980204503
+        uses: taiki-e/install-action@7f8c46cb787815968435d46f3a3321ad221eeafb
         with:
           tool: cargo-llvm-cov
 
