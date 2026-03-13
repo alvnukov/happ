@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 #[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
@@ -52,6 +53,7 @@ struct ListEntitiesParams {
 #[serde(rename_all = "camelCase")]
 struct ListEntitiesResult {
     groups: Vec<EntityGroup>,
+    enabled_entities: Vec<EnabledEntityRef>,
     default_env: String,
     used_env: String,
     env_discovery: EnvironmentDiscovery,
@@ -62,6 +64,13 @@ struct ListEntitiesResult {
 struct EntityGroup {
     name: String,
     apps: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnabledEntityRef {
+    group: String,
+    app: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +102,7 @@ struct RenderEntityManifestParams {
     group: String,
     app: String,
     env: Option<String>,
+    renderer: Option<String>,
     apply_includes: Option<bool>,
     apply_env_resolution: Option<bool>,
 }
@@ -104,6 +114,24 @@ struct RenderEntityManifestResult {
     default_env: String,
     used_env: String,
     env_discovery: EnvironmentDiscovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestPreviewRenderer {
+    Fast,
+    Helm,
+    Werf,
+}
+
+impl ManifestPreviewRenderer {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("fast") => Ok(Self::Fast),
+            Some("helm") => Ok(Self::Helm),
+            Some("werf") => Ok(Self::Werf),
+            Some(other) => Err(format!("unsupported manifest preview renderer: {other}")),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,12 +223,20 @@ struct HappPreviewThemeSyntax {
 
 #[derive(Debug)]
 struct ResolvedEntityContext {
+    root: JsonValue,
     entity: JsonValue,
     global: JsonValue,
     apply_includes: bool,
     default_env: String,
     used_env: String,
     env_discovery: EnvironmentDiscovery,
+}
+
+struct ParsedSourceValuesRoot {
+    root_map: JsonMap<String, JsonValue>,
+    chart_root: Option<PathBuf>,
+    include_base_dir: Option<PathBuf>,
+    overrides: HashMap<PathBuf, String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -514,6 +550,7 @@ fn list_entities_request(
 
     Ok(ListEntitiesResult {
         groups: collect_entity_groups(&visible_values),
+        enabled_entities: collect_enabled_entities(&visible_values),
         default_env,
         used_env,
         env_discovery,
@@ -546,9 +583,19 @@ fn render_entity_manifest_request(
     state: &ServerState,
     params: RenderEntityManifestParams,
 ) -> Result<RenderEntityManifestResult, String> {
+    let request_uri = params
+        .uri
+        .as_ref()
+        .and_then(|value| value.parse::<Uri>().ok());
+    let current_path = params
+        .uri
+        .as_deref()
+        .and_then(file_path_from_uri_string);
+    let renderer = ManifestPreviewRenderer::parse(params.renderer.as_deref())?;
+    let request_text = resolve_request_text(state, params.uri.as_deref(), params.text.clone())?;
     let context = resolve_entity_context(
         state,
-        params.uri,
+        params.uri.clone(),
         params.text,
         params.group.clone(),
         params.app.clone(),
@@ -556,13 +603,20 @@ fn render_entity_manifest_request(
         params.apply_includes,
         params.apply_env_resolution,
     )?;
+    let parsed_source_root = parse_source_values_root(request_uri.as_ref(), &request_text)
+        .ok_or_else(|| "failed to parse values root for manifest preview".to_string())?;
+    let chart_root = parsed_source_root
+        .chart_root
+        .ok_or_else(|| "chart root not found for manifest preview".to_string())?;
     let manifest = render_manifest_for_entity(
+        &chart_root,
+        current_path.as_deref(),
         &params.group,
         &params.app,
-        &context.entity,
-        &context.global,
-        context.apply_includes,
+        &JsonValue::Object(parsed_source_root.root_map),
+        &context.root,
         &context.used_env,
+        renderer,
     )?;
     Ok(RenderEntityManifestResult {
         manifest,
@@ -660,20 +714,16 @@ fn resolve_entity_context(
     let default_env = detect_default_env(&expanded, &env_discovery);
     let used_env = env.unwrap_or_else(|| default_env.clone());
 
-    let entity = read_entity(&expanded, &group, &app)?;
-    let entity = if apply_env {
-        resolve_env_maps(&entity, &used_env)
+    let root = if apply_env {
+        resolve_env_maps(&expanded, &used_env)
     } else {
-        entity
+        expanded
     };
-    let global = read_global(&expanded);
-    let global = if apply_env {
-        resolve_env_maps(&global, &used_env)
-    } else {
-        global
-    };
+    let entity = read_entity(&root, &group, &app)?;
+    let global = read_global(&root);
 
     Ok(ResolvedEntityContext {
+        root,
         entity,
         global,
         apply_includes,
@@ -719,32 +769,79 @@ fn collect_entity_groups(values: &JsonValue) -> Vec<EntityGroup> {
     groups
 }
 
+fn collect_enabled_entities(values: &JsonValue) -> Vec<EnabledEntityRef> {
+    let Some(root) = as_obj(values) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut group_names: Vec<&String> = root.keys().collect();
+    group_names.sort();
+
+    for group_name in group_names {
+        if group_name == "global" {
+            continue;
+        }
+        let Some(group_obj) = root.get(group_name).and_then(as_obj) else {
+            continue;
+        };
+        let mut app_names: Vec<&String> = group_obj.keys().collect();
+        app_names.sort();
+        for app_name in app_names {
+            if app_name == "__GroupVars__" {
+                continue;
+            }
+            let Some(app_value) = group_obj.get(app_name) else {
+                continue;
+            };
+            if !app_value.is_object() || !entity_enabled_in_resolved_root(app_value) {
+                continue;
+            }
+            out.push(EnabledEntityRef {
+                group: group_name.clone(),
+                app: app_name.clone(),
+            });
+        }
+    }
+
+    out
+}
+
 fn render_manifest_for_entity(
+    chart_root: &Path,
+    current_path: Option<&Path>,
     group: &str,
     app: &str,
-    entity: &JsonValue,
-    global: &JsonValue,
-    apply_includes: bool,
+    source_root: &JsonValue,
+    resolved_root: &JsonValue,
     env: &str,
+    renderer: ManifestPreviewRenderer,
 ) -> Result<String, String> {
+    if renderer != ManifestPreviewRenderer::Fast {
+        return render_manifest_for_entity_via_cli(
+            chart_root,
+            current_path,
+            group,
+            app,
+            resolved_root,
+            env,
+            renderer,
+        );
+    }
+
     let values_json =
-        build_manifest_preview_values(group, app, entity, global, apply_includes, env);
+        build_manifest_render_values_root(source_root, resolved_root, group, app, env)?;
     let values_yaml = json_to_yaml_value(&values_json)
         .map_err(|e| format!("build values yaml for preview: {e}"))?;
     let temp_dir = tempfile::Builder::new()
-        .prefix("happ-lsp-preview-")
+        .prefix("happ-lsp-preview-values-")
         .tempdir()
-        .map_err(|e| format!("create temp dir for preview chart: {e}"))?;
-    let chart_dir = temp_dir.path().join("chart");
-    let chart_dir_text = chart_dir.to_string_lossy().to_string();
-    crate::output::generate_consumer_chart(
-        &chart_dir_text,
-        Some("happ-lsp-preview"),
-        &values_yaml,
-        None,
-        false,
-    )
-    .map_err(|e| format!("prepare preview chart: {e}"))?;
+        .map_err(|e| format!("create temp dir for preview values: {e}"))?;
+    let values_path = temp_dir.path().join("values.preview.yaml");
+    let values_text = crate::output::values_yaml(&values_yaml)
+        .map_err(|e| format!("encode preview values yaml: {e}"))?;
+    std::fs::write(&values_path, values_text.as_bytes())
+        .map_err(|e| format!("write preview values yaml: {e}"))?;
+    let chart_dir_text = chart_root.to_string_lossy().to_string();
 
     let import_args = crate::cli::ImportArgs {
         path: chart_dir_text.clone(),
@@ -763,7 +860,7 @@ fn render_manifest_for_entity(
         verify_equivalence: false,
         release_name: "happ-lsp-preview".into(),
         namespace: None,
-        values_files: Vec::new(),
+        values_files: vec![values_path.to_string_lossy().to_string()],
         set_values: Vec::new(),
         set_string_values: Vec::new(),
         set_file_values: Vec::new(),
@@ -780,6 +877,510 @@ fn render_manifest_for_entity(
         return Err("render preview manifest returned empty output".to_string());
     }
     Ok(rendered)
+}
+
+fn render_manifest_for_entity_via_cli(
+    chart_root: &Path,
+    current_path: Option<&Path>,
+    group: &str,
+    app: &str,
+    resolved_root: &JsonValue,
+    env: &str,
+    renderer: ManifestPreviewRenderer,
+) -> Result<String, String> {
+    let current_path = current_path.ok_or_else(|| {
+        format!(
+            "file-backed document is required for {} manifest preview",
+            manifest_renderer_label(renderer)
+        )
+    })?;
+    let values_files = resolve_manifest_values_files(chart_root, current_path)?;
+    let set_values =
+        build_manifest_entity_isolation_set_values_from_resolved_root(resolved_root, group, app)?;
+    let work_dir = match renderer {
+        ManifestPreviewRenderer::Werf => resolve_werf_project_dir(chart_root),
+        _ => chart_root.to_path_buf(),
+    };
+    let command = manifest_renderer_command(renderer);
+    let args = build_manifest_backend_args(renderer, &work_dir, &values_files, &set_values, env);
+    let output = Command::new(command)
+        .args(&args)
+        .current_dir(&work_dir)
+        .output()
+        .map_err(|err| {
+            format!(
+                "{} failed: spawn {}: {err}",
+                manifest_renderer_label(renderer),
+                command
+            )
+        })?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!(
+                "{} failed: {}",
+                manifest_renderer_label(renderer),
+                if stderr.is_empty() {
+                    "render returned empty output".to_string()
+                } else {
+                    stderr
+                }
+            ));
+        }
+        return Ok(format!("{stdout}\n"));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let message = if stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    } else {
+        stderr
+    };
+    Err(format!(
+        "{} failed: {}",
+        manifest_renderer_label(renderer),
+        if message.is_empty() {
+            format!("process exited with status {}", output.status)
+        } else {
+            message
+        }
+    ))
+}
+
+fn build_manifest_render_values_root(
+    source_root: &JsonValue,
+    resolved_root: &JsonValue,
+    group: &str,
+    app: &str,
+    env: &str,
+) -> Result<JsonValue, String> {
+    let mut values = source_root.clone();
+    let root = values
+        .as_object_mut()
+        .ok_or_else(|| "manifest preview values root must be a YAML map".to_string())?;
+
+    let global = root
+        .entry("global".to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    if !global.is_object() {
+        *global = JsonValue::Object(JsonMap::new());
+    }
+    if let Some(global_obj) = global.as_object_mut() {
+        global_obj.insert("env".to_string(), JsonValue::String(env.to_string()));
+    }
+
+    let resolved_groups = as_obj(resolved_root)
+        .ok_or_else(|| "resolved manifest preview values root must be a YAML map".to_string())?;
+    let mut resolved_target_entity: Option<JsonValue> = None;
+    for (group_name, group_value) in resolved_groups {
+        if group_name == "global" {
+            continue;
+        }
+        let Some(group_obj) = as_obj(group_value) else {
+            continue;
+        };
+        for (app_name, app_value) in group_obj {
+            if app_name == "__GroupVars__" || !app_value.is_object() {
+                continue;
+            }
+            if group_name == group && app_name == app {
+                resolved_target_entity = Some(app_value.clone());
+                continue;
+            }
+            if entity_enabled_in_resolved_root(app_value) {
+                let _ = upsert_entity_enabled_flag(&mut values, group_name, app_name, false, None);
+            }
+        }
+    }
+
+    if !upsert_entity_enabled_flag(
+        &mut values,
+        group,
+        app,
+        true,
+        resolved_target_entity.as_ref(),
+    ) {
+        return Err(format!(
+            "unable to isolate entity {}.{} for manifest render",
+            group, app
+        ));
+    }
+
+    Ok(values)
+}
+
+fn build_manifest_entity_isolation_set_values_from_resolved_root(
+    resolved_root: &JsonValue,
+    group: &str,
+    app: &str,
+) -> Result<Vec<String>, String> {
+    let mut out = vec![build_enabled_set_value(group, app, true)];
+    let groups = as_obj(resolved_root)
+        .ok_or_else(|| "resolved manifest preview values root must be a YAML map".to_string())?;
+    let mut target_found = false;
+
+    let mut group_names: Vec<&String> = groups.keys().collect();
+    group_names.sort();
+    for group_name in group_names {
+        if group_name == "global" {
+            continue;
+        }
+        let Some(group_obj) = groups.get(group_name).and_then(as_obj) else {
+            continue;
+        };
+        let mut app_names: Vec<&String> = group_obj.keys().collect();
+        app_names.sort();
+        for app_name in app_names {
+            if app_name == "__GroupVars__" {
+                continue;
+            }
+            let Some(app_value) = group_obj.get(app_name) else {
+                continue;
+            };
+            if !app_value.is_object() {
+                continue;
+            }
+            if group_name == group && app_name == app {
+                target_found = true;
+                continue;
+            }
+            if entity_enabled_in_resolved_root(app_value) {
+                out.push(build_enabled_set_value(group_name, app_name, false));
+            }
+        }
+    }
+
+    if !target_found {
+        return Err(format!(
+            "unable to isolate entity {}.{} for manifest render",
+            group, app
+        ));
+    }
+    Ok(out)
+}
+
+fn build_enabled_set_value(group: &str, app: &str, enabled: bool) -> String {
+    format!(
+        "{}.{}.enabled={}",
+        escape_helm_set_path_segment(group),
+        escape_helm_set_path_segment(app),
+        if enabled { "true" } else { "false" }
+    )
+}
+
+fn escape_helm_set_path_segment(segment: &str) -> String {
+    segment
+        .replace('\\', "\\\\")
+        .replace('.', "\\.")
+        .replace(',', "\\,")
+        .replace('=', "\\=")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn manifest_renderer_command(renderer: ManifestPreviewRenderer) -> &'static str {
+    match renderer {
+        ManifestPreviewRenderer::Fast | ManifestPreviewRenderer::Helm => "helm",
+        ManifestPreviewRenderer::Werf => "werf",
+    }
+}
+
+fn manifest_renderer_label(renderer: ManifestPreviewRenderer) -> &'static str {
+    match renderer {
+        ManifestPreviewRenderer::Fast => "fast render",
+        ManifestPreviewRenderer::Helm => "helm template",
+        ManifestPreviewRenderer::Werf => "werf render",
+    }
+}
+
+fn build_manifest_backend_args(
+    renderer: ManifestPreviewRenderer,
+    chart_dir: &Path,
+    values_files: &[PathBuf],
+    set_values: &[String],
+    env: &str,
+) -> Vec<String> {
+    let mut value_args: Vec<String> = Vec::new();
+    for value_file in values_files {
+        value_args.push("--values".to_string());
+        value_args.push(value_file.to_string_lossy().to_string());
+    }
+
+    let mut set_args: Vec<String> = Vec::new();
+    for current in set_values {
+        if current.trim().is_empty() {
+            continue;
+        }
+        set_args.push("--set".to_string());
+        set_args.push(current.trim().to_string());
+    }
+
+    let normalized_env = env.trim();
+    let mut with_env = |mut args: Vec<String>| {
+        if !normalized_env.is_empty() {
+            args.push("--set-string".to_string());
+            args.push(format!("global.env={normalized_env}"));
+        }
+        args
+    };
+
+    match renderer {
+        ManifestPreviewRenderer::Helm | ManifestPreviewRenderer::Fast => with_env({
+            let mut args = vec![
+                "template".to_string(),
+                "helm-apps-preview".to_string(),
+                chart_dir.to_string_lossy().to_string(),
+            ];
+            args.extend(value_args);
+            args.extend(set_args);
+            args
+        }),
+        ManifestPreviewRenderer::Werf => with_env({
+            let mut args = vec![
+                "render".to_string(),
+                "--dir".to_string(),
+                chart_dir.to_string_lossy().to_string(),
+                "--dev".to_string(),
+                "--ignore-secret-key".to_string(),
+                "--loose-giterminism".to_string(),
+            ];
+            args.extend(value_args);
+            args.extend(set_args);
+            if !normalized_env.is_empty() {
+                args.push("--env".to_string());
+                args.push(normalized_env.to_string());
+            }
+            args
+        }),
+    }
+}
+
+fn resolve_werf_project_dir(chart_root: &Path) -> PathBuf {
+    let mut current = chart_root.to_path_buf();
+    loop {
+        if current.join("werf.yaml").exists() {
+            return current;
+        }
+        if !current.pop() {
+            return chart_root.to_path_buf();
+        }
+    }
+}
+
+fn resolve_manifest_values_files(chart_root: &Path, current_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let current_path = normalize_fs_path(current_path);
+    let root_documents = find_helm_apps_root_documents(chart_root)?;
+    let primary_values = find_primary_values_file(chart_root).map(|path| normalize_fs_path(&path));
+    let include_owners = collect_include_owners_for_chart(chart_root)?;
+    Ok(select_manifest_values_files(
+        &current_path,
+        &root_documents,
+        primary_values.as_ref(),
+        include_owners.get(&current_path),
+    ))
+}
+
+fn select_manifest_values_files(
+    current_path: &Path,
+    root_documents: &[PathBuf],
+    primary_values: Option<&PathBuf>,
+    include_owners: Option<&BTreeSet<PathBuf>>,
+) -> Vec<PathBuf> {
+    let mut owner_candidates: Vec<PathBuf> = include_owners
+        .map(|owners| owners.iter().cloned().collect())
+        .unwrap_or_default();
+    owner_candidates.sort();
+
+    if !owner_candidates.is_empty() {
+        if let Some(primary) = primary_values {
+            if owner_candidates.iter().any(|candidate| candidate == primary) {
+                return vec![primary.clone()];
+            }
+        }
+        return vec![owner_candidates[0].clone()];
+    }
+
+    if root_documents.iter().any(|root| root == current_path) {
+        if let Some(primary) = primary_values {
+            if primary != current_path {
+                return vec![primary.clone()];
+            }
+        }
+        return vec![current_path.to_path_buf()];
+    }
+
+    if let Some(primary) = primary_values {
+        return vec![primary.clone()];
+    }
+
+    vec![current_path.to_path_buf()]
+}
+
+fn find_helm_apps_root_documents(chart_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let yaml_files = collect_yaml_files(chart_root)?;
+    let mut candidate_roots: Vec<PathBuf> = Vec::new();
+    let mut included_by_other_documents: HashSet<PathBuf> = HashSet::new();
+
+    for file_path in yaml_files {
+        let text = std::fs::read_to_string(&file_path)
+            .map_err(|err| format!("read chart yaml '{}': {err}", file_path.display()))?;
+        if looks_like_helm_apps_values_text(&text) {
+            candidate_roots.push(file_path.clone());
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let base_dir = file_path.parent();
+        for file_ref in collect_include_file_refs(&lines) {
+            if is_templated_include_path(&file_ref.path) {
+                continue;
+            }
+            for candidate in build_include_candidates(&file_ref.path, base_dir) {
+                let normalized = normalize_fs_path(&candidate);
+                if normalized != file_path {
+                    included_by_other_documents.insert(normalized);
+                }
+            }
+        }
+    }
+
+    candidate_roots.sort();
+    candidate_roots.dedup();
+    Ok(candidate_roots
+        .into_iter()
+        .filter(|path| !included_by_other_documents.contains(path))
+        .collect())
+}
+
+fn collect_include_owners_for_chart(
+    chart_root: &Path,
+) -> Result<HashMap<PathBuf, BTreeSet<PathBuf>>, String> {
+    let mut owners: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
+    for root in find_helm_apps_root_documents(chart_root)? {
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        let mut queue = vec![root.clone()];
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            let text = match std::fs::read_to_string(&current) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            let base_dir = current.parent();
+            for file_ref in collect_include_file_refs(&lines) {
+                if is_templated_include_path(&file_ref.path) {
+                    continue;
+                }
+                for candidate in build_include_candidates(&file_ref.path, base_dir) {
+                    let normalized = normalize_fs_path(&candidate);
+                    if !normalized.exists() {
+                        continue;
+                    }
+                    owners
+                        .entry(normalized.clone())
+                        .or_default()
+                        .insert(root.clone());
+                    if !visited.contains(&normalized) {
+                        queue.push(normalized.clone());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Ok(owners)
+}
+
+fn collect_yaml_files(chart_root: &Path) -> Result<Vec<PathBuf>, String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+        for entry in std::fs::read_dir(dir)
+            .map_err(|err| format!("read chart dir '{}': {err}", dir.display()))?
+        {
+            let entry = entry.map_err(|err| format!("read chart dir entry: {err}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|err| format!("read file type '{}': {err}", entry.path().display()))?;
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if file_type.is_dir() {
+                if matches!(
+                    file_name.as_ref(),
+                    ".git" | "node_modules" | "vendor" | "tmp" | ".werf" | "templates"
+                ) {
+                    continue;
+                }
+                walk(&entry.path(), out)?;
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let lower = file_name.to_ascii_lowercase();
+            if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+                out.push(normalize_fs_path(&entry.path()));
+            }
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    walk(chart_root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn entity_enabled_in_resolved_root(entity: &JsonValue) -> bool {
+    as_obj(entity)
+        .and_then(|obj| obj.get("enabled"))
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+}
+
+fn upsert_entity_enabled_flag(
+    values: &mut JsonValue,
+    group: &str,
+    app: &str,
+    enabled: bool,
+    seed_entity: Option<&JsonValue>,
+) -> bool {
+    let Some(root) = values.as_object_mut() else {
+        return false;
+    };
+
+    let group_value = root
+        .entry(group.to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    if !group_value.is_object() {
+        *group_value = JsonValue::Object(JsonMap::new());
+    };
+    let Some(group_obj) = group_value.as_object_mut() else {
+        return false;
+    };
+
+    let mut created = false;
+    let app_value = group_obj.entry(app.to_string()).or_insert_with(|| {
+        created = true;
+        seed_entity
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(|| JsonValue::Object(JsonMap::new()))
+    });
+    if created && !app_value.is_object() {
+        *app_value = JsonValue::Object(JsonMap::new());
+    }
+    if !app_value.is_object() {
+        *app_value = seed_entity
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(|| JsonValue::Object(JsonMap::new()));
+    };
+    let Some(app_obj) = app_value.as_object_mut() else {
+        return false;
+    };
+    app_obj.insert("enabled".to_string(), JsonValue::Bool(enabled));
+    true
 }
 
 fn json_to_yaml_value(value: &JsonValue) -> Result<YamlValue, String> {
@@ -851,9 +1452,33 @@ fn build_manifest_preview_values(
     _apply_includes: bool,
     env: &str,
 ) -> JsonValue {
+    let mut root = JsonMap::new();
+    root.insert("global".to_string(), global.clone());
+    build_manifest_preview_values_with_root(
+        group,
+        app,
+        entity,
+        global,
+        &JsonValue::Object(root),
+        _apply_includes,
+        env,
+    )
+}
+
+fn build_manifest_preview_values_with_root(
+    group: &str,
+    app: &str,
+    entity: &JsonValue,
+    global: &JsonValue,
+    root: &JsonValue,
+    _apply_includes: bool,
+    env: &str,
+) -> JsonValue {
     let required_keys = required_preview_global_keys(entity);
     let global_map = build_preview_global_map(global, env, &required_keys);
+    let required_root_keys = required_preview_root_keys(entity);
     let mut out = build_preview_values_tree(group, app, entity, global_map);
+    inject_preview_root_keys(&mut out, root, &required_root_keys, group, app, entity);
     normalize_include_fields_for_render(&mut out);
     out
 }
@@ -867,6 +1492,13 @@ fn required_preview_global_keys(entity: &JsonValue) -> BTreeSet<String> {
         "releases".to_string(),
     ]);
     collect_global_keys_referenced(entity, &mut required_keys);
+    required_keys
+}
+
+fn required_preview_root_keys(entity: &JsonValue) -> BTreeSet<String> {
+    let mut required_keys = BTreeSet::new();
+    collect_root_keys_referenced(entity, &mut required_keys);
+    required_keys.remove("global");
     required_keys
 }
 
@@ -902,6 +1534,39 @@ fn build_preview_values_tree(
     values_map.insert("global".to_string(), JsonValue::Object(global_map));
     values_map.insert(group.to_string(), JsonValue::Object(app_map));
     JsonValue::Object(values_map)
+}
+
+fn inject_preview_root_keys(
+    values: &mut JsonValue,
+    root: &JsonValue,
+    required_root_keys: &BTreeSet<String>,
+    group: &str,
+    app: &str,
+    entity: &JsonValue,
+) {
+    let Some(values_map) = as_obj(values).cloned() else {
+        return;
+    };
+    let Some(root_map) = as_obj(root) else {
+        return;
+    };
+    let mut next_values = values_map;
+    for key in required_root_keys {
+        let Some(source_value) = root_map.get(key) else {
+            continue;
+        };
+        if key == group {
+            let Some(source_group) = as_obj(source_value) else {
+                continue;
+            };
+            let mut merged_group = source_group.clone();
+            merged_group.insert(app.to_string(), entity.clone());
+            next_values.insert(key.clone(), JsonValue::Object(merged_group));
+            continue;
+        }
+        next_values.insert(key.clone(), source_value.clone());
+    }
+    *values = JsonValue::Object(next_values);
 }
 
 fn normalize_include_fields_for_render(value: &mut JsonValue) {
@@ -978,10 +1643,44 @@ fn collect_global_keys_referenced(value: &JsonValue, out: &mut BTreeSet<String>)
     }
 }
 
+fn collect_root_keys_referenced(value: &JsonValue, out: &mut BTreeSet<String>) {
+    match value {
+        JsonValue::Array(items) => {
+            for item in items {
+                collect_root_keys_referenced(item, out);
+            }
+        }
+        JsonValue::Object(map) => {
+            for item in map.values() {
+                collect_root_keys_referenced(item, out);
+            }
+        }
+        JsonValue::String(text) => collect_root_keys_from_template_string(text, out),
+        _ => {}
+    }
+}
+
 fn collect_global_keys_from_template_string(text: &str, out: &mut BTreeSet<String>) {
     static GLOBAL_KEY_RE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
     let Some(re) = GLOBAL_KEY_RE
         .get_or_init(|| regex::Regex::new(r"(?:\$?\s*\.)?Values\.global\.([A-Za-z0-9_-]+)").ok())
+    else {
+        return;
+    };
+    for captures in re.captures_iter(text) {
+        if let Some(m) = captures.get(1) {
+            let key = m.as_str().trim();
+            if !key.is_empty() {
+                out.insert(key.to_string());
+            }
+        }
+    }
+}
+
+fn collect_root_keys_from_template_string(text: &str, out: &mut BTreeSet<String>) {
+    static ROOT_KEY_RE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let Some(re) = ROOT_KEY_RE
+        .get_or_init(|| regex::Regex::new(r"(?:\$?\s*\.)?Values\.([A-Za-z0-9_-]+)").ok())
     else {
         return;
     };
@@ -1701,22 +2400,21 @@ fn builtin_root_schema(root: TemplatePathRoot) -> Option<&'static JsonValue> {
     }
 }
 
-fn parse_and_expand_values_root(
-    uri: Option<&Uri>,
-    text: &str,
-) -> Option<JsonMap<String, JsonValue>> {
+fn parse_source_values_root(uri: Option<&Uri>, text: &str) -> Option<ParsedSourceValuesRoot> {
     let mut overrides: HashMap<PathBuf, String> = HashMap::new();
     let mut current_base_dir: Option<PathBuf> = None;
     let mut root_source_path: Option<PathBuf> = None;
     let mut root_map: Option<JsonMap<String, JsonValue>> = None;
+    let mut chart_root: Option<PathBuf> = None;
 
     if let Some(uri) = uri {
         if let Some(current_path) = file_path_from_uri_string(&uri.to_string()) {
             current_base_dir = current_path.parent().map(Path::to_path_buf);
             overrides.insert(normalize_fs_path(&current_path), text.to_string());
 
-            if let Some(chart_root) = find_chart_root_from_path(&current_path) {
-                if let Some(root_values_path) = find_primary_values_file(&chart_root) {
+            if let Some(found_chart_root) = find_chart_root_from_path(&current_path) {
+                chart_root = Some(found_chart_root.clone());
+                if let Some(root_values_path) = find_primary_values_file(&found_chart_root) {
                     let root_text =
                         read_text_from_path_with_overrides(&root_values_path, &overrides).ok()?;
                     if let Ok(parsed_root_map) = parse_yaml_map_to_json_map(&root_text) {
@@ -1731,7 +2429,7 @@ fn parse_and_expand_values_root(
                     root_map = Some(parsed_current);
                 }
 
-                if let Some(secret_values_path) = find_werf_secret_values_file(&chart_root) {
+                if let Some(secret_values_path) = find_werf_secret_values_file(&found_chart_root) {
                     let secret_path_norm = normalize_fs_path(&secret_values_path);
                     let root_path_norm = root_source_path.as_deref().map(normalize_fs_path);
                     if root_path_norm.as_ref() != Some(&secret_path_norm) {
@@ -1754,9 +2452,36 @@ fn parse_and_expand_values_root(
     let include_base_dir = root_source_path
         .as_deref()
         .and_then(Path::parent)
-        .or(current_base_dir.as_deref());
-    let with_files =
-        expand_values_with_file_includes(&root_map, include_base_dir, &overrides).ok()?;
+        .or(current_base_dir.as_deref())
+        .map(Path::to_path_buf);
+
+    Some(ParsedSourceValuesRoot {
+        root_map,
+        chart_root,
+        include_base_dir,
+        overrides,
+    })
+}
+
+fn parse_values_root_with_file_includes(
+    uri: Option<&Uri>,
+    text: &str,
+) -> Option<(JsonMap<String, JsonValue>, Option<PathBuf>)> {
+    let parsed = parse_source_values_root(uri, text)?;
+    let with_files = expand_values_with_file_includes(
+        &parsed.root_map,
+        parsed.include_base_dir.as_deref(),
+        &parsed.overrides,
+    )
+    .ok()?;
+    Some((with_files, parsed.chart_root))
+}
+
+fn parse_and_expand_values_root(
+    uri: Option<&Uri>,
+    text: &str,
+) -> Option<JsonMap<String, JsonValue>> {
+    let (with_files, _) = parse_values_root_with_file_includes(uri, text)?;
     expand_includes_in_values(&with_files).ok()
 }
 
@@ -4445,6 +5170,60 @@ apps-stateless:
     }
 
     #[test]
+    fn manifest_preview_values_keep_referenced_top_level_keys() {
+        let entity = json!({
+            "enabled": "{{ $.Values.deploy.enabled }}",
+            "werfEnv": "{{ $.Values.werf.env }}"
+        });
+        let root = json!({
+            "global": {
+                "validation": {
+                    "allowNativeListsInBuiltInListFields": true
+                }
+            },
+            "deploy": {
+                "enabled": true
+            },
+            "werf": {
+                "env": "prod"
+            },
+            "unusedTopLevel": {
+                "x": 1
+            }
+        });
+        let global = root.get("global").cloned().expect("global");
+        let values = build_manifest_preview_values_with_root(
+            "apps-certificates",
+            "apps-common",
+            &entity,
+            &global,
+            &root,
+            true,
+            "prod",
+        );
+
+        assert_eq!(
+            values
+                .get("deploy")
+                .and_then(as_obj)
+                .and_then(|deploy| deploy.get("enabled"))
+                .and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            values
+                .get("werf")
+                .and_then(as_obj)
+                .and_then(|werf| werf.get("env"))
+                .and_then(JsonValue::as_str),
+            Some("prod")
+        );
+        assert!(!values
+            .as_object()
+            .is_some_and(|map| map.contains_key("unusedTopLevel")));
+    }
+
+    #[test]
     fn parse_key_and_include_list_tokens_validate_shape() {
         assert_eq!(
             parse_key_line("  good-key_1: value"),
@@ -5517,6 +6296,14 @@ apps-stateless:
             .find(|group| group.name == "apps-stateless")
             .expect("apps-stateless group");
         assert!(group.apps.iter().any(|app| app == "include-app"));
+        assert!(result
+            .enabled_entities
+            .iter()
+            .any(|entity| entity.group == "apps-stateless" && entity.app == "include-app"));
+        assert!(!result
+            .enabled_entities
+            .iter()
+            .any(|entity| entity.group == "apps-stateless" && entity.app == "root-app"));
     }
 
     #[test]
@@ -5825,4 +6612,317 @@ apps-stateless:
             .message
             .contains("Unresolved include profile: helm-apps-defaults")));
     }
+
+    #[test]
+    fn render_entity_manifest_request_uses_real_chart_files_and_disables_other_enabled_apps() {
+        let td = TempDir::new().expect("tmp");
+        let chart_dir = td.path().join("chart");
+        fs::create_dir_all(chart_dir.join("templates")).expect("mkdir templates");
+        fs::create_dir_all(chart_dir.join("charts")).expect("mkdir charts");
+        fs::create_dir_all(chart_dir.join("configs/rms-reporting")).expect("mkdir configs");
+        fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        fs::write(
+            chart_dir.join("templates/init-helm-apps-library.yaml"),
+            "{{- include \"apps-utils.init-library\" $ }}\n",
+        )
+        .expect("write init tpl");
+        crate::assets::extract_helm_apps_chart(&chart_dir.join("charts/helm-apps"))
+            .expect("extract embedded library");
+        fs::write(
+            chart_dir.join("configs/rms-reporting/application.yaml"),
+            "preview: ok\n",
+        )
+        .expect("write config file");
+        let values_text = r#"
+global:
+  env: demo
+apps-stateless:
+  rms-reporting:
+    enabled: true
+    containers:
+      main:
+        image:
+          name: nginx
+          staticTag: latest
+        configFiles:
+          application-prod.yaml:
+            mountPath: /config/application.yaml
+            content: '{{ $.Files.Get "configs/rms-reporting/application.yaml" }}'
+  another-app:
+    enabled: true
+    containers:
+      main:
+        image:
+          name: nginx
+          staticTag: latest
+"#;
+        let values_path = chart_dir.join("values.yaml");
+        fs::write(&values_path, values_text).expect("write values");
+
+        let result = render_entity_manifest_request(
+            &ServerState::default(),
+            RenderEntityManifestParams {
+                uri: Some(format!("file://{}", values_path.to_string_lossy())),
+                text: Some(values_text.to_string()),
+                group: "apps-stateless".to_string(),
+                app: "rms-reporting".to_string(),
+                env: Some("demo".to_string()),
+                apply_includes: Some(true),
+                apply_env_resolution: Some(true),
+            },
+        )
+        .expect("render manifest");
+
+        assert!(result.manifest.contains("preview: ok"));
+        assert!(!result.manifest.contains("another-app"));
+    }
+
+    #[test]
+    fn render_entity_manifest_request_keeps_include_files_for_chart_runtime_processing() {
+        let td = TempDir::new().expect("tmp");
+        let chart_dir = td.path().join("chart");
+        fs::create_dir_all(chart_dir.join("templates")).expect("mkdir templates");
+        fs::create_dir_all(chart_dir.join("charts")).expect("mkdir charts");
+        fs::create_dir_all(chart_dir.join("configs/rms-reporting")).expect("mkdir configs");
+        fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\ndependencies:\n- name: helm-apps\n  version: 0.1.0\n  repository: file://charts/helm-apps\n",
+        )
+        .expect("write chart");
+        fs::write(
+            chart_dir.join("templates/init-helm-apps-library.yaml"),
+            "{{- include \"apps-utils.init-library\" $ }}\n",
+        )
+        .expect("write init tpl");
+        crate::assets::extract_helm_apps_chart(&chart_dir.join("charts/helm-apps"))
+            .expect("extract embedded library");
+        fs::write(
+            chart_dir.join("configs/rms-reporting/application.yaml"),
+            "spring:\n  graphql:\n    schema:\n      locations:\n        - classpath:graphql/**\n",
+        )
+        .expect("write config yaml");
+        let values_text = r#"
+global:
+  env: demo
+apps-stateless:
+  rms-reporting:
+    enabled: true
+    containers:
+      main:
+        image:
+          name: nginx
+          staticTag: latest
+        configFilesYAML:
+          application.yaml:
+            mountPath: /config/application.yaml
+            content:
+              _include_files:
+                - configs/rms-reporting/application.yaml
+"#;
+        let values_path = chart_dir.join("values.yaml");
+        fs::write(&values_path, values_text).expect("write values");
+
+        let result = render_entity_manifest_request(
+            &ServerState::default(),
+            RenderEntityManifestParams {
+                uri: Some(format!("file://{}", values_path.to_string_lossy())),
+                text: Some(values_text.to_string()),
+                group: "apps-stateless".to_string(),
+                app: "rms-reporting".to_string(),
+                env: Some("demo".to_string()),
+                apply_includes: Some(true),
+                apply_env_resolution: Some(true),
+            },
+        )
+        .expect("render manifest");
+
+        assert!(result.manifest.contains("classpath:graphql/**"));
+        assert!(!result.manifest.contains("E_UNEXPECTED_LIST"));
+    }
+
+    #[test]
+    fn build_manifest_render_values_root_injects_target_entity_if_missing_in_source_root() {
+        let source_root = json!({
+            "global": { "env": "dev" },
+            "apps-cronjobs": {
+                "other": { "enabled": true }
+            }
+        });
+        let resolved_root = json!({
+            "global": { "env": "demo" },
+            "apps-cronjobs": {
+                "aodb-update-master-data-2": {
+                    "enabled": true,
+                    "schedule": "0 0 * * *"
+                },
+                "other": { "enabled": true }
+            }
+        });
+
+        let out = build_manifest_render_values_root(
+            &source_root,
+            &resolved_root,
+            "apps-cronjobs",
+            "aodb-update-master-data-2",
+            "demo",
+        )
+        .expect("build manifest render values");
+
+        let out_root = as_obj(&out).expect("root map");
+        let out_group = out_root
+            .get("apps-cronjobs")
+            .and_then(as_obj)
+            .expect("apps-cronjobs group");
+        assert_eq!(
+            out_group
+                .get("aodb-update-master-data-2")
+                .and_then(as_obj)
+                .and_then(|app| app.get("enabled"))
+                .and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            out_group
+                .get("aodb-update-master-data-2")
+                .and_then(as_obj)
+                .and_then(|app| app.get("schedule"))
+                .and_then(JsonValue::as_str),
+            Some("0 0 * * *")
+        );
+        assert_eq!(
+            out_group
+                .get("other")
+                .and_then(as_obj)
+                .and_then(|app| app.get("enabled"))
+                .and_then(JsonValue::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn build_manifest_entity_isolation_set_values_from_resolved_root_disables_only_active_siblings() {
+        let resolved_root = json!({
+            "global": { "env": "demo" },
+            "apps-stateless": {
+                "target": { "enabled": false },
+                "enabled-a": { "enabled": true },
+                "disabled-a": { "enabled": false }
+            },
+            "apps-cronjobs": {
+                "enabled-b": { "enabled": true },
+                "disabled-b": { "enabled": false }
+            }
+        });
+
+        let set_values = build_manifest_entity_isolation_set_values_from_resolved_root(
+            &resolved_root,
+            "apps-stateless",
+            "target",
+        )
+        .expect("build isolation set values");
+
+        assert_eq!(
+            set_values,
+            vec![
+                "apps-stateless.target.enabled=true".to_string(),
+                "apps-cronjobs.enabled-b.enabled=false".to_string(),
+                "apps-stateless.enabled-a.enabled=false".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_manifest_values_files_prefers_primary_root_for_included_file_owned_by_primary() {
+        let current_path = PathBuf::from("/tmp/chart/configs/application.yaml");
+        let primary_values = PathBuf::from("/tmp/chart/values.yaml");
+        let root_documents = vec![
+            primary_values.clone(),
+            PathBuf::from("/tmp/chart/deployments-values.yaml"),
+        ];
+        let include_owners = BTreeSet::from([
+            primary_values.clone(),
+            PathBuf::from("/tmp/chart/deployments-values.yaml"),
+        ]);
+
+        let selected = select_manifest_values_files(
+            &current_path,
+            &root_documents,
+            Some(&primary_values),
+            Some(&include_owners),
+        );
+
+        assert_eq!(selected, vec![primary_values]);
+    }
+
+    #[test]
+    fn build_manifest_backend_args_for_helm_uses_values_sets_and_global_env() {
+        let args = build_manifest_backend_args(
+            ManifestPreviewRenderer::Helm,
+            Path::new("/tmp/chart"),
+            &[
+                PathBuf::from("/tmp/chart/values.yaml"),
+                PathBuf::from("/tmp/chart/deployments-values.yaml"),
+            ],
+            &[
+                "apps-stateless.app-1.enabled=true".to_string(),
+                "apps-stateless.app-2.enabled=false".to_string(),
+            ],
+            "demo",
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "template".to_string(),
+                "helm-apps-preview".to_string(),
+                "/tmp/chart".to_string(),
+                "--values".to_string(),
+                "/tmp/chart/values.yaml".to_string(),
+                "--values".to_string(),
+                "/tmp/chart/deployments-values.yaml".to_string(),
+                "--set".to_string(),
+                "apps-stateless.app-1.enabled=true".to_string(),
+                "--set".to_string(),
+                "apps-stateless.app-2.enabled=false".to_string(),
+                "--set-string".to_string(),
+                "global.env=demo".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_manifest_backend_args_for_werf_uses_dev_ignore_secret_key_and_env() {
+        let args = build_manifest_backend_args(
+            ManifestPreviewRenderer::Werf,
+            Path::new("/tmp/project"),
+            &[PathBuf::from("/tmp/project/.helm/values.yaml")],
+            &["apps-stateless.app-1.enabled=true".to_string()],
+            "demo",
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "render".to_string(),
+                "--dir".to_string(),
+                "/tmp/project".to_string(),
+                "--dev".to_string(),
+                "--ignore-secret-key".to_string(),
+                "--loose-giterminism".to_string(),
+                "--values".to_string(),
+                "/tmp/project/.helm/values.yaml".to_string(),
+                "--set".to_string(),
+                "apps-stateless.app-1.enabled=true".to_string(),
+                "--env".to_string(),
+                "demo".to_string(),
+                "--set-string".to_string(),
+                "global.env=demo".to_string(),
+            ]
+        );
+    }
+
 }
