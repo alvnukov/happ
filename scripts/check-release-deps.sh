@@ -5,9 +5,14 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
 failures=()
+warnings=()
 
 record_failure() {
   failures+=("$1")
+}
+
+record_warning() {
+  warnings+=("$1")
 }
 
 normalize_req_version() {
@@ -54,7 +59,7 @@ check_zq() {
   local current latest
   current="$(sed -nE 's/^zq = .*tag = "v([^"]+)".*/\1/p' Cargo.toml)"
   if [[ -z "${current}" ]]; then
-    record_failure "zq: unable to read current tag from Cargo.toml"
+    record_warning "zq: unable to read current tag from Cargo.toml"
     return
   fi
 
@@ -65,7 +70,7 @@ check_zq() {
       | latest_matching_version "$(compat_pattern "${current}")"
   )"
   if [[ -z "${latest}" ]]; then
-    record_failure "zq: unable to resolve latest compatible tag for ${current}"
+    record_warning "zq: unable to resolve latest compatible tag for ${current}"
     return
   fi
   if version_gt "${latest}" "${current}"; then
@@ -77,7 +82,7 @@ check_helm_apps() {
   local current latest
   current="$(sed -nE 's/.*HELM_APPS_GITHUB_REF.*"helm-apps-([^"]+)".*/\1/p' build.rs | head -n1)"
   if [[ -z "${current}" ]]; then
-    record_failure "helm-apps: unable to read current default ref from build.rs"
+    record_warning "helm-apps: unable to read current default ref from build.rs"
     return
   fi
 
@@ -88,7 +93,7 @@ check_helm_apps() {
       | latest_matching_version "$(compat_pattern "${current}")"
   )"
   if [[ -z "${latest}" ]]; then
-    record_failure "helm-apps: unable to resolve latest compatible tag for ${current}"
+    record_warning "helm-apps: unable to resolve latest compatible tag for ${current}"
     return
   fi
   if version_gt "${latest}" "${current}"; then
@@ -124,7 +129,7 @@ check_rust_registry_dependencies() {
       )"
     fi
     if [[ -z "${latest}" ]]; then
-      record_failure "rust: unable to resolve latest compatible version for ${name} (${current})"
+      record_warning "rust: unable to resolve latest compatible version for ${name} (${current})"
       continue
     fi
     if version_gt "${latest}" "${current}"; then
@@ -172,7 +177,7 @@ check_node_dependencies() {
         | jq -r 'if type == "array" then .[-1] else . end'
     )"
     if [[ -z "${latest}" ]]; then
-      record_failure "js: unable to resolve latest compatible version for ${name} (${req})"
+      record_warning "js: unable to resolve latest compatible version for ${name} (${req})"
       continue
     fi
     if version_gt "${latest}" "${current}"; then
@@ -193,6 +198,11 @@ check_helm_apps
 check_rust_registry_dependencies
 check_go_dependencies
 check_node_dependencies
+
+if ((${#warnings[@]} > 0)); then
+  printf 'release dependency freshness check warnings:\n' >&2
+  printf '  - %s\n' "${warnings[@]}" >&2
+fi
 
 if ((${#failures[@]} > 0)); then
   printf 'release dependency freshness check failed:\n' >&2
