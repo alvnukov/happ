@@ -12,6 +12,7 @@ import (
 
 	yamlv3 "go.yaml.in/yaml/v3"
 
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/cli/values"
@@ -20,6 +21,7 @@ import (
 )
 
 type request struct {
+	Mode            string   `json:"mode,omitempty"`
 	ChartPath       string   `json:"chart_path"`
 	ReleaseName     string   `json:"release_name"`
 	Namespace       *string  `json:"namespace"`
@@ -83,19 +85,78 @@ func main() {
 		return
 	}
 
-	docs, diags, err := buildResourceModel(&req)
-	if err != nil {
-		writeError("render", err)
+	switch strings.ToLower(strings.TrimSpace(req.Mode)) {
+	case "raw":
+		rendered, err := buildRenderedManifestStream(&req)
+		if err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+		_, _ = io.WriteString(os.Stdout, rendered)
 		return
+	default:
+		docs, diags, err := buildResourceModel(&req)
+		if err != nil {
+			writeError("render", err)
+			return
+		}
+		writeResponse(response{
+			OK:          true,
+			Documents:   docs,
+			Diagnostics: diags,
+		})
 	}
-	writeResponse(response{
-		OK:          true,
-		Documents:   docs,
-		Diagnostics: diags,
-	})
 }
 
 func buildResourceModel(req *request) ([]document, []diagnostic, error) {
+	ch, rendered, err := renderTemplates(req)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	paths := sortedRenderedPaths(rendered)
+	allDocs := make([]document, 0, len(paths)*2)
+	diags := make([]diagnostic, 0)
+	for _, path := range paths {
+		docs, err := decodeDocumentsFromYAML(rendered[path], path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decode rendered template %s: %w", path, err)
+		}
+		allDocs = append(allDocs, docs...)
+	}
+
+	if req.IncludeCRDs {
+		for _, crd := range ch.CRDObjects() {
+			docs, err := decodeDocumentsFromYAML(string(crd.File.Data), crd.Filename)
+			if err != nil {
+				return nil, nil, fmt.Errorf("decode rendered CRD %s: %w", crd.Filename, err)
+			}
+			allDocs = append(allDocs, docs...)
+		}
+	}
+
+	return allDocs, diags, nil
+}
+
+func buildRenderedManifestStream(req *request) (string, error) {
+	ch, rendered, err := renderTemplates(req)
+	if err != nil {
+		return "", err
+	}
+
+	var out strings.Builder
+	appendRenderedFiles(&out, rendered)
+
+	if req.IncludeCRDs {
+		for _, crd := range ch.CRDObjects() {
+			appendRenderedFile(&out, crd.Filename, string(crd.File.Data))
+		}
+	}
+
+	return out.String(), nil
+}
+
+func renderTemplates(req *request) (*chart.Chart, map[string]string, error) {
 	if strings.TrimSpace(req.ChartPath) == "" {
 		return nil, nil, errors.New("chart path is empty")
 	}
@@ -158,33 +219,34 @@ func buildResourceModel(req *request) ([]document, []diagnostic, error) {
 		return nil, nil, err
 	}
 
+	return ch, rendered, nil
+}
+
+func sortedRenderedPaths(rendered map[string]string) []string {
 	paths := make([]string, 0, len(rendered))
 	for path := range rendered {
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
+	return paths
+}
 
-	allDocs := make([]document, 0, len(paths)*2)
-	diags := make([]diagnostic, 0)
-	for _, path := range paths {
-		docs, err := decodeDocumentsFromYAML(rendered[path], path)
-		if err != nil {
-			return nil, nil, fmt.Errorf("decode rendered template %s: %w", path, err)
-		}
-		allDocs = append(allDocs, docs...)
+func appendRenderedFiles(out *strings.Builder, rendered map[string]string) {
+	for _, path := range sortedRenderedPaths(rendered) {
+		appendRenderedFile(out, path, rendered[path])
 	}
+}
 
-	if req.IncludeCRDs {
-		for _, crd := range ch.CRDObjects() {
-			docs, err := decodeDocumentsFromYAML(string(crd.File.Data), crd.Filename)
-			if err != nil {
-				return nil, nil, fmt.Errorf("decode rendered CRD %s: %w", crd.Filename, err)
-			}
-			allDocs = append(allDocs, docs...)
-		}
+func appendRenderedFile(out *strings.Builder, path, content string) {
+	content = strings.TrimRight(content, "\n")
+	if strings.TrimSpace(content) == "" {
+		return
 	}
-
-	return allDocs, diags, nil
+	out.WriteString("---\n# Source: ")
+	out.WriteString(strings.TrimSpace(path))
+	out.WriteByte('\n')
+	out.WriteString(content)
+	out.WriteByte('\n')
 }
 
 func decodeDocumentsFromYAML(stream string, templateFile string) ([]document, error) {

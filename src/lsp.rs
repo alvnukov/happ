@@ -587,10 +587,7 @@ fn render_entity_manifest_request(
         .uri
         .as_ref()
         .and_then(|value| value.parse::<Uri>().ok());
-    let current_path = params
-        .uri
-        .as_deref()
-        .and_then(file_path_from_uri_string);
+    let current_path = params.uri.as_deref().and_then(file_path_from_uri_string);
     let renderer = ManifestPreviewRenderer::parse(params.renderer.as_deref())?;
     let request_text = resolve_request_text(state, params.uri.as_deref(), params.text.clone())?;
     let context = resolve_entity_context(
@@ -871,7 +868,7 @@ fn render_manifest_for_entity(
         write_rendered_output: None,
     };
 
-    let rendered = crate::source::render_chart(&import_args, &chart_dir_text)
+    let rendered = crate::source::render_chart_raw(&import_args, &chart_dir_text)
         .map_err(|e| format!("render preview manifest: {e}"))?;
     if rendered.trim().is_empty() {
         return Err("render preview manifest returned empty output".to_string());
@@ -1169,7 +1166,10 @@ fn resolve_werf_project_dir(chart_root: &Path) -> PathBuf {
     }
 }
 
-fn resolve_manifest_values_files(chart_root: &Path, current_path: &Path) -> Result<Vec<PathBuf>, String> {
+fn resolve_manifest_values_files(
+    chart_root: &Path,
+    current_path: &Path,
+) -> Result<Vec<PathBuf>, String> {
     let current_path = normalize_fs_path(current_path);
     let root_documents = find_helm_apps_root_documents(chart_root)?;
     let primary_values = find_primary_values_file(chart_root).map(|path| normalize_fs_path(&path));
@@ -1195,7 +1195,10 @@ fn select_manifest_values_files(
 
     if !owner_candidates.is_empty() {
         if let Some(primary) = primary_values {
-            if owner_candidates.iter().any(|candidate| candidate == primary) {
+            if owner_candidates
+                .iter()
+                .any(|candidate| candidate == primary)
+            {
                 return vec![primary.clone()];
             }
         }
@@ -6574,8 +6577,11 @@ default-app:
         let td = TempDir::new().expect("tmp");
         let chart_dir = td.path().join("chart with spaces");
         fs::create_dir_all(&chart_dir).expect("chart dir");
-        fs::write(chart_dir.join("Chart.yaml"), "apiVersion: v2\nname: test\nversion: 0.1.0\n")
-            .expect("chart yaml");
+        fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test\nversion: 0.1.0\n",
+        )
+        .expect("chart yaml");
         fs::write(
             chart_dir.join("values.yaml"),
             r#"
@@ -6604,9 +6610,12 @@ apps-stateless:
         let deployments_path = chart_dir.join("deployments-values.yaml");
         fs::write(&deployments_path, deployments_src).expect("deployments values");
 
-        let uri = format!("file://{}", deployments_path.to_string_lossy().replace(' ', "%20"))
-            .parse::<Uri>()
-            .expect("uri");
+        let uri = format!(
+            "file://{}",
+            deployments_path.to_string_lossy().replace(' ', "%20")
+        )
+        .parse::<Uri>()
+        .expect("uri");
         let diagnostics = build_diagnostics(&uri, deployments_src);
         assert!(diagnostics.iter().all(|d| !d
             .message
@@ -6804,7 +6813,8 @@ apps-stateless:
     }
 
     #[test]
-    fn build_manifest_entity_isolation_set_values_from_resolved_root_disables_only_active_siblings() {
+    fn build_manifest_entity_isolation_set_values_from_resolved_root_disables_only_active_siblings()
+    {
         let resolved_root = json!({
             "global": { "env": "demo" },
             "apps-stateless": {
@@ -6924,5 +6934,4 @@ apps-stateless:
             ]
         );
     }
-
 }

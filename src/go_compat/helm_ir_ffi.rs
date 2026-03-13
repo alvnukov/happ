@@ -37,6 +37,7 @@ static HELM_IR_HELPER_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new(
 
 #[derive(Debug, Serialize)]
 struct HelmIrRequest<'a> {
+    mode: &'a str,
     chart_path: &'a str,
     release_name: &'a str,
     namespace: Option<&'a str>,
@@ -98,8 +99,65 @@ struct HelmIrDiagnostic {
 }
 
 pub fn load_chart_ir_via_helm_goffi(args: &ImportArgs) -> Result<ChartIr, HelmIrFfiError> {
-    let helper = ensure_helper_binary()?;
-    let payload = serde_json::to_vec(&HelmIrRequest {
+    let response = invoke_helper(args, "ir")?;
+    build_chart_ir_from_response(args, response)
+}
+
+pub fn render_chart_raw_via_helm_goffi(args: &ImportArgs) -> Result<String, HelmIrFfiError> {
+    let output = run_helper(&build_request_payload(args, "raw")?)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let reason = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("helper exited with status {}", output.status)
+        };
+        return Err(HelmIrFfiError::Render(reason));
+    }
+    let rendered = String::from_utf8_lossy(&output.stdout).to_string();
+    if rendered.trim().is_empty() {
+        return Err(HelmIrFfiError::Render(
+            "render returned empty output".to_string(),
+        ));
+    }
+    Ok(rendered)
+}
+
+fn invoke_helper(args: &ImportArgs, mode: &'static str) -> Result<HelmIrResponse, HelmIrFfiError> {
+    let payload = build_request_payload(args, mode)?;
+    let output = run_helper(&payload)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let reason = if stderr.is_empty() {
+            format!("helper exited with status {}", output.status)
+        } else {
+            format!("helper exited with status {}: {stderr}", output.status)
+        };
+        return Err(HelmIrFfiError::Unavailable(reason));
+    }
+
+    let response: HelmIrResponse = serde_json::from_slice(&output.stdout).map_err(|err| {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        HelmIrFfiError::Unavailable(format!("invalid helper response: {err}; stdout={stdout}"))
+    })?;
+
+    if !response.ok {
+        let message = normalize_helper_error(&response.error);
+        return Err(match response.kind.as_str() {
+            "decode" => HelmIrFfiError::Decode(message),
+            "render" | "values" | "load" | "" => HelmIrFfiError::Render(message),
+            _ => HelmIrFfiError::Render(message),
+        });
+    }
+    Ok(response)
+}
+
+fn build_request_payload(args: &ImportArgs, mode: &'static str) -> Result<Vec<u8>, HelmIrFfiError> {
+    serde_json::to_vec(&HelmIrRequest {
+        mode,
         chart_path: &args.path,
         release_name: &args.release_name,
         namespace: args.namespace.as_deref(),
@@ -112,7 +170,11 @@ pub fn load_chart_ir_via_helm_goffi(args: &ImportArgs) -> Result<ChartIr, HelmIr
         api_versions: &args.api_versions,
         include_crds: args.include_crds,
     })
-    .map_err(|err| HelmIrFfiError::Unavailable(format!("serialize request: {err}")))?;
+    .map_err(|err| HelmIrFfiError::Unavailable(format!("serialize request: {err}")))
+}
+
+fn run_helper(payload: &[u8]) -> Result<crate::process_guard::ChildOutput, HelmIrFfiError> {
+    let helper = ensure_helper_binary()?;
     if payload.len() > helm_ir_max_request_bytes() {
         return Err(HelmIrFfiError::Unavailable(format!(
             "helm helper request is too large: {} bytes (max {})",
@@ -151,29 +213,13 @@ pub fn load_chart_ir_via_helm_goffi(args: &ImportArgs) -> Result<ChartIr, HelmIr
         helm_ir_max_stderr_bytes(),
     )
     .map_err(map_wait_error)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let reason = if stderr.is_empty() {
-            format!("helper exited with status {}", output.status)
-        } else {
-            format!("helper exited with status {}: {stderr}", output.status)
-        };
-        return Err(HelmIrFfiError::Unavailable(reason));
-    }
+    Ok(output)
+}
 
-    let response: HelmIrResponse = serde_json::from_slice(&output.stdout).map_err(|err| {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        HelmIrFfiError::Unavailable(format!("invalid helper response: {err}; stdout={stdout}"))
-    })?;
-
-    if !response.ok {
-        let message = normalize_helper_error(&response.error);
-        return Err(match response.kind.as_str() {
-            "decode" => HelmIrFfiError::Decode(message),
-            "render" | "values" | "load" | "" => HelmIrFfiError::Render(message),
-            _ => HelmIrFfiError::Render(message),
-        });
-    }
+fn build_chart_ir_from_response(
+    args: &ImportArgs,
+    response: HelmIrResponse,
+) -> Result<ChartIr, HelmIrFfiError> {
     if response.documents.len() > helm_ir_max_documents() {
         return Err(HelmIrFfiError::Decode(format!(
             "helper returned too many documents: {} (max {})",

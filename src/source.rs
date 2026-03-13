@@ -118,6 +118,20 @@ pub fn render_chart(args: &ImportArgs, chart_path: &str) -> Result<String, Error
     Ok(rendered)
 }
 
+pub fn render_chart_raw(args: &ImportArgs, chart_path: &str) -> Result<String, Error> {
+    enforce_chart_source_safety(args)?;
+    let mut render_args = args.clone();
+    render_args.path = chart_path.to_string();
+    crate::go_compat::helm_ir_ffi::render_chart_raw_via_helm_goffi(&render_args).map_err(|err| {
+        let message = match err {
+            crate::go_compat::helm_ir_ffi::HelmIrFfiError::Unavailable(reason)
+            | crate::go_compat::helm_ir_ffi::HelmIrFfiError::Render(reason)
+            | crate::go_compat::helm_ir_ffi::HelmIrFfiError::Decode(reason) => reason,
+        };
+        Error::ChartModel(augment_renderer_error_message(&message))
+    })
+}
+
 fn augment_renderer_error_message(err: &str) -> String {
     let trimmed = err.trim();
     if trimmed.is_empty() {
