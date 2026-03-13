@@ -39,6 +39,19 @@ cargo build --release --locked
 ./target/release/happ --help
 ```
 
+### Development quality checks
+
+```bash
+# formatting check
+cargo fmt-check
+
+# strict safety-oriented lint profile for production targets
+cargo lint
+
+# advisory lint pass for tests
+cargo lint-tests
+```
+
 ## Query commands
 
 `happ jq` and `happ yq` now differ by query language style only.
@@ -232,7 +245,7 @@ cargo test --test parity_cli
 During build, `happ` fetches `helm-apps` chart from GitHub and embeds it into binary.
 
 - default repo: `https://github.com/alvnukov/helm-apps.git`
-- default ref: `helm-apps-1.8.4`
+- default ref: `helm-apps-1.8.6`
 - override repo: `HELM_APPS_GITHUB_REPO`
 - override ref: `HELM_APPS_GITHUB_REF`
 - force local chart path: `HELM_APPS_CHART_PATH=/abs/path/to/charts/helm-apps`
