@@ -57,7 +57,7 @@ jobs:
       - name: Setup Go toolchain
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.25.7"
+          go-version: "1.25.8"
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@dd677812177e0c29f9c970a6c58d8607ae1bfefd
@@ -86,7 +86,7 @@ jobs:
       - name: Setup Go toolchain
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.25.7"
+          go-version: "1.25.8"
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@dd677812177e0c29f9c970a6c58d8607ae1bfefd

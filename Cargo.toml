@@ -28,6 +28,7 @@ zstd = "0.13.3"
 toml = "0.8.23"
 csv = "1.4.0"
 sha2 = "0.10.9"
+url = "2.5.8"
 
 [build-dependencies]
 zstd = "0.13.3"
