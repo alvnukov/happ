@@ -12,7 +12,7 @@
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.11.0",
-    "@codemirror/commands": "^6.8.1",
+    "@codemirror/commands": "^6.10.3",
     "@codemirror/lang-json": "^6.0.2",
     "@codemirror/lang-xml": "^6.1.0",
     "@codemirror/lang-yaml": "^6.1.2",
