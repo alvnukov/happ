@@ -109,6 +109,17 @@ check_rust_registry_dependencies() {
         | awk '/^version:/ {print $2; exit}'
     )"
     if [[ -z "${latest}" ]]; then
+      latest="$(
+        curl -fsSL --retry 2 --retry-delay 1 "https://crates.io/api/v1/crates/${name}" 2>/dev/null \
+          | jq -r '.versions[] | select(.yanked | not) | .num' \
+          | while read -r version; do
+              [[ "$(compat_key "${version}")" == "${lane}" ]] && printf '%s\n' "${version}"
+            done \
+          | sort -V \
+          | tail -n1
+      )"
+    fi
+    if [[ -z "${latest}" ]]; then
       record_failure "rust: unable to resolve latest compatible version for ${name} (${current})"
       continue
     fi
