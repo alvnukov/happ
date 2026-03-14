@@ -602,6 +602,12 @@ fn render_entity_manifest_request(
     )?;
     let parsed_source_root = parse_source_values_root(request_uri.as_ref(), &request_text)
         .ok_or_else(|| "failed to parse values root for manifest preview".to_string())?;
+    let fast_source_root = if renderer == ManifestPreviewRenderer::Fast {
+        Some(build_fast_manifest_source_root(&parsed_source_root)?)
+    } else {
+        None
+    };
+    let parsed_source_root_json = JsonValue::Object(parsed_source_root.root_map.clone());
     let chart_root = parsed_source_root
         .chart_root
         .ok_or_else(|| "chart root not found for manifest preview".to_string())?;
@@ -610,7 +616,9 @@ fn render_entity_manifest_request(
         current_path.as_deref(),
         &params.group,
         &params.app,
-        &JsonValue::Object(parsed_source_root.root_map),
+        fast_source_root
+            .as_ref()
+            .unwrap_or(&parsed_source_root_json),
         &context.root,
         &context.used_env,
         renderer,
@@ -827,17 +835,15 @@ fn render_manifest_for_entity(
 
     let values_json =
         build_manifest_render_values_root(source_root, resolved_root, group, app, env)?;
-    let values_yaml = json_to_yaml_value(&values_json)
-        .map_err(|e| format!("build values yaml for preview: {e}"))?;
     let temp_dir = tempfile::Builder::new()
         .prefix("happ-lsp-preview-values-")
         .tempdir()
         .map_err(|e| format!("create temp dir for preview values: {e}"))?;
-    let values_path = temp_dir.path().join("values.preview.yaml");
-    let values_text = crate::output::values_yaml(&values_yaml)
-        .map_err(|e| format!("encode preview values yaml: {e}"))?;
+    let values_path = temp_dir.path().join("values.preview.json");
+    let values_text = serde_json::to_string_pretty(&values_json)
+        .map_err(|e| format!("encode preview values json: {e}"))?;
     std::fs::write(&values_path, values_text.as_bytes())
-        .map_err(|e| format!("write preview values yaml: {e}"))?;
+        .map_err(|e| format!("write preview values json: {e}"))?;
     let chart_dir_text = chart_root.to_string_lossy().to_string();
 
     let import_args = crate::cli::ImportArgs {
@@ -957,6 +963,7 @@ fn build_manifest_render_values_root(
     let root = values
         .as_object_mut()
         .ok_or_else(|| "manifest preview values root must be a YAML map".to_string())?;
+    ensure_global_includes_map(root);
 
     let global = root
         .entry("global".to_string())
@@ -970,7 +977,6 @@ fn build_manifest_render_values_root(
 
     let resolved_groups = as_obj(resolved_root)
         .ok_or_else(|| "resolved manifest preview values root must be a YAML map".to_string())?;
-    let mut resolved_target_entity: Option<JsonValue> = None;
     for (group_name, group_value) in resolved_groups {
         if group_name == "global" {
             continue;
@@ -983,7 +989,6 @@ fn build_manifest_render_values_root(
                 continue;
             }
             if group_name == group && app_name == app {
-                resolved_target_entity = Some(app_value.clone());
                 continue;
             }
             if entity_enabled_in_resolved_root(app_value) {
@@ -992,20 +997,145 @@ fn build_manifest_render_values_root(
         }
     }
 
-    if !upsert_entity_enabled_flag(
-        &mut values,
-        group,
-        app,
-        true,
-        resolved_target_entity.as_ref(),
-    ) {
+    if !upsert_entity_enabled_flag(&mut values, group, app, true, None) {
         return Err(format!(
             "unable to isolate entity {}.{} for manifest render",
             group, app
         ));
     }
 
+    ensure_fast_preview_werf_context(&mut values, env);
+
     Ok(values)
+}
+
+fn materialize_root_level_include_profiles(source_root: &JsonValue) -> JsonValue {
+    let Some(root_map) = as_obj(source_root).cloned() else {
+        return source_root.clone();
+    };
+    let Some(includes_map) = root_map
+        .get("global")
+        .and_then(as_obj)
+        .and_then(|global| global.get("_includes"))
+        .and_then(as_obj)
+    else {
+        return source_root.clone();
+    };
+
+    let include_names = normalize_include(root_map.get("_include"));
+    if include_names.is_empty() {
+        return source_root.clone();
+    }
+
+    let mut merged: JsonMap<String, JsonValue> = JsonMap::new();
+    let mut cache: HashMap<String, JsonMap<String, JsonValue>> = HashMap::new();
+    for include_name in include_names {
+        if let Ok(profile) = resolve_profile(&include_name, includes_map, &mut cache, &mut Vec::new())
+        {
+            merged = merge_maps(&merged, &profile);
+        }
+    }
+
+    let mut current = root_map;
+    current = merge_maps(&merged, &current);
+    current.remove("_include");
+    JsonValue::Object(current)
+}
+
+fn build_fast_manifest_source_root(parsed: &ParsedSourceValuesRoot) -> Result<JsonValue, String> {
+    let assembled = assemble_root_level_values_layers(
+        &parsed.root_map,
+        parsed.include_base_dir.as_deref(),
+        &parsed.overrides,
+    )?;
+    Ok(materialize_root_level_include_profiles(&JsonValue::Object(
+        assembled,
+    )))
+}
+
+fn assemble_root_level_values_layers(
+    source_root: &JsonMap<String, JsonValue>,
+    include_base_dir: Option<&Path>,
+    overrides: &HashMap<PathBuf, String>,
+) -> Result<JsonMap<String, JsonValue>, String> {
+    let mut root = source_root.clone();
+
+    if let Some(global) = root.get_mut("global").and_then(JsonValue::as_object_mut) {
+        if let Some(includes) = global.get_mut("_includes").and_then(JsonValue::as_object_mut) {
+            let include_from_file = includes
+                .get("_include_from_file")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            if let Some(raw_path) = include_from_file {
+                if let Some((_loaded_path, loaded_map)) =
+                    load_yaml_map_from_file(&raw_path, include_base_dir, overrides, &mut HashSet::new())?
+                {
+                    let normalized = normalize_global_includes_payload(&loaded_map);
+                    let merged = merge_maps(&normalized, includes);
+                    *includes = merged;
+                }
+                includes.remove("_include_from_file");
+            }
+        }
+    }
+
+    let include_from_file = root
+        .get("_include_from_file")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    if let Some(raw_path) = include_from_file {
+        if let Some((_loaded_path, loaded_map)) =
+            load_yaml_map_from_file(&raw_path, include_base_dir, overrides, &mut HashSet::new())?
+        {
+            root = merge_maps(&loaded_map, &root);
+        }
+        root.remove("_include_from_file");
+    }
+
+    let root_include_files = normalize_include_files(root.get("_include_files"));
+    if !root_include_files.is_empty() {
+        let mut merged_layers: JsonMap<String, JsonValue> = JsonMap::new();
+        for raw_path_value in root_include_files {
+            let raw_path = raw_path_value.trim();
+            if raw_path.is_empty() {
+                continue;
+            }
+            if let Some((_loaded_path, loaded_map)) =
+                load_yaml_map_from_file(raw_path, include_base_dir, overrides, &mut HashSet::new())?
+            {
+                merged_layers = merge_maps(&merged_layers, &loaded_map);
+            }
+        }
+        root = merge_maps(&merged_layers, &root);
+        root.remove("_include_files");
+    }
+
+    Ok(root)
+}
+
+fn ensure_fast_preview_werf_context(values: &mut JsonValue, env: &str) {
+    let Some(root) = values.as_object_mut() else {
+        return;
+    };
+    let werf = root
+        .entry("werf".to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    if !werf.is_object() {
+        *werf = JsonValue::Object(JsonMap::new());
+    }
+    let Some(werf_obj) = werf.as_object_mut() else {
+        return;
+    };
+    if !env.trim().is_empty() {
+        werf_obj.insert("env".to_string(), JsonValue::String(env.to_string()));
+    }
+    werf_obj
+        .entry("repo".to_string())
+        .or_insert_with(|| JsonValue::String(String::new()));
 }
 
 fn build_manifest_entity_isolation_set_values_from_resolved_root(
@@ -1480,10 +1610,27 @@ fn build_manifest_preview_values_with_root(
     let required_keys = required_preview_global_keys(entity);
     let global_map = build_preview_global_map(global, env, &required_keys);
     let required_root_keys = required_preview_root_keys(entity);
-    let mut out = build_preview_values_tree(group, app, entity, global_map);
-    inject_preview_root_keys(&mut out, root, &required_root_keys, group, app, entity);
+    let preview_entity = force_entity_enabled_for_preview(entity);
+    let mut out = build_preview_values_tree(group, app, &preview_entity, global_map);
+    inject_preview_root_keys(
+        &mut out,
+        root,
+        &required_root_keys,
+        group,
+        app,
+        &preview_entity,
+    );
     normalize_include_fields_for_render(&mut out);
     out
+}
+
+fn force_entity_enabled_for_preview(entity: &JsonValue) -> JsonValue {
+    let Some(entity_map) = entity.as_object() else {
+        return entity.clone();
+    };
+    let mut next = entity_map.clone();
+    next.insert("enabled".to_string(), JsonValue::Bool(true));
+    JsonValue::Object(next)
 }
 
 fn required_preview_global_keys(entity: &JsonValue) -> BTreeSet<String> {
@@ -1781,12 +1928,12 @@ fn build_diagnostics(uri: &Uri, text: &str) -> Vec<Diagnostic> {
         ));
     }
 
-    let base_dir = uri_to_base_dir(uri);
+    let include_base_dirs = include_base_dirs_for_diagnostics(uri);
     for file_ref in include_file_refs {
         if is_templated_include_path(&file_ref.path) {
             continue;
         }
-        let candidates = build_include_candidates(&file_ref.path, base_dir.as_deref());
+        let candidates = build_include_candidates_for_diagnostics(&file_ref.path, &include_base_dirs);
         let found = candidates.iter().any(|candidate| candidate.exists());
         if found {
             continue;
@@ -4399,9 +4546,48 @@ fn is_templated_include_path(path_value: &str) -> bool {
     path_value.contains("{{") || path_value.contains("}}")
 }
 
-fn uri_to_base_dir(uri: &Uri) -> Option<PathBuf> {
-    let uri_str = uri.to_string();
-    file_path_from_uri_string(&uri_str).and_then(|p| p.parent().map(Path::to_path_buf))
+fn include_base_dirs_for_diagnostics(uri: &Uri) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(current_path) = file_path_from_uri_string(&uri.to_string()) else {
+        return out;
+    };
+
+    if let Some(chart_root) = find_chart_root_from_path(&current_path) {
+        if let Some(root_values_path) = find_primary_values_file(&chart_root) {
+            if let Some(root_base_dir) = root_values_path.parent() {
+                push_unique_path(&mut out, root_base_dir);
+            }
+        }
+    }
+    if let Some(current_base_dir) = current_path.parent() {
+        push_unique_path(&mut out, current_base_dir);
+    }
+
+    out
+}
+
+fn build_include_candidates_for_diagnostics(raw_path: &str, base_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let trimmed = raw_path.trim();
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        return vec![p.to_path_buf()];
+    }
+    if base_dirs.is_empty() {
+        return vec![p.to_path_buf()];
+    }
+    let mut out = Vec::new();
+    for base_dir in base_dirs {
+        push_unique_path(&mut out, &base_dir.join(p));
+    }
+    out
+}
+
+fn push_unique_path(out: &mut Vec<PathBuf>, candidate: &Path) {
+    let normalized = normalize_fs_path(candidate);
+    if out.iter().any(|existing| normalize_fs_path(existing) == normalized) {
+        return;
+    }
+    out.push(normalized);
 }
 
 fn file_path_from_uri_string(uri: &str) -> Option<PathBuf> {
@@ -5227,6 +5413,61 @@ apps-stateless:
     }
 
     #[test]
+    fn manifest_preview_values_force_selected_entity_enabled() {
+        let entity = json!({
+            "enabled": false,
+            "image": { "name": "nginx" }
+        });
+        let root = json!({
+            "global": {
+                "validation": {
+                    "allowNativeListsInBuiltInListFields": true
+                }
+            },
+            "apps-stateless": {
+                "target": {
+                    "enabled": false,
+                    "image": { "name": "nginx" }
+                },
+                "other": {
+                    "enabled": true
+                }
+            }
+        });
+        let global = root.get("global").cloned().expect("global");
+        let values = build_manifest_preview_values_with_root(
+            "apps-stateless",
+            "target",
+            &entity,
+            &global,
+            &root,
+            true,
+            "demo",
+        );
+
+        assert_eq!(
+            values
+                .get("apps-stateless")
+                .and_then(as_obj)
+                .and_then(|group| group.get("target"))
+                .and_then(as_obj)
+                .and_then(|app| app.get("enabled"))
+                .and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            values
+                .get("apps-stateless")
+                .and_then(as_obj)
+                .and_then(|group| group.get("other"))
+                .and_then(as_obj)
+                .and_then(|app| app.get("enabled"))
+                .and_then(JsonValue::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn parse_key_and_include_list_tokens_validate_shape() {
         assert_eq!(
             parse_key_line("  good-key_1: value"),
@@ -5343,7 +5584,7 @@ apps-stateless:
     _include:
       - base
 "#;
-        let uri = format!("file://{}", values_path.to_string_lossy())
+        let uri = format!("file:///{}", values_path.to_string_lossy())
             .parse::<Uri>()
             .expect("uri");
         let diagnostics = build_diagnostics(&uri, src);
@@ -6623,6 +6864,94 @@ apps-stateless:
     }
 
     #[test]
+    fn diagnostics_do_not_report_existing_nested_include_file_inside_chart_with_spaces() {
+        let td = TempDir::new().expect("tmp");
+        let chart_dir = td.path().join("chart with spaces");
+        fs::create_dir_all(chart_dir.join("configs/rms-file-service")).expect("config dir");
+        fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test\nversion: 0.1.0\n",
+        )
+        .expect("chart yaml");
+        fs::write(
+            chart_dir.join("configs/rms-file-service/application.yaml"),
+            "spring:\n  application:\n    name: rms-file-service\n",
+        )
+        .expect("config file");
+        let deployments_src = r#"
+apps-stateless:
+  file-service:
+    containers:
+      main:
+        configFilesYAML:
+          application.yaml:
+            content:
+              _include_files:
+                - configs/rms-file-service/application.yaml
+"#;
+        let deployments_path = chart_dir.join("deployments-values.yaml");
+        fs::write(&deployments_path, deployments_src).expect("deployments values");
+
+        let uri = format!(
+            "file://{}",
+            deployments_path.to_string_lossy().replace(' ', "%20")
+        )
+        .parse::<Uri>()
+        .expect("uri");
+        let diagnostics = build_diagnostics(&uri, deployments_src);
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Include file not found: configs/rms-file-service/application.yaml")));
+    }
+
+    #[test]
+    fn diagnostics_resolve_include_files_relative_to_root_values_base_for_nested_values_docs() {
+        let td = TempDir::new().expect("tmp");
+        let chart_dir = td.path().join("chart with spaces");
+        fs::create_dir_all(chart_dir.join("nested")).expect("nested dir");
+        fs::create_dir_all(chart_dir.join("configs/rms-file-service")).expect("config dir");
+        fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test\nversion: 0.1.0\n",
+        )
+        .expect("chart yaml");
+        fs::write(
+            chart_dir.join("values.yaml"),
+            "global: {}\n_include_files:\n  - nested/deployments-values.yaml\n",
+        )
+        .expect("root values");
+        fs::write(
+            chart_dir.join("configs/rms-file-service/application.yaml"),
+            "spring:\n  application:\n    name: rms-file-service\n",
+        )
+        .expect("config file");
+        let deployments_src = r#"
+apps-stateless:
+  file-service:
+    containers:
+      main:
+        configFilesYAML:
+          application.yaml:
+            content:
+              _include_files:
+                - configs/rms-file-service/application.yaml
+"#;
+        let deployments_path = chart_dir.join("nested/deployments-values.yaml");
+        fs::write(&deployments_path, deployments_src).expect("deployments values");
+
+        let uri = format!(
+            "file://{}",
+            deployments_path.to_string_lossy().replace(' ', "%20")
+        )
+        .parse::<Uri>()
+        .expect("uri");
+        let diagnostics = build_diagnostics(&uri, deployments_src);
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Include file not found: configs/rms-file-service/application.yaml")));
+    }
+
+    #[test]
     fn render_entity_manifest_request_uses_real_chart_files_and_disables_other_enabled_apps() {
         let td = TempDir::new().expect("tmp");
         let chart_dir = td.path().join("chart");
@@ -6682,6 +7011,7 @@ apps-stateless:
                 env: Some("demo".to_string()),
                 apply_includes: Some(true),
                 apply_env_resolution: Some(true),
+                renderer: Some("fast".to_string()),
             },
         )
         .expect("render manifest");
@@ -6745,6 +7075,7 @@ apps-stateless:
                 env: Some("demo".to_string()),
                 apply_includes: Some(true),
                 apply_env_resolution: Some(true),
+                renderer: Some("fast".to_string()),
             },
         )
         .expect("render manifest");
@@ -6754,7 +7085,148 @@ apps-stateless:
     }
 
     #[test]
-    fn build_manifest_render_values_root_injects_target_entity_if_missing_in_source_root() {
+    fn render_entity_manifest_request_renders_entity_defined_in_root_include_files() {
+        let td = TempDir::new().expect("tmp");
+        let chart_dir = td.path().join("chart");
+        fs::create_dir_all(chart_dir.join("templates")).expect("mkdir templates");
+        fs::create_dir_all(chart_dir.join("charts")).expect("mkdir charts");
+        fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\ndependencies:\n- name: helm-apps\n  version: 0.1.0\n  repository: file://charts/helm-apps\n",
+        )
+        .expect("write chart");
+        fs::write(
+            chart_dir.join("templates/init-helm-apps-library.yaml"),
+            "{{- include \"apps-utils.init-library\" $ }}\n",
+        )
+        .expect("write init tpl");
+        crate::assets::extract_helm_apps_chart(&chart_dir.join("charts/helm-apps"))
+            .expect("extract embedded library");
+        fs::write(
+            chart_dir.join("helm-apps-defaults.yaml"),
+            r#"
+global:
+  _includes:
+    java-backend-app:
+      containers:
+        main:
+          image:
+            name: nginx
+            staticTag: latest
+"#,
+        )
+        .expect("write defaults");
+        let root_values = r#"
+global:
+  env: demo
+  _includes:
+    _include_from_file: helm-apps-defaults.yaml
+_include_files:
+  - deployments-values.yaml
+"#;
+        let deployments_values = r#"
+apps-stateless:
+  flight-service:
+    enabled: true
+    _include: ["java-backend-app"]
+"#;
+        let values_path = chart_dir.join("values.yaml");
+        let deployments_path = chart_dir.join("deployments-values.yaml");
+        fs::write(&values_path, root_values).expect("write root values");
+        fs::write(&deployments_path, deployments_values).expect("write deployments values");
+
+        let result = render_entity_manifest_request(
+            &ServerState::default(),
+            RenderEntityManifestParams {
+                uri: Some(format!("file://{}", deployments_path.to_string_lossy())),
+                text: Some(deployments_values.to_string()),
+                group: "apps-stateless".to_string(),
+                app: "flight-service".to_string(),
+                env: Some("demo".to_string()),
+                apply_includes: Some(true),
+                apply_env_resolution: Some(true),
+                renderer: Some("fast".to_string()),
+            },
+        )
+        .expect("render manifest");
+
+        assert!(result.manifest.contains("nginx:latest"));
+        assert!(!result.manifest.contains("index of untyped nil"));
+    }
+
+    #[test]
+    fn render_entity_manifest_request_renders_cross_file_include_chain() {
+        let td = TempDir::new().expect("tmp");
+        let chart_dir = td.path().join("chart");
+        fs::create_dir_all(chart_dir.join("templates")).expect("mkdir templates");
+        fs::create_dir_all(chart_dir.join("charts")).expect("mkdir charts");
+        fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\ndependencies:\n- name: helm-apps\n  version: 0.1.0\n  repository: file://charts/helm-apps\n",
+        )
+        .expect("write chart");
+        fs::write(
+            chart_dir.join("templates/init-helm-apps-library.yaml"),
+            "{{- include \"apps-utils.init-library\" $ }}\n",
+        )
+        .expect("write init tpl");
+        crate::assets::extract_helm_apps_chart(&chart_dir.join("charts/helm-apps"))
+            .expect("extract embedded library");
+        let root_values = r#"
+global:
+  env: demo
+  _includes:
+    default-app:
+      replicas: 1
+    default-container:
+      image:
+        name: nginx
+        staticTag: latest
+_include_files:
+  - deployments-values.yaml
+"#;
+        let deployments_values = r#"
+global:
+  _includes:
+    java-backend-app:
+      _include:
+        - default-app
+      containers:
+        main:
+          _include:
+            - default-container
+
+apps-stateless:
+  flight-service:
+    enabled: true
+    _include: ["java-backend-app"]
+"#;
+        let values_path = chart_dir.join("values.yaml");
+        let deployments_path = chart_dir.join("deployments-values.yaml");
+        fs::write(&values_path, root_values).expect("write root values");
+        fs::write(&deployments_path, deployments_values).expect("write deployments values");
+
+        let result = render_entity_manifest_request(
+            &ServerState::default(),
+            RenderEntityManifestParams {
+                uri: Some(format!("file://{}", deployments_path.to_string_lossy())),
+                text: Some(deployments_values.to_string()),
+                group: "apps-stateless".to_string(),
+                app: "flight-service".to_string(),
+                env: Some("demo".to_string()),
+                apply_includes: Some(true),
+                apply_env_resolution: Some(true),
+                renderer: Some("fast".to_string()),
+            },
+        )
+        .expect("render manifest");
+
+        assert!(result.manifest.contains("nginx:latest"));
+        assert!(!result.manifest.contains("index of untyped nil"));
+    }
+
+    #[test]
+    fn build_manifest_render_values_root_seeds_only_enabled_flag_for_missing_target_entity() {
         let source_root = json!({
             "global": { "env": "dev" },
             "apps-cronjobs": {
@@ -6798,9 +7270,8 @@ apps-stateless:
             out_group
                 .get("aodb-update-master-data-2")
                 .and_then(as_obj)
-                .and_then(|app| app.get("schedule"))
-                .and_then(JsonValue::as_str),
-            Some("0 0 * * *")
+                .map(|app| app.contains_key("schedule")),
+            Some(false)
         );
         assert_eq!(
             out_group
@@ -6809,6 +7280,70 @@ apps-stateless:
                 .and_then(|app| app.get("enabled"))
                 .and_then(JsonValue::as_bool),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn build_fast_manifest_source_root_materializes_root_include_profiles() {
+        let source_root = json!({
+            "global": {
+                "env": "dev",
+                "_includes": {
+                    "deployments-values": {
+                        "apps-stateless": {
+                            "flight-service": {
+                                "_include": ["java-backend-app"],
+                                "containers": {
+                                    "main": {
+                                        "envVars": {
+                                            "SPRING_CONFIG_LOCATION": "/config/application.yaml"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "_include": ["deployments-values"],
+            "apps-stateless": {
+                "other": { "enabled": true }
+            }
+        });
+        let parsed = ParsedSourceValuesRoot {
+            root_map: source_root.as_object().cloned().expect("root map"),
+            chart_root: None,
+            include_base_dir: None,
+            overrides: HashMap::new(),
+        };
+
+        let out = build_fast_manifest_source_root(&parsed).expect("build fast manifest source");
+
+        let out_root = as_obj(&out).expect("root map");
+        let out_group = out_root
+            .get("apps-stateless")
+            .and_then(as_obj)
+            .expect("apps-stateless group");
+        let target = out_group
+            .get("flight-service")
+            .and_then(as_obj)
+            .expect("flight-service app");
+        assert!(
+            target
+                .get("containers")
+                .and_then(as_obj)
+                .and_then(|containers| containers.get("main"))
+                .and_then(as_obj)
+                .and_then(|main| main.get("envVars"))
+                .is_some()
+        );
+        assert_eq!(
+            out_group
+                .get("other")
+                .and_then(as_obj)
+                .and_then(|app| app.get("enabled"))
+                .and_then(JsonValue::as_bool),
+            Some(true)
         );
     }
 

@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_HELM_IR_TIMEOUT_MS: u64 = 120_000;
 const HELM_IR_POLL_INTERVAL_MS: u64 = 10;
@@ -339,14 +339,32 @@ fn extract_embedded_helper_binary() -> Result<PathBuf, String> {
     }
     let helper_bin = decode_embedded_helper_binary()
         .map_err(|err| format!("decode embedded helm goffi helper (zstd): {err}"))?;
-    fs::write(&bin_path, helper_bin).map_err(|err| {
+    let temp_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = cache_dir.join(format!(
+        "{}.{}.{}.tmp",
+        helper_binary_name(),
+        std::process::id(),
+        temp_suffix
+    ));
+    fs::write(&temp_path, helper_bin).map_err(|err| {
         format!(
             "write embedded helm goffi helper {}: {err}",
+            temp_path.display()
+        )
+    })?;
+    set_executable_permissions_if_needed(&temp_path)
+        .map_err(|err| format!("set executable permissions {}: {err}", temp_path.display()))?;
+    fs::rename(&temp_path, &bin_path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "move embedded helm goffi helper {} -> {}: {err}",
+            temp_path.display(),
             bin_path.display()
         )
     })?;
-    set_executable_permissions_if_needed(&bin_path)
-        .map_err(|err| format!("set executable permissions {}: {err}", bin_path.display()))?;
     let _ = fs::write(stamp_path, stamp_payload);
     Ok(bin_path)
 }
