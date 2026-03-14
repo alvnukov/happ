@@ -3566,12 +3566,14 @@ fn block_scalar_content_lines(lines: &[&str]) -> Vec<bool> {
     let mut blocked = vec![false; lines.len()];
     let mut i = 0usize;
     while i < lines.len() {
-        let line = lines[i];
-        let Some(header_indent) = line_starts_block_scalar(line) else {
+        let Some((header_indent, header_line)) = block_scalar_header(lines, i) else {
             i += 1;
             continue;
         };
-        let mut j = i + 1;
+        if header_line > i {
+            blocked[header_line] = true;
+        }
+        let mut j = header_line + 1;
         while j < lines.len() {
             let current = lines[j];
             let trimmed = current.trim();
@@ -3592,7 +3594,23 @@ fn block_scalar_content_lines(lines: &[&str]) -> Vec<bool> {
     blocked
 }
 
-fn line_starts_block_scalar(line: &str) -> Option<usize> {
+fn block_scalar_header(lines: &[&str], index: usize) -> Option<(usize, usize)> {
+    let line = *lines.get(index)?;
+    if let Some(indent) = line_starts_inline_block_scalar(line) {
+        return Some((indent, index));
+    }
+    let (indent, _key, value) = parse_key_line(line)?;
+    if !value.trim().is_empty() {
+        return None;
+    }
+    let next_line = *lines.get(index + 1)?;
+    if count_indent(next_line) <= indent || !line_is_standalone_block_scalar_header(next_line) {
+        return None;
+    }
+    Some((indent, index + 1))
+}
+
+fn line_starts_inline_block_scalar(line: &str) -> Option<usize> {
     let indent = count_indent(line);
     let rest = line.get(indent..)?.trim();
     if rest.is_empty() || rest.starts_with('#') {
@@ -3614,6 +3632,23 @@ fn line_starts_block_scalar(line: &str) -> Option<usize> {
         return Some(indent);
     }
     None
+}
+
+fn line_is_standalone_block_scalar_header(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    let mut tokens = trimmed.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let marker = if first.starts_with('&') || first.starts_with('!') {
+        tokens.next().unwrap_or("")
+    } else {
+        first
+    };
+    marker.starts_with('|') || marker.starts_with('>')
 }
 
 fn unquote(value: &str) -> String {
@@ -3642,18 +3677,14 @@ fn uri_to_base_dir(uri: &Uri) -> Option<PathBuf> {
 }
 
 fn file_path_from_uri_string(uri: &str) -> Option<PathBuf> {
-    if !uri.starts_with("file://") {
+    if uri == "file://" {
         return None;
     }
-    let raw = uri.trim_start_matches("file://");
-    if raw.is_empty() {
+    let parsed = url::Url::parse(uri).ok()?;
+    if parsed.scheme() != "file" {
         return None;
     }
-    if cfg!(windows) {
-        Some(PathBuf::from(raw.trim_start_matches('/')))
-    } else {
-        Some(PathBuf::from(raw))
-    }
+    parsed.to_file_path().ok()
 }
 
 fn build_include_candidates(raw_path: &str, base_dir: Option<&Path>) -> Vec<PathBuf> {
@@ -4465,6 +4496,27 @@ apps-stateless:
     }
 
     #[test]
+    fn block_scalar_content_mask_detects_standalone_pipe_header() {
+        let lines = vec![
+            "root:",
+            "  ports:",
+            "    dev:",
+            "      |",
+            "        - a",
+            "        - b",
+            "    after: ok",
+        ];
+        let blocked = block_scalar_content_lines(&lines);
+        assert!(!blocked[0]);
+        assert!(!blocked[1]);
+        assert!(!blocked[2]);
+        assert!(blocked[3]);
+        assert!(blocked[4]);
+        assert!(blocked[5]);
+        assert!(!blocked[6]);
+    }
+
+    #[test]
     fn diagnostics_ignore_include_lookalikes_inside_block_scalar() {
         let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
         let src = r#"
@@ -4556,6 +4608,45 @@ apps-stateless:
                 .iter()
                 .all(|d| !d.message.contains("name: http")),
             "block scalar list items must not be treated as include files"
+        );
+    }
+
+    #[test]
+    fn diagnostics_do_not_treat_standalone_block_scalar_lists_as_include_files() {
+        let td = TempDir::new().expect("tmp");
+        let values_path = td.path().join("values.yaml");
+        fs::write(&values_path, "global: {}\n").expect("write values");
+
+        let src = r#"
+apps-stateless:
+  app-1:
+    ports:
+      _default:
+        |
+          - containerPort: 8080
+            name: http
+      dev:
+        |
+          - containerPort: 8080
+            name: althttp
+          - containerPort: 5000
+            name: debugport
+"#;
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("containerPort")),
+            "standalone block scalar list items must not be treated as include files"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("name: debugport")),
+            "standalone block scalar list items must not be treated as include files"
         );
     }
 
@@ -5678,6 +5769,10 @@ default-app:
     fn uri_and_candidate_helpers_handle_relative_and_absolute_paths() {
         assert!(file_path_from_uri_string("https://example.org/a.yaml").is_none());
         assert!(file_path_from_uri_string("file://").is_none());
+        assert_eq!(
+            file_path_from_uri_string("file:///tmp/happ-workspace%202/values.yaml"),
+            Some(PathBuf::from("/tmp/happ-workspace 2/values.yaml"))
+        );
 
         let base = Path::new("/tmp/happ-tests");
         let rel = build_include_candidates("profiles/base.yaml", Some(base));
@@ -5685,5 +5780,49 @@ default-app:
 
         let abs = build_include_candidates("/etc/hosts", Some(base));
         assert_eq!(abs, vec![Path::new("/etc/hosts").to_path_buf()]);
+    }
+
+    #[test]
+    fn diagnostics_resolve_root_include_from_file_for_open_include_file_inside_path_with_spaces() {
+        let td = TempDir::new().expect("tmp");
+        let chart_dir = td.path().join("chart with spaces");
+        fs::create_dir_all(&chart_dir).expect("chart dir");
+        fs::write(chart_dir.join("Chart.yaml"), "apiVersion: v2\nname: test\nversion: 0.1.0\n")
+            .expect("chart yaml");
+        fs::write(
+            chart_dir.join("values.yaml"),
+            r#"
+global:
+  _includes:
+    _include_from_file: defaults.yaml
+_include_files:
+  - deployments-values.yaml
+"#,
+        )
+        .expect("root values");
+        fs::write(
+            chart_dir.join("defaults.yaml"),
+            r#"
+helm-apps-defaults:
+  enabled: false
+"#,
+        )
+        .expect("defaults");
+        let deployments_src = r#"
+apps-stateless:
+  api-gateway:
+    _include:
+      - helm-apps-defaults
+"#;
+        let deployments_path = chart_dir.join("deployments-values.yaml");
+        fs::write(&deployments_path, deployments_src).expect("deployments values");
+
+        let uri = format!("file://{}", deployments_path.to_string_lossy().replace(' ', "%20"))
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, deployments_src);
+        assert!(diagnostics.iter().all(|d| !d
+            .message
+            .contains("Unresolved include profile: helm-apps-defaults")));
     }
 }

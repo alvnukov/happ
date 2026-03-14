@@ -52,6 +52,8 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Chart(ImportArgs),
+    #[command(about = "Read or extract the embedded helm-apps library chart")]
+    Library(LibraryArgs),
     #[command(about = "Batch-convert chart directory into library-format charts")]
     Batch(BatchArgs),
     Manifests(ImportArgs),
@@ -148,6 +150,26 @@ pub struct CompletionArgs {
     pub output: Option<String>,
 }
 
+#[derive(clap::Args, Debug, Clone)]
+pub struct LibraryArgs {
+    #[command(subcommand)]
+    pub command: LibraryCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum LibraryCommand {
+    #[command(about = "Print embedded helm-apps chart version")]
+    Version,
+    #[command(about = "Extract embedded helm-apps chart into directory")]
+    Extract(LibraryExtractArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct LibraryExtractArgs {
+    #[arg(long = "out-dir", help = "Destination directory for embedded helm-apps chart")]
+    pub out_dir: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +245,39 @@ mod tests {
                 assert_eq!(args.shell_flag.as_deref(), None);
                 assert_eq!(args.output, None);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_library_version_subcommand() {
+        let cli = Cli::try_parse_from(["happ", "library", "version"]).expect("parse library version");
+        match cli.command.expect("command") {
+            Command::Library(args) => match args.command {
+                LibraryCommand::Version => {}
+                other => panic!("unexpected library command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_library_extract_subcommand() {
+        let cli = Cli::try_parse_from([
+            "happ",
+            "library",
+            "extract",
+            "--out-dir",
+            "/tmp/helm-apps",
+        ])
+        .expect("parse library extract");
+        match cli.command.expect("command") {
+            Command::Library(args) => match args.command {
+                LibraryCommand::Extract(extract) => {
+                    assert_eq!(extract.out_dir, "/tmp/helm-apps");
+                }
+                other => panic!("unexpected library command: {other:?}"),
+            },
             other => panic!("unexpected command: {other:?}"),
         }
     }

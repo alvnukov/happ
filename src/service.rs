@@ -48,6 +48,7 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
 
     match command {
         Command::Chart(args) => run_chart_command(&args),
+        Command::Library(args) => run_library_command(&args),
         Command::Batch(args) => run_batch_command(&args),
         Command::Manifests(args) => run_manifests_command(&args),
         Command::Compose(args) => run_compose_command(&args),
@@ -98,6 +99,23 @@ fn run_batch_command(args: &crate::cli::BatchArgs) -> Result<(), Error> {
         report.total, report.succeeded, report.failed
     );
     Ok(())
+}
+
+fn run_library_command(args: &crate::cli::LibraryArgs) -> Result<(), Error> {
+    match &args.command {
+        crate::cli::LibraryCommand::Version => {
+            let version = crate::assets::embedded_helm_apps_version().ok_or_else(|| {
+                Error::Convert("embedded helm-apps chart version is unavailable".to_string())
+            })?;
+            println!("{version}");
+            Ok(())
+        }
+        crate::cli::LibraryCommand::Extract(extract_args) => {
+            crate::assets::extract_helm_apps_chart(std::path::Path::new(&extract_args.out_dir))
+                .map_err(|e| Error::Convert(format!("extract embedded helm-apps chart: {e}")))?;
+            Ok(())
+        }
+    }
 }
 
 fn reject_verify_equivalence_for_non_chart(args: &crate::cli::ImportArgs) -> Result<(), Error> {
@@ -741,7 +759,7 @@ mod tests {
     use super::*;
     use crate::cli::{
         BatchArgs, Command, CompletionArgs, DyffArgs, ImportArgs, ImportSharedArgs, InspectArgs,
-        QueryArgs, ValidateArgs,
+        LibraryArgs, LibraryCommand, LibraryExtractArgs, QueryArgs, ValidateArgs,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -1029,6 +1047,28 @@ mod tests {
         let script = fs::read_to_string(&out).expect("read completion");
         assert!(!script.trim().is_empty());
         assert!(script.contains("happ"));
+    }
+
+    #[test]
+    fn library_extract_command_writes_embedded_chart() {
+        let td = TempDir::new().expect("tmp");
+        let out_dir = td.path().join("helm-apps");
+        let cli = Cli {
+            web: false,
+            studio: false,
+            web_stdin: false,
+            web_addr: "127.0.0.1:8088".to_string(),
+            web_open_browser: true,
+            command: Some(Command::Library(LibraryArgs {
+                command: LibraryCommand::Extract(LibraryExtractArgs {
+                    out_dir: out_dir.to_string_lossy().to_string(),
+                }),
+            })),
+        };
+        let result = run_with(cli);
+        assert!(result.is_ok(), "library extract should succeed: {result:?}");
+        let chart_yaml = out_dir.join("Chart.yaml");
+        assert!(chart_yaml.exists(), "embedded chart Chart.yaml not extracted");
     }
 
     #[test]
