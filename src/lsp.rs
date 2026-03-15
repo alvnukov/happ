@@ -1609,7 +1609,8 @@ fn build_manifest_preview_values_with_root(
 ) -> JsonValue {
     let required_keys = required_preview_global_keys(entity);
     let global_map = build_preview_global_map(global, env, &required_keys);
-    let required_root_keys = required_preview_root_keys(entity);
+    let mut required_root_keys = required_preview_root_keys(entity);
+    required_root_keys.insert(group.to_string());
     let preview_entity = force_entity_enabled_for_preview(entity);
     let mut out = build_preview_values_tree(group, app, &preview_entity, global_map);
     inject_preview_root_keys(
