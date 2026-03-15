@@ -1068,7 +1068,10 @@ mod tests {
         let result = run_with(cli);
         assert!(result.is_ok(), "library extract should succeed: {result:?}");
         let chart_yaml = out_dir.join("Chart.yaml");
-        assert!(chart_yaml.exists(), "embedded chart Chart.yaml not extracted");
+        assert!(
+            chart_yaml.exists(),
+            "embedded chart Chart.yaml not extracted"
+        );
     }
 
     #[test]

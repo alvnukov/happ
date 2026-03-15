@@ -64,7 +64,10 @@ mod tests {
     #[test]
     fn embedded_chart_version_is_available() {
         let version = embedded_helm_apps_version().expect("embedded chart version");
-        assert!(!version.trim().is_empty(), "embedded chart version is empty");
+        assert!(
+            !version.trim().is_empty(),
+            "embedded chart version is empty"
+        );
     }
 
     #[test]

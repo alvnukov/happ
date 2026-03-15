@@ -1030,7 +1030,8 @@ fn materialize_root_level_include_profiles(source_root: &JsonValue) -> JsonValue
     let mut merged: JsonMap<String, JsonValue> = JsonMap::new();
     let mut cache: HashMap<String, JsonMap<String, JsonValue>> = HashMap::new();
     for include_name in include_names {
-        if let Ok(profile) = resolve_profile(&include_name, includes_map, &mut cache, &mut Vec::new())
+        if let Ok(profile) =
+            resolve_profile(&include_name, includes_map, &mut cache, &mut Vec::new())
         {
             merged = merge_maps(&merged, &profile);
         }
@@ -1061,7 +1062,10 @@ fn assemble_root_level_values_layers(
     let mut root = source_root.clone();
 
     if let Some(global) = root.get_mut("global").and_then(JsonValue::as_object_mut) {
-        if let Some(includes) = global.get_mut("_includes").and_then(JsonValue::as_object_mut) {
+        if let Some(includes) = global
+            .get_mut("_includes")
+            .and_then(JsonValue::as_object_mut)
+        {
             let include_from_file = includes
                 .get("_include_from_file")
                 .and_then(JsonValue::as_str)
@@ -1069,9 +1073,12 @@ fn assemble_root_level_values_layers(
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string);
             if let Some(raw_path) = include_from_file {
-                if let Some((_loaded_path, loaded_map)) =
-                    load_yaml_map_from_file(&raw_path, include_base_dir, overrides, &mut HashSet::new())?
-                {
+                if let Some((_loaded_path, loaded_map)) = load_yaml_map_from_file(
+                    &raw_path,
+                    include_base_dir,
+                    overrides,
+                    &mut HashSet::new(),
+                )? {
                     let normalized = normalize_global_includes_payload(&loaded_map);
                     let merged = merge_maps(&normalized, includes);
                     *includes = merged;
@@ -1934,7 +1941,8 @@ fn build_diagnostics(uri: &Uri, text: &str) -> Vec<Diagnostic> {
         if is_templated_include_path(&file_ref.path) {
             continue;
         }
-        let candidates = build_include_candidates_for_diagnostics(&file_ref.path, &include_base_dirs);
+        let candidates =
+            build_include_candidates_for_diagnostics(&file_ref.path, &include_base_dirs);
         let found = candidates.iter().any(|candidate| candidate.exists());
         if found {
             continue;
@@ -4585,7 +4593,10 @@ fn build_include_candidates_for_diagnostics(raw_path: &str, base_dirs: &[PathBuf
 
 fn push_unique_path(out: &mut Vec<PathBuf>, candidate: &Path) {
     let normalized = normalize_fs_path(candidate);
-    if out.iter().any(|existing| normalize_fs_path(existing) == normalized) {
+    if out
+        .iter()
+        .any(|existing| normalize_fs_path(existing) == normalized)
+    {
         return;
     }
     out.push(normalized);
@@ -7329,15 +7340,13 @@ apps-stateless:
             .get("flight-service")
             .and_then(as_obj)
             .expect("flight-service app");
-        assert!(
-            target
-                .get("containers")
-                .and_then(as_obj)
-                .and_then(|containers| containers.get("main"))
-                .and_then(as_obj)
-                .and_then(|main| main.get("envVars"))
-                .is_some()
-        );
+        assert!(target
+            .get("containers")
+            .and_then(as_obj)
+            .and_then(|containers| containers.get("main"))
+            .and_then(as_obj)
+            .and_then(|main| main.get("envVars"))
+            .is_some());
         assert_eq!(
             out_group
                 .get("other")

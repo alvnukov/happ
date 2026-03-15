@@ -166,7 +166,10 @@ pub enum LibraryCommand {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct LibraryExtractArgs {
-    #[arg(long = "out-dir", help = "Destination directory for embedded helm-apps chart")]
+    #[arg(
+        long = "out-dir",
+        help = "Destination directory for embedded helm-apps chart"
+    )]
     pub out_dir: String,
 }
 
@@ -251,7 +254,8 @@ mod tests {
 
     #[test]
     fn parses_library_version_subcommand() {
-        let cli = Cli::try_parse_from(["happ", "library", "version"]).expect("parse library version");
+        let cli =
+            Cli::try_parse_from(["happ", "library", "version"]).expect("parse library version");
         match cli.command.expect("command") {
             Command::Library(args) => match args.command {
                 LibraryCommand::Version => {}
@@ -263,14 +267,9 @@ mod tests {
 
     #[test]
     fn parses_library_extract_subcommand() {
-        let cli = Cli::try_parse_from([
-            "happ",
-            "library",
-            "extract",
-            "--out-dir",
-            "/tmp/helm-apps",
-        ])
-        .expect("parse library extract");
+        let cli =
+            Cli::try_parse_from(["happ", "library", "extract", "--out-dir", "/tmp/helm-apps"])
+                .expect("parse library extract");
         match cli.command.expect("command") {
             Command::Library(args) => match args.command {
                 LibraryCommand::Extract(extract) => {
