@@ -179,7 +179,7 @@ fn fetch_chart_from_github(out_dir: &Path) -> Result<PathBuf, String> {
     let repo = env::var("HELM_APPS_GITHUB_REPO")
         .unwrap_or_else(|_| "https://github.com/alvnukov/helm-apps.git".to_string());
     let reference =
-        env::var("HELM_APPS_GITHUB_REF").unwrap_or_else(|_| "helm-apps-1.8.6".to_string());
+        env::var("HELM_APPS_GITHUB_REF").unwrap_or_else(|_| "helm-apps-1.8.9".to_string());
     let checkout_dir = out_dir.join("helm-apps-checkout");
     if checkout_dir.exists() {
         fs::remove_dir_all(&checkout_dir)

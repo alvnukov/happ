@@ -7033,6 +7033,64 @@ apps-stateless:
     }
 
     #[test]
+    fn render_entity_manifest_request_keeps_release_logic_disabled_without_explicit_flag() {
+        let td = TempDir::new().expect("tmp");
+        let chart_dir = td.path().join("chart");
+        fs::create_dir_all(chart_dir.join("templates")).expect("mkdir templates");
+        fs::create_dir_all(chart_dir.join("charts")).expect("mkdir charts");
+        fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        fs::write(
+            chart_dir.join("templates/init-helm-apps-library.yaml"),
+            "{{- include \"apps-utils.init-library\" $ }}\n",
+        )
+        .expect("write init tpl");
+        crate::assets::extract_helm_apps_chart(&chart_dir.join("charts/helm-apps"))
+            .expect("extract embedded library");
+
+        let values_text = r#"
+global:
+  env: demo
+  releases:
+    stable:
+      release-app: "1.2.3"
+  deploy:
+    annotateAllWithRelease: true
+apps-stateless:
+  release-app:
+    enabled: true
+    containers:
+      main:
+        image:
+          name: nginx
+          staticTag: latest
+"#;
+        let values_path = chart_dir.join("values.yaml");
+        fs::write(&values_path, values_text).expect("write values");
+
+        let result = render_entity_manifest_request(
+            &ServerState::default(),
+            RenderEntityManifestParams {
+                uri: Some(format!("file://{}", values_path.to_string_lossy())),
+                text: Some(values_text.to_string()),
+                group: "apps-stateless".to_string(),
+                app: "release-app".to_string(),
+                env: Some("demo".to_string()),
+                apply_includes: Some(true),
+                apply_env_resolution: Some(true),
+                renderer: Some("fast".to_string()),
+            },
+        )
+        .expect("render manifest");
+
+        assert!(result.manifest.contains("kind: Deployment"));
+        assert!(!result.manifest.contains("helm-apps/release:"));
+    }
+
+    #[test]
     fn render_entity_manifest_request_keeps_include_files_for_chart_runtime_processing() {
         let td = TempDir::new().expect("tmp");
         let chart_dir = td.path().join("chart");
