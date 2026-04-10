@@ -2442,6 +2442,7 @@ const CURRENT_APP_RUNTIME_KEYS: &[&str] = &[
     "_currentContainersType",
     "__annotations__",
     "_options",
+    "childApps",
 ];
 
 const VALUES_RUNTIME_ROOT_KEYS: &[&str] = &[
@@ -3046,6 +3047,7 @@ fn is_dynamic_current_app_key(key: &str) -> bool {
             | "restartOnDeploy"
             | "randomName"
             | "_options"
+            | "childApps"
     )
 }
 
@@ -5989,6 +5991,24 @@ apps-stateless:
     }
 
     #[test]
+    fn diagnostics_allow_current_app_child_apps_runtime_key() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    note: '{{ $.CurrentApp.childApps }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(!has_diagnostic_code(
+            &diagnostics,
+            "E_TPL_UNKNOWN_CURRENT_APP_PATH"
+        ));
+    }
+
+    #[test]
     fn diagnostics_report_local_values_context_usage() {
         let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
         let src = r#"
@@ -6169,6 +6189,7 @@ apps-stateless:
         assert!(result.inside_template);
         assert!(result.completions.iter().any(|it| it.label == "enabled"));
         assert!(result.completions.iter().any(|it| it.label == "service"));
+        assert!(result.completions.iter().any(|it| it.label == "childApps"));
     }
 
     #[test]
