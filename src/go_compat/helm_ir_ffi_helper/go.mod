@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	go.yaml.in/yaml/v3 v3.0.4
-	helm.sh/helm/v3 v3.20.1
+	helm.sh/helm/v3 v3.20.2
 )
 
 require (
