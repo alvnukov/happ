@@ -1,3 +1,7 @@
+use crate::env_map::{
+    detect_default_env, discover_environments, looks_like_env_map, matching_env_regexes,
+    resolve_env_maps, EnvironmentDiscovery, AMBIGUOUS_ENV_REGEX_CODE, ENV_DOCS,
+};
 use crate::go_compat::parse::parse_action_compat;
 use crate::gotemplates::{scan_template_actions, GoTemplateScanError};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response, ResponseError};
@@ -237,12 +241,6 @@ struct ParsedSourceValuesRoot {
     chart_root: Option<PathBuf>,
     include_base_dir: Option<PathBuf>,
     overrides: HashMap<PathBuf, String>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct EnvironmentDiscovery {
-    literals: Vec<String>,
-    regexes: Vec<String>,
 }
 
 pub fn run(args: crate::cli::LspArgs) -> Result<(), Error> {
@@ -1958,6 +1956,7 @@ fn build_diagnostics(uri: &Uri, text: &str) -> Vec<Diagnostic> {
     }
 
     diagnostics.extend(build_unknown_group_diagnostics(&lines));
+    diagnostics.extend(build_ambiguous_env_diagnostics(&lines));
     diagnostics.extend(build_template_diagnostics(uri, text, &lines));
 
     diagnostics
@@ -4407,6 +4406,156 @@ fn build_unknown_group_diagnostics(lines: &[&str]) -> Vec<Diagnostic> {
     out
 }
 
+#[derive(Debug, Clone)]
+struct EnvMapBlockRef {
+    /// Line of the key that owns the block.
+    line: usize,
+    /// The owning key itself, used to anchor the diagnostic range.
+    key: String,
+    /// Dotted path of the owning key, quoted in the message.
+    path: String,
+    /// Direct child keys of the block.
+    keys: Vec<String>,
+}
+
+/// Parses `key:` lines the way an env map writes them.
+///
+/// [`parse_key_line`] cannot: regex keys are quoted and made of characters no
+/// plain YAML key contains (`^`, `*`, `$`, `|`).
+fn parse_env_key_line(line: &str) -> Option<(usize, String)> {
+    let indent = count_indent(line);
+    let rest = line.get(indent..)?;
+    if rest.is_empty() || rest.starts_with('#') || rest.starts_with('-') {
+        return None;
+    }
+    let (raw_key, after_key) = match rest.chars().next() {
+        Some(quote @ ('"' | '\'')) => {
+            let closing = rest.get(1..)?.find(quote)? + 1;
+            (rest.get(1..closing)?, rest.get(closing + 1..)?)
+        }
+        _ => {
+            let colon = rest.find(':')?;
+            (rest.get(..colon)?, rest.get(colon..)?)
+        }
+    };
+    if !after_key.trim_start().starts_with(':') {
+        return None;
+    }
+    let key = raw_key.trim();
+    (!key.is_empty()).then(|| (indent, key.to_string()))
+}
+
+/// Groups the document into blocks of sibling keys, so each block can be tested
+/// for the env-map shape.
+fn collect_env_map_blocks(lines: &[&str]) -> Vec<EnvMapBlockRef> {
+    let blocked = block_scalar_content_lines(lines);
+    let mut open: Vec<(usize, EnvMapBlockRef)> = Vec::new();
+    let mut out: Vec<EnvMapBlockRef> = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some((indent, key)) = parse_env_key_line(line) else {
+            continue;
+        };
+        while open
+            .last()
+            .is_some_and(|(open_indent, _)| indent <= *open_indent)
+        {
+            let (_, block) = open.pop().expect("checked by is_some_and");
+            out.push(block);
+        }
+        let path = match open.last() {
+            Some((_, parent)) => format!("{}.{key}", parent.path),
+            None => key.clone(),
+        };
+        if let Some((_, parent)) = open.last_mut() {
+            parent.keys.push(key.clone());
+        }
+        open.push((
+            indent,
+            EnvMapBlockRef {
+                line: i,
+                key,
+                path,
+                keys: Vec::new(),
+            },
+        ));
+    }
+
+    out.extend(open.into_iter().map(|(_, block)| block));
+    out
+}
+
+/// Mirrors `_fl.getValueRegex`: when more than one regex key matches the
+/// current `global.env`, the chart aborts the render instead of choosing one.
+fn build_ambiguous_env_diagnostics(lines: &[&str]) -> Vec<Diagnostic> {
+    // No `global.env` means no regex pass at all, exactly as in the chart.
+    let Some(env) = global_env_from_lines(lines) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+
+    for block in collect_env_map_blocks(lines) {
+        // Probe the shared resolver with the keys alone, so the LSP and the
+        // exporter can never disagree about what counts as ambiguous.
+        let probe: JsonMap<String, JsonValue> = block
+            .keys
+            .iter()
+            .map(|key| (key.clone(), JsonValue::Null))
+            .collect();
+        if !looks_like_env_map(&probe) {
+            continue;
+        }
+        let patterns = matching_env_regexes(&probe, &env);
+        if patterns.len() < 2 {
+            continue;
+        }
+        out.push(make_diagnostic(
+            block.line,
+            lines,
+            &block.key,
+            DiagnosticSeverity::ERROR,
+            format!(
+                "multiple env regex keys match current global.env '{env}': [{}]. \
+                 Leave only one matching regex key for '{}' ({ENV_DOCS}).",
+                patterns.join(" "),
+                block.path,
+            ),
+            Some(AMBIGUOUS_ENV_REGEX_CODE.to_string()),
+        ));
+    }
+
+    out
+}
+
+/// Reads `global.env` straight from the document text, without the JSON round
+/// trip the request handlers do.
+fn global_env_from_lines(lines: &[&str]) -> Option<String> {
+    let blocked = block_scalar_content_lines(lines);
+    let mut in_global = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some((indent, key, value)) = parse_key_line(line) else {
+            continue;
+        };
+        match indent {
+            0 => in_global = key == "global",
+            2 if in_global && key == "env" => {
+                let env = unquote(value.trim());
+                return (!env.is_empty()).then_some(env);
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 /// Nearest built-in group by edit distance, for typo hints only. The cutoff
 /// keeps `apps-statelss` pointing at `apps-stateless` without turning an
 /// intentional custom group into a bogus suggestion.
@@ -5034,137 +5183,6 @@ fn merge_maps(
         }
     }
     out
-}
-
-fn discover_environments(values: &JsonValue) -> EnvironmentDiscovery {
-    let mut literals: HashSet<String> = HashSet::new();
-    let mut regexes: HashSet<String> = HashSet::new();
-
-    if let Some(global_env) = values
-        .as_object()
-        .and_then(|root| root.get("global"))
-        .and_then(as_obj)
-        .and_then(|g| g.get("env"))
-        .and_then(|v| v.as_str())
-    {
-        let trimmed = global_env.trim();
-        if !trimmed.is_empty() {
-            literals.insert(trimmed.to_string());
-        }
-    }
-
-    walk_maps(values, &mut |map| {
-        if !looks_like_env_map(map) {
-            return;
-        }
-        for key in map.keys() {
-            if key == "_default" {
-                continue;
-            }
-            if looks_like_regex_pattern(key) {
-                regexes.insert(key.clone());
-            } else {
-                literals.insert(key.clone());
-            }
-        }
-    });
-
-    let mut literals_vec: Vec<String> = literals.into_iter().collect();
-    literals_vec.sort();
-    let mut regexes_vec: Vec<String> = regexes.into_iter().collect();
-    regexes_vec.sort();
-    EnvironmentDiscovery {
-        literals: literals_vec,
-        regexes: regexes_vec,
-    }
-}
-
-fn detect_default_env(values: &JsonValue, env_discovery: &EnvironmentDiscovery) -> String {
-    if let Some(global_env) = values
-        .as_object()
-        .and_then(|root| root.get("global"))
-        .and_then(as_obj)
-        .and_then(|g| g.get("env"))
-        .and_then(|v| v.as_str())
-    {
-        let trimmed = global_env.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    env_discovery
-        .literals
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "dev".to_string())
-}
-
-fn resolve_env_maps(value: &JsonValue, env: &str) -> JsonValue {
-    match value {
-        JsonValue::Array(items) => {
-            JsonValue::Array(items.iter().map(|v| resolve_env_maps(v, env)).collect())
-        }
-        JsonValue::Object(map) => {
-            if looks_like_env_map(map) {
-                let selected = select_env_value(map, env);
-                if selected == JsonValue::Object(map.clone()) {
-                    let mut out = JsonMap::new();
-                    for (k, v) in map {
-                        out.insert(k.clone(), resolve_env_maps(v, env));
-                    }
-                    return JsonValue::Object(out);
-                }
-                return resolve_env_maps(&selected, env);
-            }
-            let mut out = JsonMap::new();
-            for (k, v) in map {
-                out.insert(k.clone(), resolve_env_maps(v, env));
-            }
-            JsonValue::Object(out)
-        }
-        _ => value.clone(),
-    }
-}
-
-fn looks_like_env_map(map: &JsonMap<String, JsonValue>) -> bool {
-    if map.contains_key("_default") {
-        return true;
-    }
-    map.keys().any(|k| looks_like_regex_pattern(k))
-}
-
-fn looks_like_regex_pattern(key: &str) -> bool {
-    if key.is_empty() || key == "_default" {
-        return false;
-    }
-    if key.starts_with('^') || key.ends_with('$') {
-        return true;
-    }
-    if key.contains(".*") || key.contains(".+") || key.contains(".?") {
-        return true;
-    }
-    key.chars()
-        .any(|ch| matches!(ch, '[' | ']' | '(' | ')' | '|' | '\\'))
-}
-
-fn select_env_value(map: &JsonMap<String, JsonValue>, env: &str) -> JsonValue {
-    if let Some(v) = map.get(env) {
-        return v.clone();
-    }
-    for (k, v) in map {
-        if k == "_default" || !looks_like_regex_pattern(k) {
-            continue;
-        }
-        if let Ok(re) = regex::Regex::new(k) {
-            if re.is_match(env) {
-                return v.clone();
-            }
-        }
-    }
-    if let Some(v) = map.get("_default") {
-        return v.clone();
-    }
-    JsonValue::Object(map.clone())
 }
 
 fn walk_maps(value: &JsonValue, on_map: &mut dyn FnMut(&JsonMap<String, JsonValue>)) {
@@ -6012,6 +6030,153 @@ apps-stateless:
                 .split('\n')
                 .collect();
         assert!(!strict_validation_enabled(&elsewhere));
+    }
+
+    fn ambiguous_env_diagnostic(src: &str) -> Option<Diagnostic> {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        build_diagnostics(&uri, src).into_iter().find(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    AMBIGUOUS_ENV_REGEX_CODE.into(),
+                ))
+        })
+    }
+
+    #[test]
+    fn diagnostics_report_two_regex_keys_matching_the_current_env() {
+        // Verified against helm-apps 1.9.0: these exact values make
+        // `helm template` abort with E_ENV_REGEX_AMBIGUOUS.
+        let src = r#"
+global:
+  env: stage-eu
+apps-stateless:
+  api:
+    replicas:
+      _default: 1
+      "^stage-.*$": 2
+      ".*-eu": 3
+"#;
+        let found = ambiguous_env_diagnostic(src).expect("ambiguity diagnostic");
+        assert_eq!(found.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            found.message.contains("[^.*-eu$ ^stage-.*$]")
+                && found.message.contains("apps-stateless.api.replicas"),
+            "unexpected message: {}",
+            found.message
+        );
+        // The range must land on the key that owns the env map.
+        assert_eq!(found.range.start.line, 5);
+    }
+
+    #[test]
+    fn diagnostics_stay_silent_when_only_one_regex_key_matches() {
+        let src = r#"
+global:
+  env: stage-eu
+apps-stateless:
+  api:
+    replicas:
+      _default: 1
+      "^stage-.*$": 2
+      "^prod-.*$": 3
+"#;
+        assert!(ambiguous_env_diagnostic(src).is_none());
+    }
+
+    #[test]
+    fn diagnostics_stay_silent_when_an_exact_env_key_wins() {
+        // The chart short-circuits on the exact key and never runs the regex
+        // pass, so conflicting patterns beside it are harmless.
+        let src = r#"
+global:
+  env: stage-eu
+apps-stateless:
+  api:
+    replicas:
+      "stage-eu": 9
+      "^stage-.*$": 2
+      ".*-eu": 3
+"#;
+        assert!(ambiguous_env_diagnostic(src).is_none());
+    }
+
+    #[test]
+    fn diagnostics_stay_silent_without_global_env() {
+        let src = r#"
+apps-stateless:
+  api:
+    replicas:
+      _default: 1
+      "^stage-.*$": 2
+      ".*-eu": 3
+"#;
+        assert!(ambiguous_env_diagnostic(src).is_none());
+    }
+
+    #[test]
+    fn env_map_scan_reads_quoted_regex_keys_and_their_nesting() {
+        let lines: Vec<&str> = r#"
+apps-stateless:
+  api:
+    replicas:
+      _default: 1
+      "^stage-.*$": 2
+    ports: 80
+"#
+        .split('\n')
+        .collect();
+        let blocks = collect_env_map_blocks(&lines);
+        let replicas = blocks
+            .iter()
+            .find(|block| block.path == "apps-stateless.api.replicas")
+            .expect("replicas block");
+        assert_eq!(
+            replicas.keys,
+            vec!["_default".to_string(), "^stage-.*$".to_string()]
+        );
+        // Sibling keys must not leak into the env map's key set.
+        assert!(!replicas.keys.contains(&"ports".to_string()));
+        let api = blocks
+            .iter()
+            .find(|block| block.path == "apps-stateless.api")
+            .expect("api block");
+        assert_eq!(api.keys, vec!["replicas".to_string(), "ports".to_string()]);
+    }
+
+    #[test]
+    fn env_map_scan_skips_block_scalar_payloads() {
+        let lines: Vec<&str> = r#"
+apps-stateless:
+  api:
+    configFiles:
+      app.conf: |
+        _default: 1
+        "^stage-.*$": 2
+"#
+        .split('\n')
+        .collect();
+        let blocks = collect_env_map_blocks(&lines);
+        let leaked = blocks
+            .iter()
+            .find(|block| block.keys.iter().any(|key| key == "^stage-.*$"));
+        assert!(leaked.is_none(), "block scalar payload parsed as env map");
+    }
+
+    #[test]
+    fn global_env_is_read_only_from_the_global_block() {
+        let direct: Vec<&str> = "global:\n  env: prod\n".split('\n').collect();
+        assert_eq!(global_env_from_lines(&direct), Some("prod".to_string()));
+
+        let quoted: Vec<&str> = "global:\n  env: \"prod\"\n".split('\n').collect();
+        assert_eq!(global_env_from_lines(&quoted), Some("prod".to_string()));
+
+        let elsewhere: Vec<&str> = "apps-stateless:\n  api:\n    env: prod\n"
+            .split('\n')
+            .collect();
+        assert_eq!(global_env_from_lines(&elsewhere), None);
+
+        let empty: Vec<&str> = "global:\n  env: \"\"\n".split('\n').collect();
+        assert_eq!(global_env_from_lines(&empty), None);
     }
 
     #[test]

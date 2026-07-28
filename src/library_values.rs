@@ -1,3 +1,7 @@
+use crate::env_map::{
+    ambiguous_env_regex_message, detect_default_env, discover_environments,
+    find_ambiguous_env_regexes, global_env, resolve_env_maps,
+};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value;
 use sha2::{Digest, Sha256};
@@ -29,15 +33,7 @@ pub fn load_library_chart_values_for_export(
     let expanded_root = JsonValue::Object(expanded);
 
     let env_discovery = discover_environments(&expanded_root);
-    let existing_global_env = expanded_root
-        .as_object()
-        .and_then(|root| root.get("global"))
-        .and_then(as_obj)
-        .and_then(|global| global.get("env"))
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
+    let existing_global_env = global_env(&expanded_root);
     let has_env_context = existing_global_env.is_some()
         || !env_discovery.literals.is_empty()
         || !env_discovery.regexes.is_empty();
@@ -51,6 +47,11 @@ pub fn load_library_chart_values_for_export(
     };
 
     let mut materialized = if let Some(selected_env) = selected_env.as_deref() {
+        // The chart aborts the render rather than pick between conflicting
+        // regex keys, so an export must not quietly resolve one either.
+        if let Some(ambiguous) = find_ambiguous_env_regexes(&expanded_root, selected_env).first() {
+            return Err(ambiguous_env_regex_message(ambiguous));
+        }
         resolve_env_maps(&expanded_root, selected_env)
     } else {
         expanded_root
@@ -519,140 +520,6 @@ fn is_direct_global_includes_path(path_segments: &[String]) -> bool {
     path_segments.len() == 2 && path_segments[0] == "global" && path_segments[1] == "_includes"
 }
 
-fn discover_environments(values: &JsonValue) -> EnvironmentDiscovery {
-    let mut literals: HashSet<String> = HashSet::new();
-    let mut regexes: HashSet<String> = HashSet::new();
-
-    if let Some(global_env) = values
-        .as_object()
-        .and_then(|root| root.get("global"))
-        .and_then(as_obj)
-        .and_then(|global| global.get("env"))
-        .and_then(JsonValue::as_str)
-    {
-        let trimmed = global_env.trim();
-        if !trimmed.is_empty() {
-            literals.insert(trimmed.to_string());
-        }
-    }
-
-    walk_maps(values, &mut |map| {
-        if !looks_like_env_map(map) {
-            return;
-        }
-        for key in map.keys() {
-            if key == "_default" {
-                continue;
-            }
-            if looks_like_regex_pattern(key) {
-                regexes.insert(key.clone());
-            } else {
-                literals.insert(key.clone());
-            }
-        }
-    });
-
-    let mut literals_vec: Vec<String> = literals.into_iter().collect();
-    literals_vec.sort();
-    let mut regexes_vec: Vec<String> = regexes.into_iter().collect();
-    regexes_vec.sort();
-    EnvironmentDiscovery {
-        literals: literals_vec,
-        regexes: regexes_vec,
-    }
-}
-
-fn detect_default_env(values: &JsonValue, env_discovery: &EnvironmentDiscovery) -> String {
-    if let Some(global_env) = values
-        .as_object()
-        .and_then(|root| root.get("global"))
-        .and_then(as_obj)
-        .and_then(|global| global.get("env"))
-        .and_then(JsonValue::as_str)
-    {
-        let trimmed = global_env.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    env_discovery
-        .literals
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "dev".to_string())
-}
-
-fn resolve_env_maps(value: &JsonValue, env: &str) -> JsonValue {
-    match value {
-        JsonValue::Array(items) => JsonValue::Array(
-            items
-                .iter()
-                .map(|item| resolve_env_maps(item, env))
-                .collect(),
-        ),
-        JsonValue::Object(map) => {
-            if looks_like_env_map(map) {
-                let selected = select_env_value(map, env);
-                if selected == JsonValue::Object(map.clone()) {
-                    let mut out = JsonMap::new();
-                    for (key, value) in map {
-                        out.insert(key.clone(), resolve_env_maps(value, env));
-                    }
-                    return JsonValue::Object(out);
-                }
-                return resolve_env_maps(&selected, env);
-            }
-            let mut out = JsonMap::new();
-            for (key, value) in map {
-                out.insert(key.clone(), resolve_env_maps(value, env));
-            }
-            JsonValue::Object(out)
-        }
-        _ => value.clone(),
-    }
-}
-
-fn looks_like_env_map(map: &JsonMap<String, JsonValue>) -> bool {
-    if map.contains_key("_default") {
-        return true;
-    }
-    map.keys().any(|key| looks_like_regex_pattern(key))
-}
-
-fn looks_like_regex_pattern(key: &str) -> bool {
-    if key.is_empty() || key == "_default" {
-        return false;
-    }
-    if key.starts_with('^') || key.ends_with('$') {
-        return true;
-    }
-    if key.contains(".*") || key.contains(".+") || key.contains(".?") {
-        return true;
-    }
-    key.chars()
-        .any(|ch| matches!(ch, '[' | ']' | '(' | ')' | '|' | '\\'))
-}
-
-fn select_env_value(map: &JsonMap<String, JsonValue>, env: &str) -> JsonValue {
-    if let Some(value) = map.get(env) {
-        return value.clone();
-    }
-    for (key, value) in map {
-        if key == "_default" || !looks_like_regex_pattern(key) {
-            continue;
-        }
-        if let Ok(regex) = regex::Regex::new(key) {
-            if regex.is_match(env) {
-                return value.clone();
-            }
-        }
-    }
-    if let Some(value) = map.get("_default") {
-        return value.clone();
-    }
-    JsonValue::Object(map.clone())
-}
-
 // Mirrors "fl._expandValueReferences" from
 // charts/helm-apps/templates/fl-functions/_value.tpl (helm-apps >= 1.9.0).
 // Contract: docs/reference-values.md#param-value-references.
@@ -790,23 +657,6 @@ fn render_value_reference_target(
     }
 }
 
-fn walk_maps(value: &JsonValue, on_map: &mut dyn FnMut(&JsonMap<String, JsonValue>)) {
-    match value {
-        JsonValue::Array(items) => {
-            for item in items {
-                walk_maps(item, on_map);
-            }
-        }
-        JsonValue::Object(map) => {
-            on_map(map);
-            for value in map.values() {
-                walk_maps(value, on_map);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn ensure_global_env_literal(root: &mut JsonValue, env: &str) {
     let Some(root_map) = root.as_object_mut() else {
         return;
@@ -853,12 +703,6 @@ fn as_obj(value: &JsonValue) -> Option<&JsonMap<String, JsonValue>> {
 
 fn json_value_to_yaml_value(value: &JsonValue) -> Result<Value, String> {
     Ok(crate::chart_ir::json_to_yaml_value(value))
-}
-
-#[derive(Debug, Clone)]
-struct EnvironmentDiscovery {
-    literals: Vec<String>,
-    regexes: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1250,5 +1094,83 @@ apps-stateless:
             .and_then(Value::as_str)
             .expect("image name");
         assert_eq!(image_name, "registry.prod.example.com/api");
+    }
+
+    fn chart_with_values(values: &str) -> (TempDir, PathBuf) {
+        let td = TempDir::new().expect("tmp");
+        let chart_root = td.path().join("chart");
+        fs::create_dir_all(chart_root.join("templates")).expect("mkdir templates");
+        fs::write(
+            chart_root.join("Chart.yaml"),
+            "apiVersion: v2\nname: demo\ntype: application\nversion: 0.1.0\n",
+        )
+        .expect("write chart yaml");
+        fs::write(chart_root.join("values.yaml"), values).expect("write values");
+        (td, chart_root)
+    }
+
+    fn replicas_of(loaded: &LoadedLibraryValues) -> Value {
+        loaded
+            .values
+            .as_mapping()
+            .and_then(|root| root.get(Value::String("apps-stateless".into())))
+            .and_then(Value::as_mapping)
+            .and_then(|group| group.get(Value::String("api".into())))
+            .and_then(Value::as_mapping)
+            .and_then(|api| api.get(Value::String("replicas".into())))
+            .cloned()
+            .expect("replicas")
+    }
+
+    #[test]
+    fn export_refuses_to_guess_between_ambiguous_env_regexes() {
+        // Verified against helm-apps 1.9.0: `helm template` aborts on these
+        // exact values with E_ENV_REGEX_AMBIGUOUS, so the export must too.
+        let (_td, chart_root) = chart_with_values(
+            r#"
+global:
+  env: stage-eu
+apps-stateless:
+  api:
+    enabled: true
+    replicas:
+      _default: 1
+      "^stage-.*$": 2
+      ".*-eu": 3
+"#,
+        );
+
+        let error =
+            load_library_chart_values_for_export(chart_root.to_str().expect("chart path"), None)
+                .expect_err("ambiguous env regexes must fail the export");
+        assert!(
+            error.contains("E_ENV_REGEX_AMBIGUOUS")
+                && error.contains("[^.*-eu$ ^stage-.*$]")
+                && error.contains("path=apps-stateless.api.replicas"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn export_anchors_env_regex_keys_to_the_whole_env_name() {
+        // Verified against helm-apps 1.9.0: `helm template` renders 1 here,
+        // because the chart matches `^(dev|stage)$`, not a substring.
+        let (_td, chart_root) = chart_with_values(
+            r#"
+global:
+  env: stage-eu
+apps-stateless:
+  api:
+    enabled: true
+    replicas:
+      _default: 1
+      "(dev|stage)": 7
+"#,
+        );
+
+        let loaded =
+            load_library_chart_values_for_export(chart_root.to_str().expect("chart path"), None)
+                .expect("load values");
+        assert_eq!(replicas_of(&loaded), Value::Number(1.into()));
     }
 }

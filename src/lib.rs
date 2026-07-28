@@ -7,6 +7,7 @@ mod composeimport;
 mod composeinspect;
 mod convert;
 mod dyfflike;
+mod env_map;
 pub mod go_compat;
 pub mod gotemplates;
 mod inspectweb;
