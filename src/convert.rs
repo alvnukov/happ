@@ -44,11 +44,15 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
     let mut apps_service_accounts = Mapping::new();
     let mut apps_jobs = Mapping::new();
     let mut apps_cronjobs = Mapping::new();
+    let mut apps_stateful = Mapping::new();
 
     let mut stateless_by_ns_name: HashMap<String, String> = HashMap::new();
+    let mut stateful_by_ns_name: HashMap<String, String> = HashMap::new();
     let mut service_accounts_by_ns_name: HashMap<String, String> = HashMap::new();
 
     let mut pending_pdb: Vec<Value> = Vec::new();
+    let mut pending_hpa: Vec<Value> = Vec::new();
+    let mut pending_vpa: Vec<Value> = Vec::new();
     let mut pending_service_accounts: Vec<Value> = Vec::new();
     let mut pending_roles: Vec<Value> = Vec::new();
     let mut pending_role_bindings: Vec<Value> = Vec::new();
@@ -63,18 +67,32 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
         let Some(m) = doc.as_mapping() else {
             continue;
         };
-        if kind_of(m) != "Deployment" {
-            continue;
-        }
-        if let Some((app_key, app)) = map_deployment_to_apps_stateless(m) {
-            let final_key = insert_group_with_dedupe(&mut apps_stateless, &app_key, app);
-            let name = metadata_name(m);
-            if !name.is_empty() {
-                stateless_by_ns_name
-                    .insert(format!("{}/{}", metadata_namespace(m), name), final_key);
+        match kind_of(m).as_str() {
+            "Deployment" => {
+                if let Some((app_key, app)) = map_deployment_to_apps_stateless(m) {
+                    let final_key = insert_group_with_dedupe(&mut apps_stateless, &app_key, app);
+                    let name = metadata_name(m);
+                    if !name.is_empty() {
+                        stateless_by_ns_name
+                            .insert(format!("{}/{}", metadata_namespace(m), name), final_key);
+                    }
+                } else {
+                    push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
+                }
             }
-        } else {
-            push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
+            "StatefulSet" => {
+                if let Some((app_key, app)) = map_statefulset_to_apps_stateful(m) {
+                    let final_key = insert_group_with_dedupe(&mut apps_stateful, &app_key, app);
+                    let name = metadata_name(m);
+                    if !name.is_empty() {
+                        stateful_by_ns_name
+                            .insert(format!("{}/{}", metadata_namespace(m), name), final_key);
+                    }
+                } else {
+                    push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -85,7 +103,9 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
         };
         let kind = kind_of(m);
         match kind.as_str() {
-            "Deployment" => {}
+            "Deployment" | "StatefulSet" => {}
+            "HorizontalPodAutoscaler" => pending_hpa.push(doc.clone()),
+            "VerticalPodAutoscaler" => pending_vpa.push(doc.clone()),
             "ConfigMap" => {
                 if let Some((app_key, app)) = map_configmap_to_apps_configmaps(m) {
                     insert_group_with_dedupe(&mut apps_configmaps, &app_key, app);
@@ -145,10 +165,22 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
         }
     }
 
-    attach_pdbs_to_stateless_apps(
+    attach_pdbs_to_workload_apps(
         &mut apps_stateless,
         &stateless_by_ns_name,
+        &mut apps_stateful,
+        &stateful_by_ns_name,
         &pending_pdb,
+        &mut raw_fallback,
+        &mut raw_fallback_seen,
+    );
+    attach_autoscalers_to_workload_apps(
+        &mut apps_stateless,
+        &stateless_by_ns_name,
+        &mut apps_stateful,
+        &stateful_by_ns_name,
+        &pending_hpa,
+        &pending_vpa,
         &mut raw_fallback,
         &mut raw_fallback_seen,
     );
@@ -169,7 +201,7 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
         &mut raw_fallback,
         &mut raw_fallback_seen,
     );
-    attach_service_accounts_to_stateless_apps(
+    attach_service_accounts_to_workload_apps(
         &mut apps_stateless,
         &stateless_by_ns_name,
         &service_accounts_by_ns_name,
@@ -180,6 +212,9 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
 
     if !apps_stateless.is_empty() {
         root.insert(k("apps-stateless"), Value::Mapping(apps_stateless));
+    }
+    if !apps_stateful.is_empty() {
+        root.insert(k("apps-stateful"), Value::Mapping(apps_stateful));
     }
     if !apps_configmaps.is_empty() {
         root.insert(k("apps-configmaps"), Value::Mapping(apps_configmaps));
@@ -470,8 +505,10 @@ fn map_secret_to_apps_secrets(doc: &Mapping) -> Option<(String, Mapping)> {
     Some((sanitize_key(&name), app))
 }
 
-fn map_deployment_to_apps_stateless(doc: &Mapping) -> Option<(String, Mapping)> {
-    if kind_of(doc) != "Deployment" {
+// Shared preamble for workload kinds rendered by apps-stateless / apps-stateful.
+// Returns the app name plus the base app map, the workload spec and the pod spec.
+fn workload_app_base(doc: &Mapping, kind: &str) -> Option<(String, Mapping, Mapping, Mapping)> {
+    if kind_of(doc) != kind {
         return None;
     }
     let api_version = get_str(doc, "apiVersion").unwrap_or_default();
@@ -487,10 +524,10 @@ fn map_deployment_to_apps_stateless(doc: &Mapping) -> Option<(String, Mapping)> 
     let spec = get_map(doc, "spec").cloned().unwrap_or_default();
     let template = get_map(&spec, "template").cloned().unwrap_or_default();
     let pod_spec = get_map(&template, "spec").cloned().unwrap_or_default();
-    let containers = get_seq(&pod_spec, "containers")
-        .cloned()
-        .unwrap_or_default();
-    if containers.is_empty() {
+    if get_seq(&pod_spec, "containers")
+        .map(Vec::is_empty)
+        .unwrap_or(true)
+    {
         return None;
     }
 
@@ -513,16 +550,13 @@ fn map_deployment_to_apps_stateless(doc: &Mapping) -> Option<(String, Mapping)> 
         }
     }
 
-    copy_scalar_if_present(&mut app, &spec, "replicas");
-    copy_scalar_if_present(&mut app, &spec, "revisionHistoryLimit");
+    Some((name, app, spec, pod_spec))
+}
 
-    if let Some(v) = spec.get(&k("strategy")) {
-        if let Some(s) = yaml_body_clean(v) {
-            app.insert(k("strategy"), Value::String(s));
-        }
-    }
-
-    if let Some(sel) = get_map(&spec, "selector") {
+// Shared tail: selector, containers and pod-level fields are identical for
+// apps-stateless and apps-stateful.
+fn finish_workload_app(app: &mut Mapping, spec: &Mapping, pod_spec: &Mapping) -> Option<()> {
+    if let Some(sel) = get_map(spec, "selector") {
         if let Some(match_labels) = get_map(sel, "matchLabels") {
             if let Some(s) = yaml_body_clean(&Value::Mapping(match_labels.clone())) {
                 app.insert(k("selector"), Value::String(s));
@@ -536,10 +570,11 @@ fn map_deployment_to_apps_stateless(doc: &Mapping) -> Option<(String, Mapping)> 
         }
     }
 
+    let containers = get_seq(pod_spec, "containers").cloned().unwrap_or_default();
     let container_map = map_containers_for_stateless(&containers)?;
     app.insert(k("containers"), Value::Mapping(container_map));
 
-    let init_containers = get_seq(&pod_spec, "initContainers")
+    let init_containers = get_seq(pod_spec, "initContainers")
         .cloned()
         .unwrap_or_default();
     if !init_containers.is_empty() {
@@ -548,9 +583,74 @@ fn map_deployment_to_apps_stateless(doc: &Mapping) -> Option<(String, Mapping)> 
         }
     }
 
-    merge_maps(&mut app, &map_pod_spec_fields_for_library(&pod_spec));
+    merge_maps(app, &map_pod_spec_fields_for_library(pod_spec));
+    Some(())
+}
+
+fn map_deployment_to_apps_stateless(doc: &Mapping) -> Option<(String, Mapping)> {
+    let (name, mut app, spec, pod_spec) = workload_app_base(doc, "Deployment")?;
+
+    copy_scalar_if_present(&mut app, &spec, "replicas");
+    copy_scalar_if_present(&mut app, &spec, "revisionHistoryLimit");
+
+    if let Some(v) = spec.get(&k("strategy")) {
+        if let Some(s) = yaml_body_clean(v) {
+            app.insert(k("strategy"), Value::String(s));
+        }
+    }
+
+    finish_workload_app(&mut app, &spec, &pod_spec)?;
 
     if let Some(extra) = extract_deployment_extra_spec(&spec) {
+        if let Some(s) = yaml_body(&Value::Mapping(extra)) {
+            app.insert(k("extraSpec"), Value::String(s));
+        }
+    }
+
+    Some((sanitize_key(&name), app))
+}
+
+// Spec surface follows "apps-stateful.render" in
+// charts/helm-apps/templates/_apps-stateful.tpl.
+fn map_statefulset_to_apps_stateful(doc: &Mapping) -> Option<(String, Mapping)> {
+    let (name, mut app, spec, pod_spec) = workload_app_base(doc, "StatefulSet")?;
+
+    for key in [
+        "replicas",
+        "revisionHistoryLimit",
+        "minReadySeconds",
+        "podManagementPolicy",
+    ] {
+        copy_scalar_if_present(&mut app, &spec, key);
+    }
+
+    // "apps-specs.serviceName" reads .service.name, and dereferences it
+    // unconditionally -- a StatefulSet app without a service block fails to
+    // render. The governing headless Service itself arrives as its own manifest
+    // and is mapped into apps-services, so keep this block disabled to avoid
+    // emitting a second copy of it.
+    if let Some(service_name) = get_str(&spec, "serviceName").filter(|v| !v.trim().is_empty()) {
+        let mut service = Mapping::new();
+        service.insert(k("enabled"), Value::Bool(false));
+        service.insert(k("name"), Value::String(service_name));
+        app.insert(k("service"), Value::Mapping(service));
+    }
+
+    for key in [
+        "updateStrategy",
+        "persistentVolumeClaimRetentionPolicy",
+        "volumeClaimTemplates",
+    ] {
+        if let Some(v) = spec.get(&k(key)) {
+            if let Some(s) = yaml_body_clean(v) {
+                app.insert(k(key), Value::String(s));
+            }
+        }
+    }
+
+    finish_workload_app(&mut app, &spec, &pod_spec)?;
+
+    if let Some(extra) = extract_statefulset_extra_spec(&spec) {
         if let Some(s) = yaml_body(&Value::Mapping(extra)) {
             app.insert(k("extraSpec"), Value::String(s));
         }
@@ -1060,9 +1160,34 @@ fn map_pod_spec_fields_for_library(pod_spec: &Mapping) -> Mapping {
     out
 }
 
-fn attach_pdbs_to_stateless_apps(
+// Resolves "<namespace>/<name>" to the owning workload app, looking in
+// apps-stateless first and then apps-stateful.
+fn workload_app_mut<'a>(
+    apps_stateless: &'a mut Mapping,
+    stateless_by_ns_name: &HashMap<String, String>,
+    apps_stateful: &'a mut Mapping,
+    stateful_by_ns_name: &HashMap<String, String>,
+    ns_name: &str,
+) -> Option<&'a mut Mapping> {
+    if let Some(app_key) = stateless_by_ns_name.get(ns_name) {
+        if let Some(app) = apps_stateless
+            .get_mut(&k(app_key))
+            .and_then(Value::as_mapping_mut)
+        {
+            return Some(app);
+        }
+    }
+    let app_key = stateful_by_ns_name.get(ns_name)?;
+    apps_stateful
+        .get_mut(&k(app_key))
+        .and_then(Value::as_mapping_mut)
+}
+
+fn attach_pdbs_to_workload_apps(
     apps_stateless: &mut Mapping,
     stateless_by_ns_name: &HashMap<String, String>,
+    apps_stateful: &mut Mapping,
+    stateful_by_ns_name: &HashMap<String, String>,
     docs: &[Value],
     raw_fallback: &mut Vec<Value>,
     raw_fallback_seen: &mut HashSet<String>,
@@ -1071,16 +1196,14 @@ fn attach_pdbs_to_stateless_apps(
         let Some(m) = doc.as_mapping() else {
             continue;
         };
-        let name = metadata_name(m);
-        let ns = metadata_namespace(m);
-        let Some(app_key) = stateless_by_ns_name.get(&format!("{}/{}", ns, name)) else {
-            push_raw_fallback(raw_fallback, raw_fallback_seen, doc);
-            continue;
-        };
-        let Some(app) = apps_stateless
-            .get_mut(&k(app_key))
-            .and_then(Value::as_mapping_mut)
-        else {
+        let ns_name = format!("{}/{}", metadata_namespace(m), metadata_name(m));
+        let Some(app) = workload_app_mut(
+            apps_stateless,
+            stateless_by_ns_name,
+            apps_stateful,
+            stateful_by_ns_name,
+            &ns_name,
+        ) else {
             push_raw_fallback(raw_fallback, raw_fallback_seen, doc);
             continue;
         };
@@ -1097,6 +1220,128 @@ fn attach_pdbs_to_stateless_apps(
             }
         }
         app.insert(k("podDisruptionBudget"), Value::Mapping(pdb));
+    }
+}
+
+// Autoscalers are workload-local in helm-apps: they carry no group of their own
+// and attach to the app named by scaleTargetRef/targetRef.
+// See "apps-components.horizontalPodAutoscaler" / ".verticalPodAutoscaler".
+fn attach_autoscalers_to_workload_apps(
+    apps_stateless: &mut Mapping,
+    stateless_by_ns_name: &HashMap<String, String>,
+    apps_stateful: &mut Mapping,
+    stateful_by_ns_name: &HashMap<String, String>,
+    hpa_docs: &[Value],
+    vpa_docs: &[Value],
+    raw_fallback: &mut Vec<Value>,
+    raw_fallback_seen: &mut HashSet<String>,
+) {
+    for doc in hpa_docs {
+        let Some(m) = doc.as_mapping() else {
+            continue;
+        };
+        let spec = get_map(m, "spec").cloned().unwrap_or_default();
+        let target = get_map(&spec, "scaleTargetRef")
+            .cloned()
+            .unwrap_or_default();
+        let target_kind = get_str(&target, "kind").unwrap_or_default();
+        let target_name = get_str(&target, "name").unwrap_or_default();
+        // apps-stateful renders no horizontalPodAutoscaler component, so only a
+        // Deployment target can become workload-local values.
+        if target_kind != "Deployment" || target_name.is_empty() {
+            push_raw_fallback(raw_fallback, raw_fallback_seen, doc);
+            continue;
+        }
+        let ns_name = format!("{}/{}", metadata_namespace(m), target_name);
+        let Some(app_key) = stateless_by_ns_name.get(&ns_name) else {
+            push_raw_fallback(raw_fallback, raw_fallback_seen, doc);
+            continue;
+        };
+        let Some(app) = apps_stateless
+            .get_mut(&k(app_key))
+            .and_then(Value::as_mapping_mut)
+        else {
+            push_raw_fallback(raw_fallback, raw_fallback_seen, doc);
+            continue;
+        };
+
+        let mut hpa = Mapping::new();
+        hpa.insert(k("enabled"), Value::Bool(true));
+        copy_scalar_if_present(&mut hpa, &spec, "minReplicas");
+        copy_scalar_if_present(&mut hpa, &spec, "maxReplicas");
+        for key in ["behavior", "metrics"] {
+            if let Some(v) = spec.get(&k(key)) {
+                if let Some(s) = yaml_body_clean(v) {
+                    hpa.insert(k(key), Value::String(s));
+                }
+            }
+        }
+        if let Some(extra) = extract_by_allowed(
+            &spec,
+            &[
+                "scaleTargetRef",
+                "minReplicas",
+                "maxReplicas",
+                "behavior",
+                "metrics",
+            ],
+        ) {
+            if let Some(s) = yaml_body(&Value::Mapping(extra)) {
+                hpa.insert(k("extraSpec"), Value::String(s));
+            }
+        }
+        app.insert(k("horizontalPodAutoscaler"), Value::Mapping(hpa));
+    }
+
+    for doc in vpa_docs {
+        let Some(m) = doc.as_mapping() else {
+            continue;
+        };
+        let spec = get_map(m, "spec").cloned().unwrap_or_default();
+        let target = get_map(&spec, "targetRef").cloned().unwrap_or_default();
+        let target_kind = get_str(&target, "kind").unwrap_or_default();
+        let target_name = get_str(&target, "name").unwrap_or_default();
+        if !matches!(target_kind.as_str(), "Deployment" | "StatefulSet") || target_name.is_empty() {
+            push_raw_fallback(raw_fallback, raw_fallback_seen, doc);
+            continue;
+        }
+        let ns_name = format!("{}/{}", metadata_namespace(m), target_name);
+        let app = match target_kind.as_str() {
+            "Deployment" => stateless_by_ns_name
+                .get(&ns_name)
+                .and_then(|key| apps_stateless.get_mut(&k(key)))
+                .and_then(Value::as_mapping_mut),
+            _ => stateful_by_ns_name
+                .get(&ns_name)
+                .and_then(|key| apps_stateful.get_mut(&k(key)))
+                .and_then(Value::as_mapping_mut),
+        };
+        let Some(app) = app else {
+            push_raw_fallback(raw_fallback, raw_fallback_seen, doc);
+            continue;
+        };
+
+        let mut vpa = Mapping::new();
+        vpa.insert(k("enabled"), Value::Bool(true));
+        if let Some(update_mode) = get_map(&spec, "updatePolicy")
+            .and_then(|policy| get_str(policy, "updateMode"))
+            .filter(|mode| !mode.trim().is_empty())
+        {
+            vpa.insert(k("updateMode"), Value::String(update_mode));
+        }
+        if let Some(v) = spec.get(&k("resourcePolicy")) {
+            if let Some(s) = yaml_body_clean(v) {
+                vpa.insert(k("resourcePolicy"), Value::String(s));
+            }
+        }
+        if let Some(extra) =
+            extract_by_allowed(&spec, &["targetRef", "updatePolicy", "resourcePolicy"])
+        {
+            if let Some(s) = yaml_body(&Value::Mapping(extra)) {
+                vpa.insert(k("extraSpec"), Value::String(s));
+            }
+        }
+        app.insert(k("verticalPodAutoscaler"), Value::Mapping(vpa));
     }
 }
 
@@ -1596,7 +1841,7 @@ fn role_binding_target_service_account(doc: &Mapping) -> Option<(String, String)
     Some((ns.to_string(), name.to_string()))
 }
 
-fn attach_service_accounts_to_stateless_apps(
+fn attach_service_accounts_to_workload_apps(
     apps_stateless: &mut Mapping,
     stateless_by_ns_name: &HashMap<String, String>,
     service_accounts_by_ns_name: &HashMap<String, String>,
@@ -1860,6 +2105,24 @@ fn extract_deployment_extra_spec(spec: &Mapping) -> Option<Mapping> {
             "replicas",
             "revisionHistoryLimit",
             "strategy",
+            "selector",
+            "template",
+        ],
+    )
+}
+
+fn extract_statefulset_extra_spec(spec: &Mapping) -> Option<Mapping> {
+    extract_by_allowed(
+        spec,
+        &[
+            "replicas",
+            "revisionHistoryLimit",
+            "minReadySeconds",
+            "serviceName",
+            "podManagementPolicy",
+            "updateStrategy",
+            "persistentVolumeClaimRetentionPolicy",
+            "volumeClaimTemplates",
             "selector",
             "template",
         ],
@@ -2856,6 +3119,273 @@ spec:
             .expect("app");
         let ty = app.get(&k("type")).and_then(Value::as_str).expect("type");
         assert_eq!(ty, "calico");
+    }
+
+    fn single_app_of(root: &Mapping, group: &str) -> Mapping {
+        root.get(&k(group))
+            .and_then(Value::as_mapping)
+            .and_then(|group| group.values().next())
+            .and_then(Value::as_mapping)
+            .cloned()
+            .unwrap_or_else(|| panic!("single app in {group}"))
+    }
+
+    const STATEFULSET_DOC: &str = r#"
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  replicas: 3
+  serviceName: db-headless
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+      - name: main
+        image: postgres:16
+"#;
+
+    #[test]
+    fn helpers_statefulset_maps_to_apps_stateful() {
+        let docs = parse_docs(STATEFULSET_DOC);
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        assert!(
+            !root.contains_key(&k("apps-k8s-manifests")),
+            "StatefulSet must not fall back to the raw passthrough group"
+        );
+
+        let app = single_app_of(root, "apps-stateful");
+        assert_eq!(app.get(&k("name")).and_then(Value::as_str), Some("db"));
+        // spec.serviceName is rendered from .service.name by
+        // "apps-specs.serviceName", and that helper dereferences .service
+        // unconditionally -- there is no top-level serviceName key.
+        let service = app
+            .get(&k("service"))
+            .and_then(Value::as_mapping)
+            .expect("service block is required by apps-stateful");
+        assert_eq!(
+            service.get(&k("name")).and_then(Value::as_str),
+            Some("db-headless")
+        );
+        assert_eq!(
+            service.get(&k("enabled")),
+            Some(&Value::Bool(false)),
+            "the headless Service arrives as its own manifest; do not render a second one"
+        );
+        assert!(!app.contains_key(&k("serviceName")));
+        assert_eq!(
+            app.get(&k("podManagementPolicy")).and_then(Value::as_str),
+            Some("Parallel")
+        );
+        assert!(app.contains_key(&k("volumeClaimTemplates")));
+        assert!(app.contains_key(&k("updateStrategy")));
+        assert!(app.contains_key(&k("containers")));
+    }
+
+    #[test]
+    fn helpers_hpa_attaches_to_targeted_stateless_app() {
+        let docs = parse_docs(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+      - name: main
+        image: nginx:1.27
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 9
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let app = single_app_of(root, "apps-stateless");
+        let hpa = app
+            .get(&k("horizontalPodAutoscaler"))
+            .and_then(Value::as_mapping)
+            .expect("horizontalPodAutoscaler");
+        assert_eq!(hpa.get(&k("enabled")), Some(&Value::Bool(true)));
+        assert_eq!(
+            hpa.get(&k("minReplicas")).and_then(Value::as_u64),
+            Some(2),
+            "minReplicas must survive as a scalar"
+        );
+        assert_eq!(hpa.get(&k("maxReplicas")).and_then(Value::as_u64), Some(9));
+        assert!(
+            hpa.get(&k("metrics"))
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("averageUtilization")),
+            "metrics must be carried as a YAML block string"
+        );
+    }
+
+    // apps-stateful.render wires verticalPodAutoscaler but no HPA component,
+    // so an HPA aimed at a StatefulSet has no library-level home.
+    #[test]
+    fn helpers_hpa_targeting_statefulset_stays_raw() {
+        let mut src = STATEFULSET_DOC.to_string();
+        src.push_str(
+            r#"---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: db
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: db
+  minReplicas: 1
+  maxReplicas: 4
+"#,
+        );
+        let docs = parse_docs(&src);
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+
+        let app = single_app_of(root, "apps-stateful");
+        assert!(
+            !app.contains_key(&k("horizontalPodAutoscaler")),
+            "apps-stateful has no horizontalPodAutoscaler component"
+        );
+        assert!(
+            root.contains_key(&k("apps-k8s-manifests")),
+            "unsupported HPA target must stay in the raw passthrough group"
+        );
+    }
+
+    #[test]
+    fn helpers_vpa_attaches_to_targeted_stateful_app() {
+        let mut src = STATEFULSET_DOC.to_string();
+        src.push_str(
+            r#"---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: db
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: db
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: main
+      minAllowed:
+        cpu: 100m
+"#,
+        );
+        let docs = parse_docs(&src);
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let app = single_app_of(root, "apps-stateful");
+        let vpa = app
+            .get(&k("verticalPodAutoscaler"))
+            .and_then(Value::as_mapping)
+            .expect("verticalPodAutoscaler");
+        assert_eq!(vpa.get(&k("enabled")), Some(&Value::Bool(true)));
+        assert_eq!(
+            vpa.get(&k("updateMode")).and_then(Value::as_str),
+            Some("Auto"),
+            "updateMode is lifted out of spec.updatePolicy"
+        );
+        assert!(vpa
+            .get(&k("resourcePolicy"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("containerPolicies")));
+    }
+
+    #[test]
+    fn helpers_pdb_attaches_to_stateful_app() {
+        let mut src = STATEFULSET_DOC.to_string();
+        src.push_str(
+            r#"---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db
+spec:
+  minAvailable: 2
+"#,
+        );
+        let docs = parse_docs(&src);
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let app = single_app_of(root, "apps-stateful");
+        let pdb = app
+            .get(&k("podDisruptionBudget"))
+            .and_then(Value::as_mapping)
+            .expect("podDisruptionBudget");
+        assert_eq!(pdb.get(&k("minAvailable")).and_then(Value::as_u64), Some(2));
+    }
+
+    #[test]
+    fn helpers_autoscaler_without_known_target_stays_raw() {
+        let docs = parse_docs(
+            r#"
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: orphan
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: missing
+  minReplicas: 1
+  maxReplicas: 2
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        assert!(
+            !root.contains_key(&k("apps-stateless")),
+            "an orphan autoscaler must not invent a workload app"
+        );
+        assert!(root.contains_key(&k("apps-k8s-manifests")));
     }
 
     #[test]
