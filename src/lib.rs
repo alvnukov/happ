@@ -10,6 +10,7 @@ mod dyfflike;
 pub mod go_compat;
 pub mod gotemplates;
 mod inspectweb;
+mod library_values;
 mod lsp;
 pub mod output;
 mod process_guard;

@@ -162,6 +162,8 @@ pub enum LibraryCommand {
     Version,
     #[command(about = "Extract embedded helm-apps chart into directory")]
     Extract(LibraryExtractArgs),
+    #[command(about = "Export library chart into standalone ordinary chart")]
+    ExportOrdinary(LibraryExportOrdinaryArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -171,6 +173,35 @@ pub struct LibraryExtractArgs {
         help = "Destination directory for embedded helm-apps chart"
     )]
     pub out_dir: String,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct LibraryExportOrdinaryArgs {
+    #[arg(long, help = "Path to source library chart")]
+    pub path: String,
+    #[arg(
+        long = "out-dir",
+        help = "Destination directory for generated ordinary chart"
+    )]
+    pub out_dir: String,
+    #[arg(long, help = "Override generated chart name")]
+    pub chart_name: Option<String>,
+    #[arg(
+        long,
+        help = "Optional environment to materialize from source library values; output chart itself keeps no env-map support"
+    )]
+    pub env: Option<String>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Verify source library chart render against generated ordinary chart render"
+    )]
+    pub verify_equivalence: bool,
+    #[arg(
+        long,
+        help = "Override helm-apps library chart path used as template source"
+    )]
+    pub library_chart_path: Option<String>,
 }
 
 #[cfg(test)]
@@ -274,6 +305,41 @@ mod tests {
             Command::Library(args) => match args.command {
                 LibraryCommand::Extract(extract) => {
                     assert_eq!(extract.out_dir, "/tmp/helm-apps");
+                }
+                other => panic!("unexpected library command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_library_export_ordinary_subcommand() {
+        let cli = Cli::try_parse_from([
+            "happ",
+            "library",
+            "export-ordinary",
+            "--path",
+            "/tmp/source-chart",
+            "--out-dir",
+            "/tmp/out-chart",
+            "--chart-name",
+            "demo",
+            "--env",
+            "prod",
+            "--verify-equivalence",
+            "--library-chart-path",
+            "/tmp/helm-apps",
+        ])
+        .expect("parse library export ordinary");
+        match cli.command.expect("command") {
+            Command::Library(args) => match args.command {
+                LibraryCommand::ExportOrdinary(export) => {
+                    assert_eq!(export.path, "/tmp/source-chart");
+                    assert_eq!(export.out_dir, "/tmp/out-chart");
+                    assert_eq!(export.chart_name.as_deref(), Some("demo"));
+                    assert_eq!(export.env.as_deref(), Some("prod"));
+                    assert!(export.verify_equivalence);
+                    assert_eq!(export.library_chart_path.as_deref(), Some("/tmp/helm-apps"));
                 }
                 other => panic!("unexpected library command: {other:?}"),
             },

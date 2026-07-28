@@ -115,7 +115,96 @@ fn run_library_command(args: &crate::cli::LibraryArgs) -> Result<(), Error> {
                 .map_err(|e| Error::Convert(format!("extract embedded helm-apps chart: {e}")))?;
             Ok(())
         }
+        crate::cli::LibraryCommand::ExportOrdinary(export_args) => {
+            run_library_export_ordinary_command(export_args)
+        }
     }
+}
+
+fn run_library_export_ordinary_command(
+    args: &crate::cli::LibraryExportOrdinaryArgs,
+) -> Result<(), Error> {
+    let loaded = crate::library_values::load_library_chart_values_for_export(
+        &args.path,
+        args.env.as_deref(),
+    )
+    .map_err(Error::Convert)?;
+    crate::output::generate_ordinary_chart_from_library_source(
+        &args.out_dir,
+        args.chart_name.as_deref(),
+        &loaded.values,
+        loaded.chart_root.to_str().ok_or_else(|| {
+            Error::Convert(format!(
+                "source chart root is not valid utf-8: {}",
+                loaded.chart_root.display()
+            ))
+        })?,
+        args.library_chart_path.as_deref(),
+        false,
+    )?;
+
+    if args.verify_equivalence {
+        let source_docs = render_chart_for_library_export_equivalence(
+            loaded.chart_root.to_str().ok_or_else(|| {
+                Error::Convert(format!(
+                    "source chart root is not valid utf-8: {}",
+                    loaded.chart_root.display()
+                ))
+            })?,
+            loaded.selected_env.as_deref(),
+        )?;
+        let generated_docs = render_chart_for_library_export_equivalence(
+            &args.out_dir,
+            loaded.selected_env.as_deref(),
+        )?;
+        let result = crate::verify::equivalent(&source_docs, &generated_docs);
+        if !result.equal {
+            return Err(Error::Convert(format!(
+                "verify equivalence failed: {}",
+                result.summary
+            )));
+        }
+        eprintln!("verify equivalence: {}", result.summary);
+    }
+    Ok(())
+}
+
+fn render_chart_for_library_export_equivalence(
+    chart_path: &str,
+    env: Option<&str>,
+) -> Result<Vec<serde_yaml::Value>, Error> {
+    let mut args = crate::cli::ImportArgs {
+        path: chart_path.to_string(),
+        env: env.unwrap_or("dev").to_string(),
+        group_name: "apps-k8s-manifests".into(),
+        group_type: "apps-k8s-manifests".into(),
+        min_include_bytes: 24,
+        include_status: false,
+        output: None,
+        out_chart_dir: None,
+        chart_name: None,
+        library_chart_path: None,
+        import_strategy: "helpers".into(),
+        allow_template_includes: Vec::new(),
+        unsupported_template_mode: "error".into(),
+        verify_equivalence: false,
+        release_name: "ordinary-export".into(),
+        namespace: None,
+        values_files: Vec::new(),
+        set_values: Vec::new(),
+        set_string_values: Vec::new(),
+        set_file_values: Vec::new(),
+        set_json_values: Vec::new(),
+        kube_version: None,
+        api_versions: Vec::new(),
+        include_crds: false,
+        write_rendered_output: None,
+    };
+    if let Some(env) = env {
+        args.set_string_values.push(format!("global.env={env}"));
+        args.env = env.to_string();
+    }
+    crate::source::load_documents_for_chart(&args).map_err(Error::Source)
 }
 
 fn reject_verify_equivalence_for_non_chart(args: &crate::cli::ImportArgs) -> Result<(), Error> {
