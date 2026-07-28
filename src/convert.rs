@@ -69,6 +69,11 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
     let mut raw_fallback: Vec<Value> = Vec::new();
     let mut raw_fallback_seen: HashSet<String> = HashSet::new();
 
+    let service_index = index_services_by_ns_name(docs);
+    let service_name_claims = count_governing_service_claims(docs);
+    // Services a StatefulSet took over; pass 2 must not emit them a second time.
+    let mut adopted_services: HashSet<String> = HashSet::new();
+
     // Pass 1: workloads first.
     for doc in docs {
         let Some(m) = doc.as_mapping() else {
@@ -88,7 +93,11 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
                 }
             }
             "StatefulSet" => {
-                if let Some((app_key, app)) = map_statefulset_to_apps_stateful(m) {
+                let governing = governing_headless_service(m, &service_index, &service_name_claims);
+                if let Some((app_key, app)) = map_statefulset_to_apps_stateful(m, governing) {
+                    if governing.is_some() {
+                        adopted_services.insert(governing_service_key(m));
+                    }
                     let final_key = insert_group_with_dedupe(&mut apps_stateful, &app_key, app);
                     let name = metadata_name(m);
                     if !name.is_empty() {
@@ -177,7 +186,10 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
                 }
             }
             "Service" => {
-                if let Some((app_key, app)) = map_service_to_apps_services(m) {
+                let key = ns_name_key(&metadata_namespace(m), &metadata_name(m));
+                if adopted_services.contains(&key) {
+                    // Already rendered from the StatefulSet's own .service block.
+                } else if let Some((app_key, app)) = map_service_to_apps_services(m) {
                     insert_group_with_dedupe(&mut apps_services, &app_key, app);
                 } else {
                     push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
@@ -696,9 +708,153 @@ fn map_deployment_to_apps_stateless(doc: &Mapping) -> Option<(String, Mapping)> 
     Some((sanitize_key(&name), app))
 }
 
+fn index_services_by_ns_name(docs: &[Value]) -> HashMap<String, &Mapping> {
+    let mut index: HashMap<String, &Mapping> = HashMap::new();
+    for doc in docs {
+        let Some(m) = doc.as_mapping() else {
+            continue;
+        };
+        if kind_of(m) != "Service" {
+            continue;
+        }
+        let name = metadata_name(m);
+        if name.is_empty() {
+            continue;
+        }
+        index.insert(ns_name_key(&metadata_namespace(m), &name), m);
+    }
+    index
+}
+
+// How many StatefulSets name each Service as their governing one. Two claimants
+// on one Service cannot both fold it in, so neither does.
+fn count_governing_service_claims(docs: &[Value]) -> HashMap<String, usize> {
+    let mut claims: HashMap<String, usize> = HashMap::new();
+    for doc in docs {
+        let Some(m) = doc.as_mapping() else {
+            continue;
+        };
+        if kind_of(m) != "StatefulSet" {
+            continue;
+        }
+        let key = governing_service_key(m);
+        if key.ends_with('/') {
+            continue;
+        }
+        *claims.entry(key).or_insert(0) += 1;
+    }
+    claims
+}
+
+// One spelling of the lookup key, so the index, the claim count and the
+// already-adopted set cannot drift apart.
+fn ns_name_key(ns: &str, name: &str) -> String {
+    format!("{}/{}", normalized_ns(ns), name.trim())
+}
+
+fn governing_service_key(statefulset: &Mapping) -> String {
+    let service_name = get_map(statefulset, "spec")
+        .and_then(|spec| get_str(spec, "serviceName"))
+        .unwrap_or_default();
+    ns_name_key(&metadata_namespace(statefulset), &service_name)
+}
+
+/// The Service a StatefulSet governs can live inside the app itself: the chart
+/// renders it from `.service` ("apps-components.service") and reads its name
+/// back out for `spec.serviceName` ("apps-specs.serviceName"), so one values
+/// block covers both. Folding is only safe when the standalone manifest is
+/// exactly what that block would produce, which is narrower than it looks --
+/// the inline path is not the same renderer as apps-services:
+///   - it drops a Service that has no ports (_apps-components.tpl:103), while
+///     apps-services renders it;
+///   - it substitutes the app's generated labels for an empty selector
+///     (_apps-components.tpl:106), while apps-services leaves the selector out;
+///   - "fl.generateLabels" stamps `app: <owning app>` on it rather than
+///     `app: <service app>`, so a Service pinning some other `app` label would
+///     come out relabelled.
+fn governing_headless_service<'a>(
+    statefulset: &Mapping,
+    services: &HashMap<String, &'a Mapping>,
+    claims: &HashMap<String, usize>,
+) -> Option<&'a Mapping> {
+    let sts_spec = get_map(statefulset, "spec")?;
+    let service_name = get_str(sts_spec, "serviceName")?;
+    let service_name = service_name.trim();
+    if service_name.is_empty() {
+        return None;
+    }
+
+    let key = governing_service_key(statefulset);
+    if claims.get(&key).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+    let service = *services.get(&key)?;
+    let service_spec = get_map(service, "spec")?;
+
+    if get_str(service_spec, "clusterIP").as_deref() != Some("None") {
+        return None;
+    }
+    match get_str(service_spec, "type").as_deref() {
+        None | Some("ClusterIP") => {}
+        Some(_) => return None,
+    }
+    if get_seq(service_spec, "ports")
+        .map(Vec::is_empty)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+
+    // The block must keep governing the same pods, and it only does so when the
+    // selector is spelled out -- an empty one would be regenerated from the app.
+    let selector = get_map(service_spec, "selector")?;
+    let match_labels = get_map(sts_spec, "selector").and_then(|s| get_map(s, "matchLabels"))?;
+    if selector.is_empty() || selector != match_labels {
+        return None;
+    }
+
+    // `app` is regenerated from the owning app's name either way, so refuse the
+    // fold when the manifest pins a different value and the move would lose it.
+    let app_label = get_map(service, "metadata")
+        .and_then(|meta| get_map(meta, "labels").and_then(|labels| get_str(labels, "app")));
+    if let Some(app_label) = app_label {
+        if app_label.trim() != metadata_name(statefulset) {
+            return None;
+        }
+    }
+
+    Some(service)
+}
+
+// Reuses the apps-services mapping so both shapes of the same Service stay in
+// step, then restates the parts the inline block spells differently.
+fn folded_service_block(service: &Mapping, service_name: &str) -> Option<Mapping> {
+    let (_, mapped) = map_service_to_apps_services(service)?;
+
+    let mut block = Mapping::new();
+    block.insert(k("enabled"), Value::Bool(true));
+    block.insert(k("name"), Value::String(service_name.to_string()));
+    // "apps-components.service" turns this into clusterIP: None itself.
+    block.insert(k("headless"), Value::Bool(true));
+    for (key, value) in mapped {
+        let Some(name) = key.as_str() else {
+            continue;
+        };
+        // namespace never reaches a rendered Service; the owning app carries it.
+        if matches!(name, "enabled" | "name" | "clusterIP" | "namespace") {
+            continue;
+        }
+        block.insert(key, value);
+    }
+    Some(block)
+}
+
 // Spec surface follows "apps-stateful.render" in
 // charts/helm-apps/templates/_apps-stateful.tpl.
-fn map_statefulset_to_apps_stateful(doc: &Mapping) -> Option<(String, Mapping)> {
+fn map_statefulset_to_apps_stateful(
+    doc: &Mapping,
+    governing_service: Option<&Mapping>,
+) -> Option<(String, Mapping)> {
     let (name, mut app, spec, pod_spec) = workload_app_base(doc, "StatefulSet")?;
 
     for key in [
@@ -712,13 +868,18 @@ fn map_statefulset_to_apps_stateful(doc: &Mapping) -> Option<(String, Mapping)> 
 
     // "apps-specs.serviceName" reads .service.name, and dereferences it
     // unconditionally -- a StatefulSet app without a service block fails to
-    // render. The governing headless Service itself arrives as its own manifest
-    // and is mapped into apps-services, so keep this block disabled to avoid
-    // emitting a second copy of it.
+    // render. When the governing Service qualifies it moves in here and renders
+    // from this block; otherwise it stays in apps-services and the block only
+    // carries the name, disabled so no second copy is emitted.
     if let Some(service_name) = get_str(&spec, "serviceName").filter(|v| !v.trim().is_empty()) {
-        let mut service = Mapping::new();
-        service.insert(k("enabled"), Value::Bool(false));
-        service.insert(k("name"), Value::String(service_name));
+        let service = governing_service
+            .and_then(|doc| folded_service_block(doc, &service_name))
+            .unwrap_or_else(|| {
+                let mut service = Mapping::new();
+                service.insert(k("enabled"), Value::Bool(false));
+                service.insert(k("name"), Value::String(service_name));
+                service
+            });
         app.insert(k("service"), Value::Mapping(service));
     }
 
@@ -3642,6 +3803,171 @@ spec:
         assert!(app.contains_key(&k("volumeClaimTemplates")));
         assert!(app.contains_key(&k("updateStrategy")));
         assert!(app.contains_key(&k("containers")));
+    }
+
+    const HEADLESS_SERVICE_DOC: &str = r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-headless
+  labels:
+    app: db
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: db
+  ports:
+  - name: pg
+    port: 5432
+    targetPort: 5432
+"#;
+
+    fn stateful_service_block(src: &str) -> (Mapping, bool) {
+        let docs = parse_docs(src);
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let service = single_app_of(root, "apps-stateful")
+            .get(&k("service"))
+            .and_then(Value::as_mapping)
+            .cloned()
+            .expect("service block is required by apps-stateful");
+        (service, root.contains_key(&k("apps-services")))
+    }
+
+    #[test]
+    fn helpers_statefulset_adopts_its_governing_headless_service() {
+        let (service, has_apps_services) =
+            stateful_service_block(&format!("{STATEFULSET_DOC}---{HEADLESS_SERVICE_DOC}"));
+
+        assert_eq!(service.get(&k("enabled")), Some(&Value::Bool(true)));
+        assert_eq!(
+            service.get(&k("name")).and_then(Value::as_str),
+            Some("db-headless"),
+            "the name still feeds spec.serviceName through apps-specs.serviceName"
+        );
+        assert_eq!(
+            service.get(&k("headless")),
+            Some(&Value::Bool(true)),
+            "apps-components.service derives clusterIP: None from this"
+        );
+        assert!(
+            !service.contains_key(&k("clusterIP")),
+            "headless already says it; spelling both is the apps-services shape"
+        );
+        assert!(
+            !service.contains_key(&k("namespace")),
+            "a rendered Service never carries it; the owning app does"
+        );
+        assert_eq!(
+            service.get(&k("selector")).and_then(Value::as_str),
+            Some("app: db"),
+            "an empty selector would be regenerated from the app's labels"
+        );
+        assert!(service.contains_key(&k("ports")));
+        assert_eq!(
+            service.get(&k("publishNotReadyAddresses")),
+            Some(&Value::Bool(true))
+        );
+        assert!(
+            !has_apps_services,
+            "the Service renders from the app now; a second copy would collide"
+        );
+    }
+
+    #[test]
+    fn helpers_statefulset_leaves_a_portless_headless_service_alone() {
+        // "apps-components.service" renders nothing when ports are empty, so
+        // folding a portless Service in would drop it from the output entirely.
+        let service_doc = HEADLESS_SERVICE_DOC
+            .split("  ports:")
+            .next()
+            .expect("service head");
+        let (service, has_apps_services) =
+            stateful_service_block(&format!("{STATEFULSET_DOC}---{service_doc}"));
+
+        assert_eq!(service.get(&k("enabled")), Some(&Value::Bool(false)));
+        assert!(has_apps_services, "apps-services still renders it");
+    }
+
+    #[test]
+    fn helpers_statefulset_leaves_a_non_headless_service_alone() {
+        let service_doc = HEADLESS_SERVICE_DOC.replace("clusterIP: None", "clusterIP: 10.0.0.5");
+        let (service, has_apps_services) =
+            stateful_service_block(&format!("{STATEFULSET_DOC}---{service_doc}"));
+
+        assert_eq!(service.get(&k("enabled")), Some(&Value::Bool(false)));
+        assert!(has_apps_services);
+    }
+
+    #[test]
+    fn helpers_statefulset_leaves_a_service_that_selects_other_pods_alone() {
+        let service_doc = HEADLESS_SERVICE_DOC.replace(
+            "  selector:\n    app: db\n",
+            "  selector:\n    app: db-other\n",
+        );
+        let (service, has_apps_services) =
+            stateful_service_block(&format!("{STATEFULSET_DOC}---{service_doc}"));
+
+        assert_eq!(service.get(&k("enabled")), Some(&Value::Bool(false)));
+        assert!(has_apps_services);
+    }
+
+    #[test]
+    fn helpers_statefulset_leaves_a_service_pinning_another_app_label_alone() {
+        // "fl.generateLabels" would restamp it as app: db on the way in. Only
+        // the label moves here -- the selector still has to match, or the guard
+        // under test is not the one doing the work.
+        let service_doc = HEADLESS_SERVICE_DOC.replacen(
+            "  labels:\n    app: db\n",
+            "  labels:\n    app: db-headless\n",
+            1,
+        );
+        let (service, has_apps_services) =
+            stateful_service_block(&format!("{STATEFULSET_DOC}---{service_doc}"));
+
+        assert_eq!(service.get(&k("enabled")), Some(&Value::Bool(false)));
+        assert!(has_apps_services);
+    }
+
+    #[test]
+    fn helpers_statefulset_leaves_a_service_in_another_namespace_alone() {
+        let service_doc = HEADLESS_SERVICE_DOC.replace(
+            "  name: db-headless\n",
+            "  name: db-headless\n  namespace: other\n",
+        );
+        let (service, has_apps_services) =
+            stateful_service_block(&format!("{STATEFULSET_DOC}---{service_doc}"));
+
+        assert_eq!(service.get(&k("enabled")), Some(&Value::Bool(false)));
+        assert!(has_apps_services);
+    }
+
+    #[test]
+    fn helpers_two_statefulsets_claiming_one_service_leave_it_alone() {
+        // Whichever app adopted it would render it under its own labels and the
+        // other would lose its governing Service, so neither adopts.
+        let second = STATEFULSET_DOC.replace("name: db\n", "name: db2\n");
+        let docs = parse_docs(&format!(
+            "{STATEFULSET_DOC}---{second}---{HEADLESS_SERVICE_DOC}"
+        ));
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+
+        let stateful = root
+            .get(&k("apps-stateful"))
+            .and_then(Value::as_mapping)
+            .expect("apps-stateful");
+        assert_eq!(stateful.len(), 2);
+        for app in stateful.values() {
+            let service = app
+                .as_mapping()
+                .and_then(|app| app.get(&k("service")))
+                .and_then(Value::as_mapping)
+                .expect("service block");
+            assert_eq!(service.get(&k("enabled")), Some(&Value::Bool(false)));
+        }
+        assert!(root.contains_key(&k("apps-services")));
     }
 
     #[test]

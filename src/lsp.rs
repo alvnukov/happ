@@ -5185,23 +5185,6 @@ fn merge_maps(
     out
 }
 
-fn walk_maps(value: &JsonValue, on_map: &mut dyn FnMut(&JsonMap<String, JsonValue>)) {
-    match value {
-        JsonValue::Array(items) => {
-            for item in items {
-                walk_maps(item, on_map);
-            }
-        }
-        JsonValue::Object(map) => {
-            on_map(map);
-            for v in map.values() {
-                walk_maps(v, on_map);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn as_obj(value: &JsonValue) -> Option<&JsonMap<String, JsonValue>> {
     match value {
         JsonValue::Object(map) => Some(map),
