@@ -48,6 +48,10 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
     let mut apps_pvcs = Mapping::new();
     let mut apps_limit_range = Mapping::new();
     let mut apps_certificates = Mapping::new();
+    let mut apps_dex_clients = Mapping::new();
+    let mut apps_dex_authenticators = Mapping::new();
+    let mut apps_prometheus_rules = Mapping::new();
+    let mut apps_infra_node_users = Mapping::new();
 
     let mut stateless_by_ns_name: HashMap<String, String> = HashMap::new();
     let mut stateful_by_ns_name: HashMap<String, String> = HashMap::new();
@@ -107,6 +111,34 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
         let kind = kind_of(m);
         match kind.as_str() {
             "Deployment" | "StatefulSet" => {}
+            "DexClient" => {
+                if let Some((app_key, app)) = map_dex_client_to_apps_dex_clients(m) {
+                    insert_group_with_dedupe(&mut apps_dex_clients, &app_key, app);
+                } else {
+                    push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
+                }
+            }
+            "DexAuthenticator" => {
+                if let Some((app_key, app)) = map_dex_authenticator_to_apps_dex_authenticators(m) {
+                    insert_group_with_dedupe(&mut apps_dex_authenticators, &app_key, app);
+                } else {
+                    push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
+                }
+            }
+            "CustomPrometheusRules" => {
+                if let Some((app_key, app)) = map_custom_prometheus_rules(m) {
+                    insert_group_with_dedupe(&mut apps_prometheus_rules, &app_key, app);
+                } else {
+                    push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
+                }
+            }
+            "NodeUser" => {
+                if let Some((app_key, app)) = map_node_user_to_apps_infra(m) {
+                    insert_group_with_dedupe(&mut apps_infra_node_users, &app_key, app);
+                } else {
+                    push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
+                }
+            }
             "PersistentVolumeClaim" => {
                 if let Some((app_key, app)) = map_pvc_to_apps_pvcs(m) {
                     insert_group_with_dedupe(&mut apps_pvcs, &app_key, app);
@@ -248,6 +280,27 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
     }
     if !apps_certificates.is_empty() {
         root.insert(k("apps-certificates"), Value::Mapping(apps_certificates));
+    }
+    if !apps_dex_clients.is_empty() {
+        root.insert(k("apps-dex-clients"), Value::Mapping(apps_dex_clients));
+    }
+    if !apps_dex_authenticators.is_empty() {
+        root.insert(
+            k("apps-dex-authenticators"),
+            Value::Mapping(apps_dex_authenticators),
+        );
+    }
+    if !apps_prometheus_rules.is_empty() {
+        root.insert(
+            k("apps-custom-prometheus-rules"),
+            Value::Mapping(apps_prometheus_rules),
+        );
+    }
+    if !apps_infra_node_users.is_empty() {
+        // apps-infra nests its apps under node-users / node-groups.
+        let mut infra = Mapping::new();
+        infra.insert(k("node-users"), Value::Mapping(apps_infra_node_users));
+        root.insert(k("apps-infra"), Value::Mapping(infra));
     }
     if !apps_configmaps.is_empty() {
         root.insert(k("apps-configmaps"), Value::Mapping(apps_configmaps));
@@ -821,6 +874,211 @@ fn map_certificate_to_apps_certificates(doc: &Mapping) -> Option<(String, Mappin
         }
     }
 
+    Some((sanitize_key(&name), app))
+}
+
+// Copies spec keys the group renders, and refuses the document when anything
+// else is present. Groups without an extraSpec escape hatch would otherwise
+// drop those fields silently on render.
+fn map_exact_spec_keys(
+    app: &mut Mapping,
+    spec: &Mapping,
+    scalars: &[&str],
+    blocks: &[&str],
+) -> Option<()> {
+    let mut allowed: Vec<&str> = Vec::with_capacity(scalars.len() + blocks.len());
+    allowed.extend_from_slice(scalars);
+    allowed.extend_from_slice(blocks);
+    if extract_by_allowed(spec, &allowed).is_some() {
+        return None;
+    }
+    for key in scalars {
+        copy_scalar_if_present(app, spec, key);
+    }
+    for key in blocks {
+        if let Some(v) = spec.get(&k(*key)) {
+            if let Some(s) = yaml_body_clean(v) {
+                app.insert(k(*key), Value::String(s));
+            }
+        }
+    }
+    Some(())
+}
+
+// "apps-dex-clients.render" emits spec.redirectURIs and nothing else.
+fn map_dex_client_to_apps_dex_clients(doc: &Mapping) -> Option<(String, Mapping)> {
+    if kind_of(doc) != "DexClient"
+        || !get_str(doc, "apiVersion")
+            .unwrap_or_default()
+            .starts_with("deckhouse.io/")
+    {
+        return None;
+    }
+    let name = metadata_name(doc);
+    if name.is_empty() {
+        return None;
+    }
+    let spec = get_map(doc, "spec").cloned().unwrap_or_default();
+    // E_DEX_REQUIRED_FIELD: the render fails without redirectURIs.
+    if get_seq(&spec, "redirectURIs").is_none_or(Vec::is_empty) {
+        return None;
+    }
+
+    let mut app = base_app_with_metadata(doc, &name);
+    map_exact_spec_keys(&mut app, &spec, &[], &["redirectURIs"])?;
+    Some((sanitize_key(&name), app))
+}
+
+// Spec surface follows "apps-dex-authenticators.render".
+fn map_dex_authenticator_to_apps_dex_authenticators(doc: &Mapping) -> Option<(String, Mapping)> {
+    if kind_of(doc) != "DexAuthenticator"
+        || !get_str(doc, "apiVersion")
+            .unwrap_or_default()
+            .starts_with("deckhouse.io/")
+    {
+        return None;
+    }
+    let name = metadata_name(doc);
+    if name.is_empty() {
+        return None;
+    }
+    let spec = get_map(doc, "spec").cloned().unwrap_or_default();
+    // E_DEX_REQUIRED_FIELD: the render fails without applicationDomain.
+    if get_str(&spec, "applicationDomain").is_none_or(|v| v.trim().is_empty()) {
+        return None;
+    }
+
+    let mut app = base_app_with_metadata(doc, &name);
+    map_exact_spec_keys(
+        &mut app,
+        &spec,
+        &[
+            "applicationDomain",
+            "applicationIngressCertificateSecretName",
+            "applicationIngressClassName",
+            "keepUsersLoggedInFor",
+            "signOutURL",
+            "sendAuthorizationHeader",
+        ],
+        &[
+            "whitelistSourceRanges",
+            "tolerations",
+            "allowedGroups",
+            "nodeSelector",
+        ],
+    )?;
+    Some((sanitize_key(&name), app))
+}
+
+// "apps-custom-prometheus-rules.render" inverts the manifest shape: rule lists
+// become alert maps keyed by alert name. It builds metadata by hand (fixed
+// component/prometheus labels, no annotations or namespace) and always emits
+// "- alert:", so recording rules have no representation.
+fn map_custom_prometheus_rules(doc: &Mapping) -> Option<(String, Mapping)> {
+    if kind_of(doc) != "CustomPrometheusRules"
+        || !get_str(doc, "apiVersion")
+            .unwrap_or_default()
+            .starts_with("deckhouse.io/")
+    {
+        return None;
+    }
+    let name = metadata_name(doc);
+    if name.is_empty() {
+        return None;
+    }
+    let metadata = get_map(doc, "metadata").cloned().unwrap_or_default();
+    if metadata.contains_key(&k("annotations")) {
+        return None;
+    }
+    let ns = metadata_namespace(doc);
+    if !ns.trim().is_empty() && ns.trim() != "default" {
+        return None;
+    }
+    let spec = get_map(doc, "spec").cloned().unwrap_or_default();
+    if extract_by_allowed(&spec, &["groups"]).is_some() {
+        return None;
+    }
+
+    let mut groups = Mapping::new();
+    for group in get_seq(&spec, "groups")?.iter() {
+        let group = group.as_mapping()?;
+        let group_name = get_str(group, "name").filter(|v| !v.trim().is_empty())?;
+        if extract_by_allowed(group, &["name", "rules"]).is_some() {
+            return None;
+        }
+        let mut alerts = Mapping::new();
+        for rule in get_seq(group, "rules")?.iter() {
+            let rule = rule.as_mapping()?;
+            let alert_name = get_str(rule, "alert").filter(|v| !v.trim().is_empty())?;
+            let body = extract_by_allowed(rule, &["alert"])?;
+            let mut alert = Mapping::new();
+            alert.insert(
+                k("content"),
+                Value::String(yaml_body(&Value::Mapping(body))?),
+            );
+            alerts.insert(k(&alert_name), Value::Mapping(alert));
+        }
+        if alerts.is_empty() {
+            return None;
+        }
+        let mut group_map = Mapping::new();
+        group_map.insert(k("alerts"), Value::Mapping(alerts));
+        groups.insert(k(&group_name), Value::Mapping(group_map));
+    }
+    if groups.is_empty() {
+        return None;
+    }
+
+    let mut app = Mapping::new();
+    app.insert(k("enabled"), Value::Bool(true));
+    app.insert(k("name"), Value::String(name.clone()));
+    app.insert(k("groups"), Value::Mapping(groups));
+    Some((sanitize_key(&name), app))
+}
+
+// "apps-infra.node-users" nests apps under a "node-users" key instead of
+// holding them directly, and renders no namespace.
+fn map_node_user_to_apps_infra(doc: &Mapping) -> Option<(String, Mapping)> {
+    if kind_of(doc) != "NodeUser"
+        || !get_str(doc, "apiVersion")
+            .unwrap_or_default()
+            .starts_with("deckhouse.io/")
+    {
+        return None;
+    }
+    let name = metadata_name(doc);
+    if name.is_empty() {
+        return None;
+    }
+    let ns = metadata_namespace(doc);
+    if !ns.trim().is_empty() && ns.trim() != "default" {
+        return None;
+    }
+    let spec = get_map(doc, "spec").cloned().unwrap_or_default();
+    // generateSpecs marks uid as Required.
+    if !spec.contains_key(&k("uid")) {
+        return None;
+    }
+
+    let metadata = get_map(doc, "metadata").cloned().unwrap_or_default();
+    let mut app = Mapping::new();
+    app.insert(k("enabled"), Value::Bool(true));
+    if let Some(labels) = filter_imported_metadata_labels(metadata.get(&k("labels"))) {
+        if let Some(s) = yaml_body(&labels) {
+            app.insert(k("labels"), Value::String(s));
+        }
+    }
+    if let Some(v) = metadata.get(&k("annotations")) {
+        if let Some(s) = yaml_body(v) {
+            app.insert(k("annotations"), Value::String(s));
+        }
+    }
+    map_exact_spec_keys(
+        &mut app,
+        &spec,
+        &["uid", "sshPublicKey", "passwordHash", "isSudoer"],
+        &["extraGroups", "nodeGroups", "sshPublicKeys"],
+    )?;
     Some((sanitize_key(&name), app))
 }
 
@@ -3797,6 +4055,264 @@ spec:
             !root.contains_key(&k("apps-certificates")),
             "the component emits no labels, so mapping would drop them silently"
         );
+    }
+
+    #[test]
+    fn helpers_dex_client_maps_to_apps_dex_clients() {
+        let docs = parse_docs(
+            r#"
+apiVersion: deckhouse.io/v1alpha1
+kind: DexClient
+metadata:
+  name: grafana
+spec:
+  redirectURIs:
+  - https://grafana.example.com/callback
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let app = single_app_of(root, "apps-dex-clients");
+        assert!(app
+            .get(&k("redirectURIs"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("grafana.example.com")));
+    }
+
+    #[test]
+    fn helpers_dex_authenticator_maps_to_apps_dex_authenticators() {
+        let docs = parse_docs(
+            r#"
+apiVersion: deckhouse.io/v1
+kind: DexAuthenticator
+metadata:
+  name: gate
+spec:
+  applicationDomain: gate.example.com
+  applicationIngressClassName: nginx
+  allowedGroups:
+  - admins
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let app = single_app_of(root, "apps-dex-authenticators");
+        assert_eq!(
+            app.get(&k("applicationDomain")).and_then(Value::as_str),
+            Some("gate.example.com")
+        );
+        assert!(app
+            .get(&k("allowedGroups"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("admins")));
+    }
+
+    // Both dex renders fail fast with E_DEX_REQUIRED_FIELD, and neither group
+    // has an extraSpec escape hatch.
+    #[test]
+    fn helpers_dex_outside_the_render_shape_stays_raw() {
+        for doc in [
+            // DexClient without the required redirectURIs
+            r#"
+apiVersion: deckhouse.io/v1alpha1
+kind: DexClient
+metadata:
+  name: grafana
+spec: {}
+"#,
+            // DexAuthenticator without the required applicationDomain
+            r#"
+apiVersion: deckhouse.io/v1
+kind: DexAuthenticator
+metadata:
+  name: gate
+spec:
+  applicationIngressClassName: nginx
+"#,
+            // spec field the render cannot emit
+            r#"
+apiVersion: deckhouse.io/v1
+kind: DexAuthenticator
+metadata:
+  name: gate
+spec:
+  applicationDomain: gate.example.com
+  unsupportedField: true
+"#,
+        ] {
+            let values = build_values(&import_args("helpers"), &parse_docs(doc)).expect("values");
+            let root = values.as_mapping().expect("root");
+            assert!(
+                !root.contains_key(&k("apps-dex-clients"))
+                    && !root.contains_key(&k("apps-dex-authenticators")),
+                "must not claim a dex resource it cannot render: {doc}"
+            );
+            assert!(root.contains_key(&k("apps-k8s-manifests")));
+        }
+    }
+
+    #[test]
+    fn helpers_custom_prometheus_rules_invert_rule_lists_into_alert_maps() {
+        let docs = parse_docs(
+            r#"
+apiVersion: deckhouse.io/v1
+kind: CustomPrometheusRules
+metadata:
+  name: app-alerts
+spec:
+  groups:
+  - name: availability
+    rules:
+    - alert: AppDown
+      expr: up == 0
+      for: 5m
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let app = single_app_of(root, "apps-custom-prometheus-rules");
+        let content = app
+            .get(&k("groups"))
+            .and_then(Value::as_mapping)
+            .and_then(|groups| groups.get(&k("availability")))
+            .and_then(Value::as_mapping)
+            .and_then(|group| group.get(&k("alerts")))
+            .and_then(Value::as_mapping)
+            .and_then(|alerts| alerts.get(&k("AppDown")))
+            .and_then(Value::as_mapping)
+            .and_then(|alert| alert.get(&k("content")))
+            .and_then(Value::as_str)
+            .expect("alert content");
+        assert!(
+            content.contains("expr: up == 0"),
+            "unexpected content: {content}"
+        );
+        assert!(
+            !content.contains("alert:"),
+            "the alert name becomes the map key, not part of the body"
+        );
+    }
+
+    // The render always emits "- alert: <key>", so a recording rule cannot be
+    // expressed through this group.
+    #[test]
+    fn helpers_prometheus_recording_rule_stays_raw() {
+        let docs = parse_docs(
+            r#"
+apiVersion: deckhouse.io/v1
+kind: CustomPrometheusRules
+metadata:
+  name: app-rules
+spec:
+  groups:
+  - name: aggregation
+    rules:
+    - record: job:requests:rate5m
+      expr: sum(rate(requests[5m]))
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        assert!(!root.contains_key(&k("apps-custom-prometheus-rules")));
+        assert!(root.contains_key(&k("apps-k8s-manifests")));
+    }
+
+    #[test]
+    fn helpers_node_user_maps_into_apps_infra_node_users() {
+        let docs = parse_docs(
+            r#"
+apiVersion: deckhouse.io/v1
+kind: NodeUser
+metadata:
+  name: ops
+spec:
+  uid: 1001
+  isSudoer: true
+  sshPublicKeys:
+  - ssh-rsa AAAAB3demo
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let app = root
+            .get(&k("apps-infra"))
+            .and_then(Value::as_mapping)
+            .and_then(|infra| infra.get(&k("node-users")))
+            .and_then(Value::as_mapping)
+            .and_then(|users| users.values().next())
+            .and_then(Value::as_mapping)
+            .expect("node user app");
+        assert_eq!(app.get(&k("uid")).and_then(Value::as_u64), Some(1001));
+        assert_eq!(app.get(&k("isSudoer")), Some(&Value::Bool(true)));
+        assert!(app
+            .get(&k("sshPublicKeys"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("ssh-rsa")));
+    }
+
+    // generateSpecs marks uid as Required for node-users.
+    #[test]
+    fn helpers_node_user_without_uid_stays_raw() {
+        let docs = parse_docs(
+            r#"
+apiVersion: deckhouse.io/v1
+kind: NodeUser
+metadata:
+  name: ops
+spec:
+  isSudoer: true
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        assert!(!root.contains_key(&k("apps-infra")));
+        assert!(root.contains_key(&k("apps-k8s-manifests")));
+    }
+
+    // Documents the groups that cannot be reached by importing values:
+    // - GrafanaDashboardDefinition reads spec.definition from the chart file
+    //   dashboards/<name>.json, which values cannot carry
+    // - NodeGroup renders through generateSpecs with every list empty
+    //   (_apps-infra.tpl is headed "# TODO:")
+    // - apps-kafka-strimzi is a composite: one app also emits four
+    //   VerticalPodAutoscalers absent from the imported manifest
+    #[test]
+    fn helpers_groups_without_a_values_only_representation_stay_raw() {
+        for doc in [
+            r#"
+apiVersion: deckhouse.io/v1alpha1
+kind: GrafanaDashboardDefinition
+metadata:
+  name: overview
+spec:
+  folder: Custom
+  definition: '{"panels":[]}'
+"#,
+            r#"
+apiVersion: deckhouse.io/v1
+kind: NodeGroup
+metadata:
+  name: workers
+spec:
+  nodeType: Static
+"#,
+            r#"
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: events
+spec:
+  kafka:
+    replicas: 3
+"#,
+        ] {
+            let values = build_values(&import_args("helpers"), &parse_docs(doc)).expect("values");
+            let root = values.as_mapping().expect("root");
+            assert!(
+                root.contains_key(&k("apps-k8s-manifests")),
+                "must stay a raw manifest: {doc}"
+            );
+        }
     }
 
     #[test]
