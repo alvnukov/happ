@@ -663,6 +663,88 @@ pub fn generate_consumer_chart(
     Ok(())
 }
 
+pub fn generate_ordinary_chart_from_library_source(
+    out_dir: &str,
+    chart_name: Option<&str>,
+    values: &Value,
+    source_chart_root: &str,
+    library_chart_path: Option<&str>,
+    yaml_anchors: bool,
+) -> Result<(), Error> {
+    let out_path = Path::new(out_dir);
+    let source_root = Path::new(source_chart_root);
+    if !source_root.join("Chart.yaml").exists() {
+        return Err(Error::Library(format!(
+            "source chart root '{}' does not contain Chart.yaml",
+            source_chart_root
+        )));
+    }
+
+    fs::create_dir_all(out_path)?;
+    let templates_out = out_path.join("templates");
+    if templates_out.exists() {
+        fs::remove_dir_all(&templates_out)?;
+    }
+    fs::create_dir_all(&templates_out)?;
+
+    let chart_yaml = build_application_chart_yaml_from_source(source_root, chart_name)?;
+    fs::write(out_path.join("Chart.yaml"), chart_yaml.as_bytes())?;
+    write_values_with_yaml_anchors(
+        Some(&out_path.join("values.yaml").to_string_lossy()),
+        values,
+        yaml_anchors,
+    )?;
+
+    let source_templates = source_root.join("templates");
+    if source_templates.is_dir() {
+        copy_dir_inner(&source_templates, &templates_out)?;
+    }
+
+    let vendored_library = source_root.join("charts/helm-apps");
+    let mut extracted_library: Option<tempfile::TempDir> = None;
+    let library_root = if vendored_library.join("Chart.yaml").exists() {
+        vendored_library
+    } else if let Some(explicit_root) = resolve_library_path(library_chart_path)? {
+        explicit_root
+    } else if crate::assets::has_helm_apps_chart() {
+        let temp = tempfile::Builder::new()
+            .prefix("happ-ordinary-chart-lib-")
+            .tempdir()?;
+        let extracted_root = temp.path().join("helm-apps");
+        crate::assets::extract_helm_apps_chart(&extracted_root)?;
+        extracted_library = Some(temp);
+        extracted_root
+    } else {
+        return Err(Error::Library(
+            "embedded helm-apps chart is unavailable and source chart does not vendor charts/helm-apps"
+                .to_string(),
+        ));
+    };
+
+    let library_templates = library_root.join("templates");
+    if !library_templates.is_dir() {
+        return Err(Error::Library(format!(
+            "library chart '{}' does not contain templates directory",
+            library_root.display()
+        )));
+    }
+    copy_dir_inner(&library_templates, &templates_out)?;
+
+    sync_optional_dir(
+        &source_root.join("dashboards"),
+        &out_path.join("dashboards"),
+    )?;
+    sync_optional_dir(&source_root.join("files"), &out_path.join("files"))?;
+
+    let charts_dir = out_path.join("charts");
+    if charts_dir.exists() {
+        fs::remove_dir_all(charts_dir)?;
+    }
+    let _ = copy_chart_crds_if_any(source_chart_root, out_dir)?;
+    drop(extracted_library);
+    Ok(())
+}
+
 pub fn copy_chart_crds_if_any(source_chart_path: &str, out_dir: &str) -> Result<bool, Error> {
     let src_crds = Path::new(source_chart_path).join("crds");
     if !src_crds.exists() || !src_crds.is_dir() {
@@ -803,6 +885,38 @@ fn resolve_library_path(explicit: Option<&str>) -> Result<Option<PathBuf>, Error
     Ok(None)
 }
 
+fn build_application_chart_yaml_from_source(
+    source_root: &Path,
+    chart_name: Option<&str>,
+) -> Result<String, Error> {
+    let chart_yaml_path = source_root.join("Chart.yaml");
+    let chart_yaml_text = fs::read_to_string(&chart_yaml_path)?;
+    let mut chart_yaml: Value = serde_yaml::from_str(&chart_yaml_text)?;
+    let chart_map = chart_yaml
+        .as_mapping_mut()
+        .ok_or_else(|| Error::YamlFormat("source Chart.yaml must be a YAML map".to_string()))?;
+
+    chart_map.remove(Value::String("dependencies".into()));
+    chart_map.insert(
+        Value::String("type".into()),
+        Value::String("application".into()),
+    );
+    if let Some(name) = chart_name.map(str::trim).filter(|value| !value.is_empty()) {
+        chart_map.insert(
+            Value::String("name".into()),
+            Value::String(name.to_string()),
+        );
+    }
+    if !chart_map.contains_key(Value::String("apiVersion".into())) {
+        chart_map.insert(
+            Value::String("apiVersion".into()),
+            Value::String("v2".into()),
+        );
+    }
+    let rendered = serde_yaml::to_string(&chart_yaml)?;
+    Ok(rendered.trim_start_matches("---\n").to_string())
+}
+
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), Error> {
     if dst.exists() {
         fs::remove_dir_all(dst)?;
@@ -822,6 +936,15 @@ fn copy_dir_inner(src: &Path, dst: &Path) -> Result<(), Error> {
         } else {
             fs::copy(&p, &target)?;
         }
+    }
+    Ok(())
+}
+
+fn sync_optional_dir(src: &Path, dst: &Path) -> Result<(), Error> {
+    if src.is_dir() {
+        copy_dir(src, dst)?;
+    } else if dst.exists() {
+        fs::remove_dir_all(dst)?;
     }
     Ok(())
 }
@@ -1523,6 +1646,221 @@ apps-k8s-manifests:
     }
 
     #[test]
+    fn generate_ordinary_chart_reuses_source_chart_metadata_and_templates() {
+        let td = TempDir::new().expect("tmp");
+        let source = td.path().join("source-chart");
+        let out = td.path().join("ordinary-chart");
+        fs::create_dir_all(source.join("templates")).expect("mkdir source templates");
+        fs::create_dir_all(source.join("charts/helm-apps/templates"))
+            .expect("mkdir vendored library templates");
+        fs::create_dir_all(source.join("dashboards")).expect("mkdir dashboards");
+        fs::write(
+            source.join("Chart.yaml"),
+            r#"
+apiVersion: v2
+name: source-demo
+type: library
+version: 1.2.3
+appVersion: "9.9.9"
+annotations:
+  demo: "true"
+dependencies:
+  - name: helm-apps
+    version: 1.0.0
+"#,
+        )
+        .expect("write source chart yaml");
+        fs::write(source.join("values.yaml"), "global:\n  env: dev\n").expect("write values");
+        fs::write(
+            source.join("templates/imported-source-includes.tpl"),
+            "{{- define \"source.helper\" -}}ok{{- end -}}\n",
+        )
+        .expect("write source helper");
+        fs::write(
+            source.join("charts/helm-apps/Chart.yaml"),
+            "apiVersion: v2\nname: helm-apps\ntype: library\nversion: 0.1.0\n",
+        )
+        .expect("write vendored chart yaml");
+        fs::write(
+            source.join("charts/helm-apps/templates/_apps-helpers.tpl"),
+            "{{- define \"apps-utils.init-library\" -}}ok{{- end -}}\n",
+        )
+        .expect("write library helper");
+        fs::write(source.join("dashboards/demo.json"), "{}\n").expect("write dashboard");
+
+        let values: Value = serde_yaml::from_str("global:\n  env: dev\n").expect("parse values");
+        generate_ordinary_chart_from_library_source(
+            out.to_str().expect("out"),
+            Some("renamed-demo"),
+            &values,
+            source.to_str().expect("source"),
+            None,
+            false,
+        )
+        .expect("generate ordinary chart");
+
+        let chart_yaml = fs::read_to_string(out.join("Chart.yaml")).expect("read chart yaml");
+        assert!(chart_yaml.contains("name: renamed-demo"));
+        assert!(chart_yaml.contains("type: application"));
+        assert!(chart_yaml.contains("version: 1.2.3"));
+        assert!(chart_yaml.contains("appVersion: 9.9.9"));
+        assert!(!chart_yaml.contains("dependencies:"));
+        assert!(out.join("templates/imported-source-includes.tpl").exists());
+        assert!(out.join("templates/_apps-helpers.tpl").exists());
+        assert!(out.join("dashboards/demo.json").exists());
+        assert!(!out.join("charts").exists());
+    }
+
+    #[test]
+    fn ordinary_chart_from_library_source_renders_equivalent_with_flattened_values() {
+        let td = TempDir::new().expect("tmp");
+        let source = td.path().join("source-chart");
+        let out = td.path().join("ordinary-chart");
+        let values: Value = serde_yaml::from_str(
+            r#"
+global:
+  env: prod
+  vars:
+    registry:
+      _default: registry.dev.example.com
+      prod: registry.prod.example.com
+  _includes:
+    base-api:
+      labels: |
+        role: api
+apps-stateless:
+  api:
+    _include: ["base-api"]
+    enabled: true
+    replicas:
+      _default: 1
+      prod: 2
+    containers:
+      app:
+        image:
+          name: '$fl.value{global.vars.registry}/nginx'
+          staticTag:
+            _default: latest
+            prod: "1.27"
+        envVars:
+          RESOLVED: '$fl.value{global.vars.registry}'
+          LITERAL: '$$fl.value{global.vars.registry}'
+"#,
+        )
+        .expect("parse values");
+        generate_consumer_chart(
+            source.to_str().expect("source"),
+            Some("source-demo"),
+            &values,
+            None,
+            false,
+        )
+        .expect("generate consumer chart");
+
+        let loaded = crate::library_values::load_library_chart_values_for_export(
+            source.to_str().expect("source"),
+            None,
+        )
+        .expect("load flattened values");
+        generate_ordinary_chart_from_library_source(
+            out.to_str().expect("out"),
+            Some("ordinary-demo"),
+            &loaded.values,
+            source.to_str().expect("source"),
+            None,
+            false,
+        )
+        .expect("generate ordinary chart");
+
+        let mut source_args = ordinary_render_args(source.to_str().expect("source"));
+        if let Some(env) = loaded.selected_env.as_deref() {
+            source_args
+                .set_string_values
+                .push(format!("global.env={env}"));
+            source_args.env = env.to_string();
+        }
+        let source_docs =
+            crate::source::load_documents_for_chart(&source_args).expect("source render");
+
+        let ordinary_args = ordinary_render_args(out.to_str().expect("out"));
+        let ordinary_docs =
+            crate::source::load_documents_for_chart(&ordinary_args).expect("ordinary render");
+
+        // Pin the $fl.value contract itself, not just source/generated parity:
+        // a marker resolves, an escaped marker stays literal after exactly one
+        // unescape. Rendered by the vendored Helm the binary actually ships.
+        // Numeric fidelity through the Go helper decode path: before
+        // chart_ir::json_to_yaml_value this arrived as a
+        // "$serde_json::private::Number" map on both sides, so plain
+        // source-vs-generated parity could not see the breakage.
+        let source_replicas = deployment_replicas(&source_docs);
+        assert_eq!(
+            source_replicas,
+            Some(2),
+            "rendered spec.replicas must stay a YAML number"
+        );
+        assert_eq!(deployment_replicas(&ordinary_docs), source_replicas);
+
+        let source_env = deployment_container_env(&source_docs);
+        assert_eq!(
+            source_env.get("RESOLVED").map(String::as_str),
+            Some("registry.prod.example.com"),
+            "source render must resolve $fl.value marker"
+        );
+        assert_eq!(
+            source_env.get("LITERAL").map(String::as_str),
+            Some("$fl.value{global.vars.registry}"),
+            "source render must unescape $$fl.value exactly once"
+        );
+        assert_eq!(
+            deployment_container_env(&ordinary_docs),
+            source_env,
+            "exported chart must reproduce both markers identically"
+        );
+
+        let result = crate::verify::equivalent(&source_docs, &ordinary_docs);
+        assert!(
+            result.equal,
+            "ordinary chart must stay semantically equivalent: {}",
+            result.summary
+        );
+    }
+
+    fn deployment_replicas(docs: &[Value]) -> Option<u64> {
+        docs.iter()
+            .find(|doc| doc.get("kind").and_then(Value::as_str) == Some("Deployment"))
+            .and_then(|doc| doc.get("spec"))
+            .and_then(|spec| spec.get("replicas"))
+            .and_then(Value::as_u64)
+    }
+
+    fn deployment_container_env(docs: &[Value]) -> BTreeMap<String, String> {
+        let mut collected = BTreeMap::new();
+        for doc in docs {
+            if doc.get("kind").and_then(Value::as_str) != Some("Deployment") {
+                continue;
+            }
+            let containers = doc
+                .get("spec")
+                .and_then(|spec| spec.get("template"))
+                .and_then(|template| template.get("spec"))
+                .and_then(|spec| spec.get("containers"))
+                .and_then(Value::as_sequence);
+            for container in containers.into_iter().flatten() {
+                let env = container.get("env").and_then(Value::as_sequence);
+                for entry in env.into_iter().flatten() {
+                    let name = entry.get("name").and_then(Value::as_str);
+                    let value = entry.get("value").and_then(Value::as_str);
+                    if let (Some(name), Some(value)) = (name, value) {
+                        collected.insert(name.to_string(), value.to_string());
+                    }
+                }
+            }
+        }
+        collected
+    }
+
+    #[test]
     fn rejects_invalid_explicit_library_path() {
         let td = TempDir::new().expect("tmp");
         let out = td.path().join("chart");
@@ -1741,5 +2079,35 @@ global:
         assert!(normalized.contains(r#"{{ "}}" }}"#));
         assert!(normalized.contains(r#"include "foo.skip" ."#));
         assert!(normalized.contains(r#"{{ $.Values.name }}"#));
+    }
+
+    fn ordinary_render_args(path: &str) -> crate::cli::ImportArgs {
+        crate::cli::ImportArgs {
+            path: path.to_string(),
+            env: "dev".to_string(),
+            group_name: "apps-k8s-manifests".to_string(),
+            group_type: "apps-k8s-manifests".to_string(),
+            min_include_bytes: 24,
+            include_status: false,
+            output: None,
+            out_chart_dir: None,
+            chart_name: None,
+            library_chart_path: None,
+            import_strategy: "helpers".to_string(),
+            allow_template_includes: Vec::new(),
+            unsupported_template_mode: "error".to_string(),
+            verify_equivalence: false,
+            release_name: "ordinary-export".to_string(),
+            namespace: None,
+            values_files: Vec::new(),
+            set_values: Vec::new(),
+            set_string_values: Vec::new(),
+            set_file_values: Vec::new(),
+            set_json_values: Vec::new(),
+            kube_version: None,
+            api_versions: Vec::new(),
+            include_crds: false,
+            write_rendered_output: None,
+        }
     }
 }
