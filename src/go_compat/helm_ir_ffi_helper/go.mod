@@ -3,7 +3,7 @@ module happ-helm-ir-ffi-helper
 go 1.25.0
 
 require (
-	go.yaml.in/yaml/v3 v3.0.4
+	go.yaml.in/yaml/v3 v3.0.5
 	helm.sh/helm/v3 v3.20.2
 )
 
