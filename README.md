@@ -195,6 +195,40 @@ use happ
 happ --web --web-open-browser=false
 ```
 
+## UI development
+
+`happ` web UI is server-rendered from Rust, so the local dev loop is:
+
+```bash
+# first run builds CodeMirror bundle, compiles happ, then starts happ --web
+./scripts/ui-dev.sh
+```
+
+Useful variants:
+
+```bash
+# keep server local but do not auto-open browser
+./scripts/ui-dev.sh --no-browser
+
+# reuse already running happ --web and run the full Playwright suite
+./scripts/ui-check.sh --reuse-running
+
+# visual-only pass
+./scripts/ui-check.sh --visual
+
+# refresh visual baselines
+./scripts/ui-check.sh --visual --update-snapshots
+
+# headed Playwright run against an already running server
+(cd web && HAPP_WEB_BASE_URL=http://127.0.0.1:18088 HAPP_WEB_SKIP_SERVER=1 \
+  npm run test:ui:headed)
+```
+
+Artifacts you can inspect after UI checks:
+
+- Playwright HTML report: `web/test-results/playwright-report-html/index.html`
+- visual baselines: `web/tests/visual.spec.mjs-snapshots/*.png`
+
 ## Studio mode (no port)
 
 ```bash
@@ -245,7 +279,7 @@ cargo test --test parity_cli
 During build, `happ` fetches `helm-apps` chart from GitHub and embeds it into binary.
 
 - default repo: `https://github.com/alvnukov/helm-apps.git`
-- default ref: `helm-apps-1.8.9`
+- default ref: `helm-apps-1.9.0`
 - override repo: `HELM_APPS_GITHUB_REPO`
 - override ref: `HELM_APPS_GITHUB_REF`
 - force local chart path: `HELM_APPS_CHART_PATH=/abs/path/to/charts/helm-apps`
