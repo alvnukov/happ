@@ -45,6 +45,9 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
     let mut apps_jobs = Mapping::new();
     let mut apps_cronjobs = Mapping::new();
     let mut apps_stateful = Mapping::new();
+    let mut apps_pvcs = Mapping::new();
+    let mut apps_limit_range = Mapping::new();
+    let mut apps_certificates = Mapping::new();
 
     let mut stateless_by_ns_name: HashMap<String, String> = HashMap::new();
     let mut stateful_by_ns_name: HashMap<String, String> = HashMap::new();
@@ -104,6 +107,27 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
         let kind = kind_of(m);
         match kind.as_str() {
             "Deployment" | "StatefulSet" => {}
+            "PersistentVolumeClaim" => {
+                if let Some((app_key, app)) = map_pvc_to_apps_pvcs(m) {
+                    insert_group_with_dedupe(&mut apps_pvcs, &app_key, app);
+                } else {
+                    push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
+                }
+            }
+            "LimitRange" => {
+                if let Some((app_key, app)) = map_limit_range_to_apps_limit_range(m) {
+                    insert_group_with_dedupe(&mut apps_limit_range, &app_key, app);
+                } else {
+                    push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
+                }
+            }
+            "Certificate" => {
+                if let Some((app_key, app)) = map_certificate_to_apps_certificates(m) {
+                    insert_group_with_dedupe(&mut apps_certificates, &app_key, app);
+                } else {
+                    push_raw_fallback(&mut raw_fallback, &mut raw_fallback_seen, doc);
+                }
+            }
             "HorizontalPodAutoscaler" => pending_hpa.push(doc.clone()),
             "VerticalPodAutoscaler" => pending_vpa.push(doc.clone()),
             "ConfigMap" => {
@@ -215,6 +239,15 @@ fn build_values_helpers_experimental(args: &ImportArgs, docs: &[Value]) -> Resul
     }
     if !apps_stateful.is_empty() {
         root.insert(k("apps-stateful"), Value::Mapping(apps_stateful));
+    }
+    if !apps_pvcs.is_empty() {
+        root.insert(k("apps-pvcs"), Value::Mapping(apps_pvcs));
+    }
+    if !apps_limit_range.is_empty() {
+        root.insert(k("apps-limit-range"), Value::Mapping(apps_limit_range));
+    }
+    if !apps_certificates.is_empty() {
+        root.insert(k("apps-certificates"), Value::Mapping(apps_certificates));
     }
     if !apps_configmaps.is_empty() {
         root.insert(k("apps-configmaps"), Value::Mapping(apps_configmaps));
@@ -657,6 +690,162 @@ fn map_statefulset_to_apps_stateful(doc: &Mapping) -> Option<(String, Mapping)> 
     }
 
     Some((sanitize_key(&name), app))
+}
+
+// Spec surface follows "apps-pvcs.render" in _apps-pvcs.tpl.
+fn map_pvc_to_apps_pvcs(doc: &Mapping) -> Option<(String, Mapping)> {
+    if kind_of(doc) != "PersistentVolumeClaim" {
+        return None;
+    }
+    let api_version = get_str(doc, "apiVersion").unwrap_or_default();
+    if !api_version.is_empty() && api_version != "v1" {
+        return None;
+    }
+    let name = metadata_name(doc);
+    if name.is_empty() {
+        return None;
+    }
+    let spec = get_map(doc, "spec").cloned().unwrap_or_default();
+    let mut app = base_app_with_metadata(doc, &name);
+
+    for key in ["accessModes", "resources"] {
+        if let Some(v) = spec.get(&k(key)) {
+            if let Some(s) = yaml_body_clean(v) {
+                app.insert(k(key), Value::String(s));
+            }
+        }
+    }
+    copy_scalar_if_present(&mut app, &spec, "storageClassName");
+
+    if let Some(extra) =
+        extract_by_allowed(&spec, &["accessModes", "resources", "storageClassName"])
+    {
+        if let Some(s) = yaml_body(&Value::Mapping(extra)) {
+            app.insert(k("extraSpec"), Value::String(s));
+        }
+    }
+
+    Some((sanitize_key(&name), app))
+}
+
+// "apps-limit-range.render" renders spec.limits and nothing else -- there is no
+// extraSpec escape hatch, so any other spec field has to stay raw.
+fn map_limit_range_to_apps_limit_range(doc: &Mapping) -> Option<(String, Mapping)> {
+    if kind_of(doc) != "LimitRange" {
+        return None;
+    }
+    let api_version = get_str(doc, "apiVersion").unwrap_or_default();
+    if !api_version.is_empty() && api_version != "v1" {
+        return None;
+    }
+    let name = metadata_name(doc);
+    if name.is_empty() {
+        return None;
+    }
+    let spec = get_map(doc, "spec").cloned().unwrap_or_default();
+    if extract_by_allowed(&spec, &["limits"]).is_some() {
+        return None;
+    }
+    let limits = yaml_body(spec.get(&k("limits"))?)?;
+
+    let mut app = base_app_with_metadata(doc, &name);
+    app.insert(k("limits"), Value::String(limits));
+    Some((sanitize_key(&name), app))
+}
+
+// "apps-components.cerificate" hardwires secretName to the app name and
+// issuerRef.kind to ClusterIssuer, builds metadata by hand (no name/labels/
+// annotations helper) and offers no extraSpec. Anything outside that shape
+// cannot be represented and must stay in the raw passthrough group.
+fn map_certificate_to_apps_certificates(doc: &Mapping) -> Option<(String, Mapping)> {
+    if kind_of(doc) != "Certificate" {
+        return None;
+    }
+    if !get_str(doc, "apiVersion")
+        .unwrap_or_default()
+        .starts_with("cert-manager.io/")
+    {
+        return None;
+    }
+    let name = metadata_name(doc);
+    if name.is_empty() {
+        return None;
+    }
+    let metadata = get_map(doc, "metadata").cloned().unwrap_or_default();
+    let spec = get_map(doc, "spec").cloned().unwrap_or_default();
+
+    if get_str(&spec, "secretName").is_some_and(|secret| secret != name) {
+        return None;
+    }
+    if extract_by_allowed(&spec, &["secretName", "issuerRef", "dnsNames"]).is_some() {
+        return None;
+    }
+    let issuer_ref = get_map(&spec, "issuerRef");
+    if issuer_ref
+        .and_then(|issuer| get_str(issuer, "kind"))
+        .is_some_and(|kind| kind != "ClusterIssuer")
+    {
+        return None;
+    }
+    // The component emits no labels or annotations at all, so keeping any would
+    // silently drop them from the rendered Certificate.
+    if filter_imported_metadata_labels(metadata.get(&k("labels"))).is_some()
+        || metadata.contains_key(&k("annotations"))
+    {
+        return None;
+    }
+    let ns = metadata_namespace(doc);
+    if !ns.trim().is_empty() && ns.trim() != "default" {
+        return None;
+    }
+
+    let mut app = Mapping::new();
+    app.insert(k("enabled"), Value::Bool(true));
+    app.insert(k("name"), Value::String(name.clone()));
+    if let Some(issuer_name) = issuer_ref
+        .and_then(|issuer| get_str(issuer, "name"))
+        .filter(|issuer| !issuer.trim().is_empty())
+    {
+        app.insert(k("clusterIssuer"), Value::String(issuer_name));
+    }
+
+    let dns_names = get_seq(&spec, "dnsNames").cloned().unwrap_or_default();
+    match dns_names.as_slice() {
+        [] => {}
+        [single] => {
+            app.insert(k("host"), single.clone());
+        }
+        many => {
+            let s = yaml_body(&Value::Sequence(many.to_vec()))?;
+            app.insert(k("hosts"), Value::String(s));
+        }
+    }
+
+    Some((sanitize_key(&name), app))
+}
+
+// Shared "enabled/name/namespace/labels/annotations" preamble for groups that
+// render metadata through apps-helpers.metadataGenerator.
+fn base_app_with_metadata(doc: &Mapping, name: &str) -> Mapping {
+    let metadata = get_map(doc, "metadata").cloned().unwrap_or_default();
+    let mut app = Mapping::new();
+    app.insert(k("enabled"), Value::Bool(true));
+    app.insert(k("name"), Value::String(name.to_string()));
+    let ns = metadata_namespace(doc);
+    if !ns.trim().is_empty() && ns.trim() != "default" {
+        app.insert(k("namespace"), Value::String(ns));
+    }
+    if let Some(labels) = filter_imported_metadata_labels(metadata.get(&k("labels"))) {
+        if let Some(s) = yaml_body(&labels) {
+            app.insert(k("labels"), Value::String(s));
+        }
+    }
+    if let Some(v) = metadata.get(&k("annotations")) {
+        if let Some(s) = yaml_body(v) {
+            app.insert(k("annotations"), Value::String(s));
+        }
+    }
+    app
 }
 
 fn map_service_to_apps_services(doc: &Mapping) -> Option<(String, Mapping)> {
@@ -3386,6 +3575,228 @@ spec:
             "an orphan autoscaler must not invent a workload app"
         );
         assert!(root.contains_key(&k("apps-k8s-manifests")));
+    }
+
+    #[test]
+    fn helpers_pvc_maps_to_apps_pvcs() {
+        let docs = parse_docs(
+            r#"
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: fast
+  resources:
+    requests:
+      storage: 10Gi
+  volumeMode: Filesystem
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        assert!(!root.contains_key(&k("apps-k8s-manifests")));
+
+        let app = single_app_of(root, "apps-pvcs");
+        assert_eq!(
+            app.get(&k("storageClassName")).and_then(Value::as_str),
+            Some("fast")
+        );
+        assert!(app
+            .get(&k("accessModes"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("ReadWriteOnce")));
+        assert!(app
+            .get(&k("resources"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("10Gi")));
+        assert!(
+            app.get(&k("extraSpec"))
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("volumeMode")),
+            "spec keys outside the rendered set belong in extraSpec"
+        );
+    }
+
+    #[test]
+    fn helpers_limit_range_maps_to_apps_limit_range() {
+        let docs = parse_docs(
+            r#"
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: 500m
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let app = single_app_of(root, "apps-limit-range");
+        assert!(app
+            .get(&k("limits"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("type: Container")));
+    }
+
+    // apps-limit-range.render emits spec.limits only and has no extraSpec.
+    #[test]
+    fn helpers_limit_range_with_unrenderable_spec_key_stays_raw() {
+        let docs = parse_docs(
+            r#"
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+spec:
+  limits:
+  - type: Container
+  unsupportedField: true
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        assert!(!root.contains_key(&k("apps-limit-range")));
+        assert!(root.contains_key(&k("apps-k8s-manifests")));
+    }
+
+    #[test]
+    fn helpers_certificate_maps_to_apps_certificates() {
+        let docs = parse_docs(
+            r#"
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: web-tls
+spec:
+  secretName: web-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-prod
+  dnsNames:
+  - example.com
+  - www.example.com
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let app = single_app_of(root, "apps-certificates");
+        assert_eq!(
+            app.get(&k("clusterIssuer")).and_then(Value::as_str),
+            Some("letsencrypt-prod")
+        );
+        assert!(app
+            .get(&k("hosts"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("www.example.com")));
+    }
+
+    #[test]
+    fn helpers_certificate_with_one_dns_name_uses_host() {
+        let docs = parse_docs(
+            r#"
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: web-tls
+spec:
+  secretName: web-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt
+  dnsNames:
+  - example.com
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        let app = single_app_of(root, "apps-certificates");
+        assert_eq!(
+            app.get(&k("host")).and_then(Value::as_str),
+            Some("example.com")
+        );
+        assert!(!app.contains_key(&k("hosts")));
+    }
+
+    // apps-components.cerificate hardwires secretName to the app name, pins
+    // issuerRef.kind to ClusterIssuer and renders no labels/annotations, so
+    // anything richer has to survive as a raw manifest instead of losing data.
+    #[test]
+    fn helpers_certificate_outside_the_component_shape_stays_raw() {
+        for spec in [
+            // secretName decoupled from the resource name
+            r#"
+  secretName: other-secret
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt
+  dnsNames: ["example.com"]
+"#,
+            // namespaced Issuer instead of ClusterIssuer
+            r#"
+  secretName: web-tls
+  issuerRef:
+    kind: Issuer
+    name: internal
+  dnsNames: ["example.com"]
+"#,
+            // spec field the component cannot render and cannot park in extraSpec
+            r#"
+  secretName: web-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt
+  dnsNames: ["example.com"]
+  duration: 2160h
+"#,
+        ] {
+            let docs = parse_docs(&format!(
+                r#"
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: web-tls
+spec:{spec}"#
+            ));
+            let values = build_values(&import_args("helpers"), &docs).expect("values");
+            let root = values.as_mapping().expect("root");
+            assert!(
+                !root.contains_key(&k("apps-certificates")),
+                "must not claim a Certificate it cannot render: {spec}"
+            );
+            assert!(root.contains_key(&k("apps-k8s-manifests")));
+        }
+    }
+
+    #[test]
+    fn helpers_certificate_with_custom_labels_stays_raw() {
+        let docs = parse_docs(
+            r#"
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: web-tls
+  labels:
+    team: platform
+spec:
+  secretName: web-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt
+  dnsNames: ["example.com"]
+"#,
+        );
+        let values = build_values(&import_args("helpers"), &docs).expect("values");
+        let root = values.as_mapping().expect("root");
+        assert!(
+            !root.contains_key(&k("apps-certificates")),
+            "the component emits no labels, so mapping would drop them silently"
+        );
     }
 
     #[test]
