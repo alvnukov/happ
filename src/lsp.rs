@@ -1957,6 +1957,7 @@ fn build_diagnostics(uri: &Uri, text: &str) -> Vec<Diagnostic> {
         ));
     }
 
+    diagnostics.extend(build_unknown_group_diagnostics(&lines));
     diagnostics.extend(build_template_diagnostics(uri, text, &lines));
 
     diagnostics
@@ -4240,6 +4241,206 @@ fn is_reserved_top_level_key(key: &str) -> bool {
     matches!(key, "global" | "enabled" | "werf" | "helm-apps")
 }
 
+/// Built-in library groups, mirroring the `$Library` list in
+/// `apps-utils.init-library` (charts/helm-apps/templates/_apps-utils.tpl).
+///
+/// The library renders exactly these groups; anything else named `apps-*` is
+/// either a custom group (opted in via `__GroupVars__.type`) or dead values.
+/// Kept sorted for `binary_search`, and pinned against the vendored chart by
+/// `builtin_app_groups_match_the_embedded_chart_library_list`.
+const BUILTIN_APP_GROUPS: &[&str] = &[
+    "apps-certificates",
+    "apps-configmaps",
+    "apps-cronjobs",
+    "apps-custom-prometheus-rules",
+    "apps-dex-authenticators",
+    "apps-dex-clients",
+    "apps-grafana-dashboards",
+    "apps-infra",
+    "apps-ingresses",
+    "apps-jobs",
+    "apps-k8s-manifests",
+    "apps-kafka-strimzi",
+    "apps-limit-range",
+    "apps-network-policies",
+    "apps-pvcs",
+    "apps-secrets",
+    "apps-service-accounts",
+    "apps-services",
+    "apps-stateful",
+    "apps-stateless",
+];
+
+/// Prefix the library reserves for its own groups. `apps-compat.validateTopLevelStrict`
+/// only rejects unknown keys carrying it -- other top-level keys stay free-form.
+const APP_GROUP_PREFIX: &str = "apps-";
+
+const CUSTOM_GROUP_MARKER: &str = "__GroupVars__";
+
+const CUSTOM_GROUP_DOCS: &str = "docs/reference-values.md#param-custom-groups";
+
+fn is_builtin_app_group(key: &str) -> bool {
+    BUILTIN_APP_GROUPS.binary_search(&key).is_ok()
+}
+
+#[derive(Debug, Clone)]
+struct TopLevelGroupRef {
+    name: String,
+    line: usize,
+    declares_custom_group: bool,
+}
+
+/// Collects top-level `apps-*` keys together with whether their block opts into
+/// the custom-group escape hatch.
+fn collect_top_level_app_groups(lines: &[&str]) -> Vec<TopLevelGroupRef> {
+    let mut out: Vec<TopLevelGroupRef> = Vec::new();
+    let blocked = block_scalar_content_lines(lines);
+    // Index into `out` for the block currently being scanned, or None while the
+    // cursor sits under a top-level key that is not an `apps-*` group.
+    let mut current_group: Option<usize> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some((indent, key, _value)) = parse_key_line(line) else {
+            continue;
+        };
+        if indent == 0 {
+            current_group = key.starts_with(APP_GROUP_PREFIX).then(|| {
+                out.push(TopLevelGroupRef {
+                    name: key.to_string(),
+                    line: i,
+                    declares_custom_group: false,
+                });
+                out.len() - 1
+            });
+            continue;
+        }
+        if key == CUSTOM_GROUP_MARKER {
+            if let Some(index) = current_group {
+                out[index].declares_custom_group = true;
+            }
+        }
+    }
+
+    out
+}
+
+/// Mirrors `apps-compat.validateTopLevelStrict`: strict mode turns an unknown
+/// top-level `apps-*` key into a hard render error, while the default contract
+/// silently drops it.
+fn strict_validation_enabled(lines: &[&str]) -> bool {
+    let blocked = block_scalar_content_lines(lines);
+    let mut in_global = false;
+    let mut in_validation = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some((indent, key, value)) = parse_key_line(line) else {
+            continue;
+        };
+        match indent {
+            0 => {
+                in_global = key == "global";
+                in_validation = false;
+            }
+            2 if in_global => in_validation = key == "validation",
+            4 if in_validation => {
+                if key == "strict" {
+                    return matches!(unquote(value.trim()).as_str(), "true" | "yes" | "on");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn build_unknown_group_diagnostics(lines: &[&str]) -> Vec<Diagnostic> {
+    let strict = strict_validation_enabled(lines);
+    let mut out = Vec::new();
+
+    for group in collect_top_level_app_groups(lines) {
+        if is_builtin_app_group(&group.name) || group.declares_custom_group {
+            continue;
+        }
+        let hint = closest_builtin_app_group(&group.name)
+            .map(|name| format!(" Did you mean '{name}'?"))
+            .unwrap_or_default();
+        let (severity, code, message) = if strict {
+            (
+                DiagnosticSeverity::ERROR,
+                "E_STRICT_UNKNOWN_GROUP",
+                format!(
+                    "unknown top-level apps group '{}' in strict mode.{hint} \
+                     Use a built-in apps-* group or declare {CUSTOM_GROUP_MARKER}.type \
+                     ({CUSTOM_GROUP_DOCS}).",
+                    group.name
+                ),
+            )
+        } else {
+            (
+                DiagnosticSeverity::WARNING,
+                "E_UNKNOWN_APPS_GROUP",
+                format!(
+                    "Unknown apps-* group '{}': the library renders nothing for it.{hint} \
+                     Use a built-in apps-* group or declare {CUSTOM_GROUP_MARKER}.type \
+                     ({CUSTOM_GROUP_DOCS}).",
+                    group.name
+                ),
+            )
+        };
+        out.push(make_diagnostic(
+            group.line,
+            lines,
+            &group.name,
+            severity,
+            message,
+            Some(code.to_string()),
+        ));
+    }
+
+    out
+}
+
+/// Nearest built-in group by edit distance, for typo hints only. The cutoff
+/// keeps `apps-statelss` pointing at `apps-stateless` without turning an
+/// intentional custom group into a bogus suggestion.
+fn closest_builtin_app_group(name: &str) -> Option<&'static str> {
+    let cutoff = match name.len() {
+        0..=8 => 1,
+        9..=16 => 2,
+        _ => 3,
+    };
+    BUILTIN_APP_GROUPS
+        .iter()
+        .map(|candidate| (edit_distance(name, candidate), *candidate))
+        .filter(|(distance, _)| *distance <= cutoff)
+        .min_by_key(|(distance, candidate)| (*distance, *candidate))
+        .map(|(_, candidate)| candidate)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current = vec![0usize; right_chars.len() + 1];
+
+    for (i, left_char) in left.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right_chars.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_char != *right_char);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right_chars.len()]
+}
+
 fn collect_include_usages(lines: &[&str]) -> Vec<IncludeUsageRef> {
     let mut out = Vec::new();
     let blocked = block_scalar_content_lines(lines);
@@ -5551,6 +5752,276 @@ apps-stateless:
         assert!(blocked[4]);
         assert!(blocked[5]);
         assert!(!blocked[6]);
+    }
+
+    /// Parses the `$Library` list out of `apps-utils.init-library` in the
+    /// vendored chart. Keeps `BUILTIN_APP_GROUPS` honest across chart bumps
+    /// instead of freezing a snapshot of helm-apps 1.9.0.
+    fn library_groups_from_embedded_chart() -> Vec<String> {
+        let tpl = crate::assets::embedded_helm_apps_file("templates/_apps-utils.tpl")
+            .expect("embedded _apps-utils.tpl");
+        let start = tpl
+            .find("{{- $Library := list")
+            .expect("$Library list in init-library");
+        let rest = &tpl[start..];
+        let end = rest.find("}}").expect("end of $Library list");
+        rest[..end]
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                let name = trimmed.strip_prefix('"')?.strip_suffix('"')?;
+                Some(format!("apps-{name}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn builtin_app_groups_match_the_embedded_chart_library_list() {
+        let mut from_chart = library_groups_from_embedded_chart();
+        assert_eq!(
+            from_chart.len(),
+            20,
+            "expected 20 built-in groups, parsed {from_chart:?}"
+        );
+        from_chart.sort();
+        let known: Vec<String> = BUILTIN_APP_GROUPS
+            .iter()
+            .map(|g| (*g).to_string())
+            .collect();
+        assert_eq!(
+            known, from_chart,
+            "BUILTIN_APP_GROUPS drifted from apps-utils.init-library"
+        );
+    }
+
+    #[test]
+    fn builtin_app_groups_stay_sorted_for_binary_search() {
+        let mut sorted = BUILTIN_APP_GROUPS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, BUILTIN_APP_GROUPS);
+        for group in BUILTIN_APP_GROUPS {
+            assert!(is_builtin_app_group(group), "{group} must resolve");
+        }
+    }
+
+    #[test]
+    fn diagnostics_warn_on_unknown_apps_group_with_typo_hint() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: production
+apps-statelss:
+  app-a:
+    enabled: true
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        let found = diagnostics
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "E_UNKNOWN_APPS_GROUP".into(),
+                    ))
+            })
+            .expect("unknown group diagnostic");
+        assert_eq!(found.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(
+            found.message.contains("apps-statelss")
+                && found.message.contains("Did you mean 'apps-stateless'?"),
+            "message must name the group and suggest the builtin: {}",
+            found.message
+        );
+    }
+
+    #[test]
+    fn diagnostics_escalate_unknown_apps_group_under_strict_validation() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: production
+  validation:
+    strict: true
+apps-statelss:
+  app-a:
+    enabled: true
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        let found = diagnostics
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(lsp_types::NumberOrString::String(
+                        "E_STRICT_UNKNOWN_GROUP".into(),
+                    ))
+            })
+            .expect("strict unknown group diagnostic");
+        assert_eq!(found.severity, Some(DiagnosticSeverity::ERROR));
+        // Mirrors the library wording so the editor and `helm template` agree.
+        assert!(
+            found
+                .message
+                .contains("unknown top-level apps group 'apps-statelss' in strict mode"),
+            "message must mirror apps-compat.validateTopLevelStrict: {}",
+            found.message
+        );
+    }
+
+    #[test]
+    fn diagnostics_accept_every_builtin_apps_group() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let mut src = String::from("global:\n  env: production\n  validation:\n    strict: true\n");
+        for group in BUILTIN_APP_GROUPS {
+            src.push_str(&format!("{group}:\n  app-a:\n    enabled: true\n"));
+        }
+        let diagnostics = build_diagnostics(&uri, &src);
+        let offenders: Vec<&str> = diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code.as_ref(),
+                    Some(lsp_types::NumberOrString::String(code))
+                        if code == "E_UNKNOWN_APPS_GROUP" || code == "E_STRICT_UNKNOWN_GROUP"
+                )
+            })
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "built-in groups flagged: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_allow_custom_group_declared_through_group_vars() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        // Verified against helm-apps 1.9.0: `helm template` renders this group
+        // in both default and strict mode.
+        let src = r#"
+global:
+  env: production
+  validation:
+    strict: true
+apps-extra-workers:
+  __GroupVars__:
+    type: apps-stateless
+  app-b:
+    enabled: true
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("apps-extra-workers")),
+            "custom group opts out of the taxonomy check: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_scope_group_vars_to_its_own_top_level_block() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        // `__GroupVars__` belongs to `plain-group`, so it must not excuse the
+        // preceding `apps-*` key.
+        let src = r#"
+global:
+  env: production
+apps-typo-group:
+  app-a:
+    enabled: true
+plain-group:
+  __GroupVars__:
+    type: apps-stateless
+  app-b:
+    enabled: true
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("apps-typo-group")),
+            "unknown group must still be reported: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_leave_non_apps_top_level_keys_alone() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        // The library only strict-checks the `apps-` prefix; other top-level
+        // keys are free-form even under strict validation.
+        let src = r#"
+global:
+  env: production
+  validation:
+    strict: true
+werf: {}
+helm-apps: {}
+project-settings:
+  anything: true
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        let offenders: Vec<&str> = diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code.as_ref(),
+                    Some(lsp_types::NumberOrString::String(code))
+                        if code == "E_UNKNOWN_APPS_GROUP" || code == "E_STRICT_UNKNOWN_GROUP"
+                )
+            })
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(offenders.is_empty(), "non-apps keys flagged: {offenders:?}");
+    }
+
+    #[test]
+    fn unknown_group_scan_skips_block_scalar_payloads() {
+        let lines: Vec<&str> = r#"
+apps-stateless:
+  app-1:
+    note: |
+      apps-not-a-group:
+        app-x: {}
+"#
+        .split('\n')
+        .collect();
+        let groups = collect_top_level_app_groups(&lines);
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["apps-stateless"]);
+    }
+
+    #[test]
+    fn strict_validation_flag_reads_only_global_validation_strict() {
+        let strict: Vec<&str> = "global:\n  validation:\n    strict: true\n"
+            .split('\n')
+            .collect();
+        assert!(strict_validation_enabled(&strict));
+
+        let quoted: Vec<&str> = "global:\n  validation:\n    strict: \"true\"\n"
+            .split('\n')
+            .collect();
+        assert!(strict_validation_enabled(&quoted));
+
+        let off: Vec<&str> = "global:\n  validation:\n    strict: false\n"
+            .split('\n')
+            .collect();
+        assert!(!strict_validation_enabled(&off));
+
+        // Same key nested somewhere else must not flip the mode.
+        let elsewhere: Vec<&str> =
+            "apps-stateless:\n  app-1:\n    validation:\n      strict: true\n"
+                .split('\n')
+                .collect();
+        assert!(!strict_validation_enabled(&elsewhere));
+    }
+
+    #[test]
+    fn closest_builtin_app_group_declines_distant_names() {
+        assert_eq!(closest_builtin_app_group("apps-pvc"), Some("apps-pvcs"));
+        assert_eq!(
+            closest_builtin_app_group("apps-statelss"),
+            Some("apps-stateless")
+        );
+        assert_eq!(closest_builtin_app_group("apps-totally-made-up"), None);
     }
 
     #[test]

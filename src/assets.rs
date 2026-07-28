@@ -29,6 +29,16 @@ pub fn embedded_helm_apps_version() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Reads a UTF-8 file straight out of the embedded helm-apps chart.
+///
+/// Used to pin hardcoded knowledge of the library contract against the chart
+/// version that is actually vendored, instead of against a snapshot of it.
+pub(crate) fn embedded_helm_apps_file(relative_path: &str) -> Option<&'static str> {
+    EMBEDDED_HELM_APPS
+        .get_file(relative_path)
+        .and_then(|file| file.contents_utf8())
+}
+
 fn write_dir(dir: &Dir<'_>, dst: &Path) -> Result<(), io::Error> {
     for entry in dir.entries() {
         match entry {
