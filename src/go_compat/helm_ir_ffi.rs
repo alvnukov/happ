@@ -242,8 +242,7 @@ fn build_chart_ir_from_response(
     });
 
     for doc in response.documents {
-        let body_yaml = serde_yaml::to_value(doc.body)
-            .map_err(|err| HelmIrFfiError::Decode(format!("document decode: {err}")))?;
+        let body_yaml = crate::chart_ir::json_to_yaml_value(&doc.body);
         ir.documents.push(ChartIrDocument {
             identity: ChartIrIdentity {
                 api_version: doc.identity.api_version,
