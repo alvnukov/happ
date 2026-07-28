@@ -165,6 +165,40 @@ pub fn encode_node(node: &Value) -> IrNode {
     }
 }
 
+// serde_json is compiled with `arbitrary_precision` (pulled in transitively by
+// the zq dependency, and cargo features are additive). Under that feature a
+// number serializes through a private newtype, so `serde_yaml::to_value` on a
+// JSON value yields a `$serde_json::private::Number` map instead of a scalar.
+// Numbers therefore have to be projected explicitly.
+pub fn json_to_yaml_value(value: &serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(flag) => Value::Bool(*flag),
+        serde_json::Value::Number(number) => {
+            if let Some(signed) = number.as_i64() {
+                Value::Number(signed.into())
+            } else if let Some(unsigned) = number.as_u64() {
+                Value::Number(unsigned.into())
+            } else if let Some(float) = number.as_f64() {
+                serde_yaml::to_value(float).unwrap_or_else(|_| Value::String(number.to_string()))
+            } else {
+                Value::String(number.to_string())
+            }
+        }
+        serde_json::Value::String(text) => Value::String(text.clone()),
+        serde_json::Value::Array(items) => {
+            Value::Sequence(items.iter().map(json_to_yaml_value).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut out = Mapping::new();
+            for (key, nested) in map {
+                out.insert(Value::String(key.clone()), json_to_yaml_value(nested));
+            }
+            Value::Mapping(out)
+        }
+    }
+}
+
 pub fn decode_node(node: &IrNode) -> Value {
     match node {
         IrNode::Null => Value::Null,
@@ -237,6 +271,75 @@ fn normalize_key(key: &Value) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression guard: serde_yaml::to_value on a JSON value silently produces
+    // a "$serde_json::private::Number" map while `arbitrary_precision` is on,
+    // which turned every rendered numeric field into an unusable map.
+    #[test]
+    fn json_to_yaml_value_keeps_numbers_as_scalars() {
+        let json = serde_json::json!({
+            "replicas": 3,
+            "negative": -7,
+            "ratio": 1.5,
+            "nested": {"minReplicas": 2},
+            "list": [1, 2],
+        });
+        let yaml = json_to_yaml_value(&json);
+
+        let encoded = serde_yaml::to_string(&yaml).expect("encode yaml");
+        assert!(
+            !encoded.contains("serde_json"),
+            "serde_json internals must not leak into YAML: {encoded}"
+        );
+
+        let map = yaml.as_mapping().expect("mapping");
+        assert_eq!(
+            map.get(Value::String("replicas".into()))
+                .and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            map.get(Value::String("negative".into()))
+                .and_then(Value::as_i64),
+            Some(-7)
+        );
+        assert_eq!(
+            map.get(Value::String("ratio".into()))
+                .and_then(Value::as_f64),
+            Some(1.5)
+        );
+        assert_eq!(
+            map.get(Value::String("nested".into()))
+                .and_then(Value::as_mapping)
+                .and_then(|nested| nested.get(Value::String("minReplicas".into())))
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            map.get(Value::String("list".into()))
+                .and_then(Value::as_sequence)
+                .map(|items| items.iter().filter_map(Value::as_u64).collect::<Vec<_>>()),
+            Some(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn json_to_yaml_value_maps_remaining_scalar_kinds() {
+        let json = serde_json::json!({"name": "api", "enabled": true, "missing": null});
+        let map = json_to_yaml_value(&json);
+        let map = map.as_mapping().expect("mapping");
+        assert_eq!(
+            map.get(Value::String("name".into()))
+                .and_then(Value::as_str),
+            Some("api")
+        );
+        assert_eq!(
+            map.get(Value::String("enabled".into()))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(map.get(Value::String("missing".into())), Some(&Value::Null));
+    }
 
     #[test]
     fn encode_decode_roundtrip_preserves_identity_and_body() {
