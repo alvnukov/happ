@@ -39,6 +39,31 @@ pub(crate) fn embedded_helm_apps_file(relative_path: &str) -> Option<&'static st
         .and_then(|file| file.contents_utf8())
 }
 
+/// Every UTF-8 file in the embedded chart, by chart-relative path, sorted.
+///
+/// Lets the MCP server publish the library source as readable resources, so a
+/// model can consult the contract helm-apps actually ships instead of guessing
+/// at it.
+pub(crate) fn embedded_helm_apps_paths() -> Vec<String> {
+    let mut out = Vec::new();
+    collect_file_paths(&EMBEDDED_HELM_APPS, &mut out);
+    out.sort();
+    out
+}
+
+fn collect_file_paths(dir: &Dir<'_>, out: &mut Vec<String>) {
+    for entry in dir.entries() {
+        match entry {
+            DirEntry::Dir(child) => collect_file_paths(child, out),
+            DirEntry::File(file) => {
+                if file.contents_utf8().is_some() {
+                    out.push(file.path().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+}
+
 fn write_dir(dir: &Dir<'_>, dst: &Path) -> Result<(), io::Error> {
     for entry in dir.entries() {
         match entry {

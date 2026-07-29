@@ -18,10 +18,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(unix)]
-use std::thread;
-#[cfg(unix)]
-use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -34,7 +30,7 @@ pub enum Error {
 }
 
 #[derive(Default)]
-struct ServerState {
+pub(crate) struct ServerState {
     documents: HashMap<String, DocumentState>,
 }
 
@@ -247,7 +243,7 @@ pub fn run(args: crate::cli::LspArgs) -> Result<(), Error> {
     if !args.stdio {
         return Err(Error::UnsupportedTransport);
     }
-    maybe_start_parent_watchdog(args.parent_pid);
+    crate::process_guard::watch_parent(args.parent_pid);
 
     let (connection, io_threads) = Connection::stdio();
     let server_capabilities = json!({
@@ -275,33 +271,6 @@ pub fn run(args: crate::cli::LspArgs) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn maybe_start_parent_watchdog(parent_pid: Option<u32>) {
-    let Some(pid) = parent_pid else {
-        return;
-    };
-    if pid == 0 {
-        return;
-    }
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(2));
-        let ok = unsafe { libc::kill(pid as i32, 0) } == 0;
-        if ok {
-            continue;
-        }
-        if matches!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EPERM)
-        ) {
-            continue;
-        }
-        std::process::exit(0);
-    });
-}
-
-#[cfg(not(unix))]
-fn maybe_start_parent_watchdog(_parent_pid: Option<u32>) {}
-
 fn event_loop(connection: &Connection, state: &mut ServerState) -> Result<(), Error> {
     for msg in &connection.receiver {
         match msg {
@@ -327,120 +296,83 @@ fn handle_request(
     state: &ServerState,
     req: &Request,
 ) -> Result<(), Error> {
-    match req.method.as_str() {
-        "happ/listEntities" => {
-            let params: ListEntitiesParams = match serde_json::from_value(req.params.clone()) {
-                Ok(v) => v,
-                Err(err) => {
-                    return send_error(
-                        connection,
-                        req.id.clone(),
-                        -32602,
-                        format!("invalid params for happ/listEntities: {err}"),
-                    );
-                }
-            };
-            match list_entities_request(state, params) {
-                Ok(result) => {
-                    let value = serde_json::to_value(result).unwrap_or(JsonValue::Null);
-                    send_ok(connection, req.id.clone(), value)
-                }
-                Err(err) => send_error(connection, req.id.clone(), -32001, err),
-            }
-        }
-        "happ/resolveEntity" => {
-            let params: ResolveEntityParams = match serde_json::from_value(req.params.clone()) {
-                Ok(v) => v,
-                Err(err) => {
-                    return send_error(
-                        connection,
-                        req.id.clone(),
-                        -32602,
-                        format!("invalid params for happ/resolveEntity: {err}"),
-                    );
-                }
-            };
-            match resolve_entity_request(state, params) {
-                Ok(result) => {
-                    let value = serde_json::to_value(result).unwrap_or(JsonValue::Null);
-                    send_ok(connection, req.id.clone(), value)
-                }
-                Err(err) => send_error(connection, req.id.clone(), -32001, err),
-            }
-        }
-        "happ/renderEntityManifest" => {
-            let params: RenderEntityManifestParams =
-                match serde_json::from_value(req.params.clone()) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return send_error(
-                            connection,
-                            req.id.clone(),
-                            -32602,
-                            format!("invalid params for happ/renderEntityManifest: {err}"),
-                        );
-                    }
-                };
-            match render_entity_manifest_request(state, params) {
-                Ok(result) => {
-                    let value = serde_json::to_value(result).unwrap_or(JsonValue::Null);
-                    send_ok(connection, req.id.clone(), value)
-                }
-                Err(err) => send_error(connection, req.id.clone(), -32001, err),
-            }
-        }
-        "happ/getPreviewTheme" => {
-            let value = serde_json::to_value(preview_theme_request()).unwrap_or(JsonValue::Null);
-            send_ok(connection, req.id.clone(), value)
-        }
-        "happ/templateAssist" => {
-            let params: TemplateAssistParams = match serde_json::from_value(req.params.clone()) {
-                Ok(v) => v,
-                Err(err) => {
-                    return send_error(
-                        connection,
-                        req.id.clone(),
-                        -32602,
-                        format!("invalid params for happ/templateAssist: {err}"),
-                    );
-                }
-            };
-            match template_assist_request(state, params) {
-                Ok(result) => {
-                    let value = serde_json::to_value(result).unwrap_or(JsonValue::Null);
-                    send_ok(connection, req.id.clone(), value)
-                }
-                Err(err) => send_error(connection, req.id.clone(), -32001, err),
-            }
-        }
-        "happ/optimizeValuesIncludes" => {
-            let params: OptimizeValuesIncludesParams =
-                match serde_json::from_value(req.params.clone()) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return send_error(
-                            connection,
-                            req.id.clone(),
-                            -32602,
-                            format!("invalid params for happ/optimizeValuesIncludes: {err}"),
-                        );
-                    }
-                };
-            match optimize_values_includes_request(state, params) {
-                Ok(result) => {
-                    let value = serde_json::to_value(result).unwrap_or(JsonValue::Null);
-                    send_ok(connection, req.id.clone(), value)
-                }
-                Err(err) => send_error(connection, req.id.clone(), -32001, err),
-            }
-        }
-        _ => send_error(
-            connection,
-            req.id.clone(),
-            -32601,
-            format!("method not implemented: {}", req.method),
-        ),
+    match dispatch_request(state, &req.method, &req.params) {
+        Ok(value) => send_ok(connection, req.id.clone(), value),
+        Err(failure) => send_error(connection, req.id.clone(), failure.code, failure.message),
     }
+}
+
+/// A request that could not be answered, in JSON-RPC terms.
+pub(crate) struct RequestFailure {
+    pub(crate) code: i32,
+    pub(crate) message: String,
+}
+
+/// Answers one request, with no idea what carried it here.
+///
+/// Keeping dispatch free of the connection is what lets happ serve its own
+/// language features over two transports at once: an editor drives them over
+/// LSP stdio, and the MCP bridge calls straight into this function, with no
+/// second process and no risk of the two surfaces drifting apart.
+pub(crate) fn dispatch_request(
+    state: &ServerState,
+    method: &str,
+    params: &JsonValue,
+) -> Result<JsonValue, RequestFailure> {
+    match method {
+        "happ/listEntities" => encode(list_entities_request(state, parse_params(method, params)?)),
+        "happ/resolveEntity" => {
+            encode(resolve_entity_request(state, parse_params(method, params)?))
+        }
+        "happ/renderEntityManifest" => encode(render_entity_manifest_request(
+            state,
+            parse_params(method, params)?,
+        )),
+        "happ/getPreviewTheme" => encode(Ok(preview_theme_request())),
+        "happ/templateAssist" => encode(template_assist_request(
+            state,
+            parse_params(method, params)?,
+        )),
+        "happ/optimizeValuesIncludes" => encode(optimize_values_includes_request(
+            state,
+            parse_params(method, params)?,
+        )),
+        _ => Err(RequestFailure {
+            code: -32601,
+            message: format!("method not implemented: {method}"),
+        }),
+    }
+}
+
+/// The methods [`dispatch_request`] answers, for capability advertisement.
+pub(crate) const SUPPORTED_REQUESTS: &[&str] = &[
+    "happ/listEntities",
+    "happ/resolveEntity",
+    "happ/renderEntityManifest",
+    "happ/getPreviewTheme",
+    "happ/templateAssist",
+    "happ/optimizeValuesIncludes",
+];
+
+fn parse_params<T: serde::de::DeserializeOwned>(
+    method: &str,
+    params: &JsonValue,
+) -> Result<T, RequestFailure> {
+    serde_json::from_value(params.clone()).map_err(|err| RequestFailure {
+        code: -32602,
+        message: format!("invalid params for {method}: {err}"),
+    })
+}
+
+fn encode<T: Serialize>(result: Result<T, String>) -> Result<JsonValue, RequestFailure> {
+    let value = result.map_err(|message| RequestFailure {
+        code: -32001,
+        message,
+    })?;
+    serde_json::to_value(value).map_err(|err| RequestFailure {
+        code: -32603,
+        message: format!("serialize result: {err}"),
+    })
 }
 
 fn handle_notification(
@@ -521,34 +453,62 @@ fn list_entities_request(
     params: ListEntitiesParams,
 ) -> Result<ListEntitiesResult, String> {
     let text = resolve_request_text(state, params.uri.as_deref(), params.text)?;
-
-    let request_uri = params
-        .uri
-        .as_ref()
-        .and_then(|value| value.parse::<Uri>().ok());
-    let apply_includes = params.apply_includes.unwrap_or(true);
-    let apply_env = params.apply_env_resolution.unwrap_or(true);
-
-    let root_map = if apply_includes {
-        parse_and_expand_values_root(request_uri.as_ref(), &text)
-            .ok_or_else(|| "failed to parse values root with include expansion".to_string())?
-    } else {
-        parse_yaml_map_to_json_map(&text)?
-    };
-
-    let values = JsonValue::Object(root_map);
-    let env_discovery = discover_environments(&values);
-    let default_env = detect_default_env(&values, &env_discovery);
-    let used_env = params.env.unwrap_or_else(|| default_env.clone());
-    let visible_values = if apply_env {
-        resolve_env_maps(&values, &used_env)
-    } else {
-        values
-    };
+    let resolved = resolve_values_root(
+        params.uri.as_deref(),
+        &text,
+        params.env,
+        params.apply_includes.unwrap_or(true),
+        params.apply_env_resolution.unwrap_or(true),
+    )?;
 
     Ok(ListEntitiesResult {
-        groups: collect_entity_groups(&visible_values),
-        enabled_entities: collect_enabled_entities(&visible_values),
+        groups: collect_entity_groups(&resolved.root),
+        enabled_entities: collect_enabled_entities(&resolved.root),
+        default_env: resolved.default_env,
+        used_env: resolved.used_env,
+        env_discovery: resolved.env_discovery,
+    })
+}
+
+/// A values tree brought to the shape the chart actually renders from: file and
+/// profile includes expanded, env maps collapsed for one `global.env`.
+struct ResolvedValuesRoot {
+    root: JsonValue,
+    default_env: String,
+    used_env: String,
+    env_discovery: EnvironmentDiscovery,
+}
+
+/// The one place both entity lookups and whole-tree queries go through, so an
+/// MCP caller and the editor never disagree about what a chart resolves to.
+fn resolve_values_root(
+    uri: Option<&str>,
+    text: &str,
+    env: Option<String>,
+    apply_includes: bool,
+    apply_env: bool,
+) -> Result<ResolvedValuesRoot, String> {
+    let request_uri = uri.and_then(|value| value.parse::<Uri>().ok());
+
+    let root_map = if apply_includes {
+        parse_and_expand_values_root(request_uri.as_ref(), text)
+            .ok_or_else(|| "failed to parse values root with include expansion".to_string())?
+    } else {
+        parse_yaml_map_to_json_map(text)?
+    };
+
+    let expanded = JsonValue::Object(root_map);
+    let env_discovery = discover_environments(&expanded);
+    let default_env = detect_default_env(&expanded, &env_discovery);
+    let used_env = env.unwrap_or_else(|| default_env.clone());
+    let root = if apply_env {
+        resolve_env_maps(&expanded, &used_env)
+    } else {
+        expanded
+    };
+
+    Ok(ResolvedValuesRoot {
+        root,
         default_env,
         used_env,
         env_discovery,
@@ -701,38 +661,25 @@ fn resolve_entity_context(
     let text = resolve_request_text(state, uri.as_deref(), text)?;
 
     let apply_includes = apply_includes.unwrap_or(true);
-    let apply_env = apply_env_resolution.unwrap_or(true);
-    let request_uri = uri.as_ref().and_then(|value| value.parse::<Uri>().ok());
+    let resolved = resolve_values_root(
+        uri.as_deref(),
+        &text,
+        env,
+        apply_includes,
+        apply_env_resolution.unwrap_or(true),
+    )?;
 
-    let root_map = if apply_includes {
-        parse_and_expand_values_root(request_uri.as_ref(), &text)
-            .ok_or_else(|| "failed to parse values root with include expansion".to_string())?
-    } else {
-        parse_yaml_map_to_json_map(&text)?
-    };
-
-    let expanded = JsonValue::Object(root_map.clone());
-
-    let env_discovery = discover_environments(&expanded);
-    let default_env = detect_default_env(&expanded, &env_discovery);
-    let used_env = env.unwrap_or_else(|| default_env.clone());
-
-    let root = if apply_env {
-        resolve_env_maps(&expanded, &used_env)
-    } else {
-        expanded
-    };
-    let entity = read_entity(&root, &group, &app)?;
-    let global = read_global(&root);
+    let entity = read_entity(&resolved.root, &group, &app)?;
+    let global = read_global(&resolved.root);
 
     Ok(ResolvedEntityContext {
-        root,
+        root: resolved.root,
         entity,
         global,
         apply_includes,
-        default_env,
-        used_env,
-        env_discovery,
+        default_env: resolved.default_env,
+        used_env: resolved.used_env,
+        env_discovery: resolved.env_discovery,
     })
 }
 
@@ -1956,6 +1903,7 @@ fn build_diagnostics(uri: &Uri, text: &str) -> Vec<Diagnostic> {
     }
 
     diagnostics.extend(build_unknown_group_diagnostics(&lines));
+    diagnostics.extend(build_scalar_include_diagnostics(&lines));
     diagnostics.extend(build_ambiguous_env_diagnostics(&lines));
     diagnostics.extend(build_template_diagnostics(uri, text, &lines));
 
@@ -4023,9 +3971,11 @@ fn make_diagnostic(
 ) -> Diagnostic {
     let line_text = lines.get(line).copied().unwrap_or_default();
     let start = line_text.find(token).unwrap_or(0);
-    let end = if start == 0 && token.is_empty() {
-        line_text.len()
-    } else if start == 0 && !line_text.starts_with(token) {
+    // `find` yields 0 both for a token at the start of the line and for one that
+    // is not on the line at all, and an empty token matches everywhere. When the
+    // token cannot actually be located the whole line is underlined, because a
+    // zero-width range at column 0 points at nothing.
+    let end = if start == 0 && (token.is_empty() || !line_text.starts_with(token)) {
         line_text.len()
     } else {
         start + token.len()
@@ -4270,6 +4220,16 @@ const BUILTIN_APP_GROUPS: &[&str] = &[
     "apps-stateless",
 ];
 
+/// The groups the library ships, as pinned by `apps-compat.validateTopLevelStrict`.
+pub(crate) fn builtin_app_groups() -> &'static [&'static str] {
+    BUILTIN_APP_GROUPS
+}
+
+/// How many list arguments a library include takes, when the contract fixes it.
+pub(crate) fn library_include_signature(name: &str) -> Option<(usize, Option<usize>)> {
+    library_include_arity(name).map(|arity| (arity.min, arity.max))
+}
+
 /// Prefix the library reserves for its own groups. `apps-compat.validateTopLevelStrict`
 /// only rejects unknown keys carrying it -- other top-level keys stay free-form.
 const APP_GROUP_PREFIX: &str = "apps-";
@@ -4357,6 +4317,50 @@ fn strict_validation_enabled(lines: &[&str]) -> bool {
     }
 
     false
+}
+
+/// Flags `_include` written as a plain scalar.
+///
+/// `fl._getJoinedIncludesInJson` ranges over the value, so `_include: baseline`
+/// fails the render outright with "range can't iterate over baseline".
+/// happ's own values expander accepts the scalar, which makes this worth
+/// reporting loudly: without it `resolve` answers happily about a chart that
+/// cannot be deployed.
+fn build_scalar_include_diagnostics(lines: &[&str]) -> Vec<Diagnostic> {
+    let blocked = block_scalar_content_lines(lines);
+    let mut out = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        if blocked.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some((_indent, key, value)) = parse_key_line(line) else {
+            continue;
+        };
+        if key != "_include" {
+            continue;
+        }
+        let value = unquote(value.trim());
+        // An empty value means the list follows on the next lines, which is
+        // the correct form. A flow list `[a, b]` is a list too.
+        if value.is_empty() || value.starts_with('#') || value.starts_with('[') {
+            continue;
+        }
+        out.push(make_diagnostic(
+            i,
+            lines,
+            &value,
+            DiagnosticSeverity::ERROR,
+            format!(
+                "_include must be a list, not the scalar '{value}'. The library ranges over it, \
+                 so this fails the render with \"range can't iterate over {value}\". Write it as \
+                 a list item instead."
+            ),
+            Some("E_INCLUDE_NOT_A_LIST".to_string()),
+        ));
+    }
+
+    out
 }
 
 fn build_unknown_group_diagnostics(lines: &[&str]) -> Vec<Diagnostic> {
@@ -4459,11 +4463,10 @@ fn collect_env_map_blocks(lines: &[&str]) -> Vec<EnvMapBlockRef> {
         let Some((indent, key)) = parse_env_key_line(line) else {
             continue;
         };
-        while open
-            .last()
-            .is_some_and(|(open_indent, _)| indent <= *open_indent)
-        {
-            let (_, block) = open.pop().expect("checked by is_some_and");
+        // A key at this indent or shallower closes every block still open at or
+        // below it. `pop_if` asks and takes in one step, so there is no gap
+        // between testing the top of the stack and removing it.
+        while let Some((_, block)) = open.pop_if(|(open_indent, _)| indent <= *open_indent) {
             out.push(block);
         }
         let path = match open.last() {
@@ -4758,6 +4761,222 @@ fn parse_list_item_raw(line: &str) -> Option<(usize, &str)> {
         return None;
     }
     Some((indent, value))
+}
+
+// ---------------------------------------------------------------------------
+// Chart-path facade
+//
+// The LSP answers about a buffer the editor already has open; the MCP server
+// answers about a chart on disk. Both need the same include expansion, env-map
+// resolution and diagnostics, so the facade opens the document and then hands
+// off to the very same request handlers -- an MCP answer and an editor answer
+// can never drift apart.
+// ---------------------------------------------------------------------------
+
+/// A values document located on disk, addressed the way the LSP addresses an
+/// open buffer.
+pub(crate) struct ChartValuesSource {
+    pub(crate) chart_root: PathBuf,
+    pub(crate) values_path: PathBuf,
+    pub(crate) uri: String,
+    pub(crate) text: String,
+}
+
+impl ChartValuesSource {
+    fn params_uri(&self) -> Option<String> {
+        Some(self.uri.clone())
+    }
+
+    fn params_text(&self) -> Option<String> {
+        Some(self.text.clone())
+    }
+}
+
+/// Turns a user-supplied path into the values document analysis starts from.
+///
+/// Accepts either the chart directory or a values file inside it, because a
+/// caller that only knows "the chart lives here" is the common case, and a
+/// caller pointing at `values-prod.yaml` is the useful exception.
+pub(crate) fn locate_chart_values(path: &Path) -> Result<ChartValuesSource, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("resolve current directory: {err}"))?
+            .join(path)
+    };
+    if !absolute.exists() {
+        return Err(format!("path does not exist: {}", absolute.display()));
+    }
+
+    let chart_root = find_chart_root_from_path(&absolute).ok_or_else(|| {
+        format!(
+            "no Chart.yaml found at or above {} -- point at a Helm chart directory or a values file inside one",
+            absolute.display()
+        )
+    })?;
+
+    let values_path = if absolute.is_dir() {
+        find_primary_values_file(&chart_root).ok_or_else(|| {
+            format!(
+                "chart at {} has no values.yaml -- pass the values file explicitly",
+                chart_root.display()
+            )
+        })?
+    } else {
+        absolute
+    };
+
+    let text = std::fs::read_to_string(&values_path)
+        .map_err(|err| format!("read {}: {err}", values_path.display()))?;
+    let uri = url::Url::from_file_path(&values_path)
+        .map_err(|()| {
+            format!(
+                "path is not addressable as a file URI: {}",
+                values_path.display()
+            )
+        })?
+        .to_string();
+
+    Ok(ChartValuesSource {
+        chart_root,
+        values_path,
+        uri,
+        text,
+    })
+}
+
+/// Groups, apps and the envs a chart declares, for `env`.
+pub(crate) fn analysis_list_entities(
+    source: &ChartValuesSource,
+    env: Option<String>,
+) -> Result<JsonValue, String> {
+    let result = list_entities_request(
+        &ServerState::default(),
+        ListEntitiesParams {
+            uri: source.params_uri(),
+            text: source.params_text(),
+            env,
+            apply_includes: None,
+            apply_env_resolution: None,
+        },
+    )?;
+    serde_json::to_value(result).map_err(|err| format!("serialize entity list: {err}"))
+}
+
+/// One app's values with includes expanded and env maps collapsed.
+pub(crate) fn analysis_resolve_entity(
+    source: &ChartValuesSource,
+    group: String,
+    app: String,
+    env: Option<String>,
+    apply_includes: Option<bool>,
+    apply_env_resolution: Option<bool>,
+) -> Result<JsonValue, String> {
+    let result = resolve_entity_request(
+        &ServerState::default(),
+        ResolveEntityParams {
+            uri: source.params_uri(),
+            text: source.params_text(),
+            group,
+            app,
+            env,
+            apply_includes,
+            apply_env_resolution,
+        },
+    )?;
+    serde_json::to_value(result).map_err(|err| format!("serialize resolved entity: {err}"))
+}
+
+/// The Kubernetes manifests one app renders to, isolated from its siblings.
+pub(crate) fn analysis_render_entity_manifest(
+    source: &ChartValuesSource,
+    group: String,
+    app: String,
+    env: Option<String>,
+    renderer: Option<String>,
+) -> Result<JsonValue, String> {
+    let result = render_entity_manifest_request(
+        &ServerState::default(),
+        RenderEntityManifestParams {
+            uri: source.params_uri(),
+            text: source.params_text(),
+            group,
+            app,
+            env,
+            renderer,
+            apply_includes: None,
+            apply_env_resolution: None,
+        },
+    )?;
+    serde_json::to_value(result).map_err(|err| format!("serialize rendered manifest: {err}"))
+}
+
+/// The whole values tree as the chart sees it for `env`.
+pub(crate) fn analysis_resolved_root(
+    source: &ChartValuesSource,
+    env: Option<String>,
+    apply_includes: Option<bool>,
+    apply_env_resolution: Option<bool>,
+) -> Result<(JsonValue, String), String> {
+    let resolved = resolve_values_root(
+        Some(&source.uri),
+        &source.text,
+        env,
+        apply_includes.unwrap_or(true),
+        apply_env_resolution.unwrap_or(true),
+    )?;
+    Ok((resolved.root, resolved.used_env))
+}
+
+/// The env names a chart mentions, split into literals and regex keys.
+pub(crate) fn analysis_environments(
+    source: &ChartValuesSource,
+) -> Result<(JsonValue, String), String> {
+    let resolved = resolve_values_root(Some(&source.uri), &source.text, None, true, false)?;
+    let discovery = serde_json::to_value(&resolved.env_discovery)
+        .map_err(|err| format!("serialize env discovery: {err}"))?;
+    Ok((discovery, resolved.default_env))
+}
+
+/// The same diagnostics the editor underlines, as plain data.
+pub(crate) fn analysis_diagnostics(source: &ChartValuesSource) -> Result<Vec<JsonValue>, String> {
+    let uri: Uri = source
+        .uri
+        .parse()
+        .map_err(|_| format!("values path is not a usable URI: {}", source.uri))?;
+    Ok(build_diagnostics(&uri, &source.text)
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "line": diagnostic.range.start.line + 1,
+                "column": diagnostic.range.start.character + 1,
+                "endLine": diagnostic.range.end.line + 1,
+                "endColumn": diagnostic.range.end.character + 1,
+                "severity": diagnostic_severity_label(diagnostic.severity),
+                "code": diagnostic_code_label(diagnostic),
+                "message": diagnostic.message,
+            })
+        })
+        .collect())
+}
+
+fn diagnostic_severity_label(severity: Option<DiagnosticSeverity>) -> &'static str {
+    match severity {
+        Some(DiagnosticSeverity::ERROR) => "error",
+        Some(DiagnosticSeverity::WARNING) => "warning",
+        Some(DiagnosticSeverity::INFORMATION) => "info",
+        Some(DiagnosticSeverity::HINT) => "hint",
+        _ => "info",
+    }
+}
+
+fn diagnostic_code_label(diagnostic: &Diagnostic) -> JsonValue {
+    match &diagnostic.code {
+        Some(lsp_types::NumberOrString::String(code)) => JsonValue::String(code.clone()),
+        Some(lsp_types::NumberOrString::Number(code)) => JsonValue::String(code.to_string()),
+        None => JsonValue::Null,
+    }
 }
 
 #[cfg(test)]
