@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.2.0] - 2026-07-29
+
+### Added
+
+- Added `happ mcp`, which serves happ's helm-apps chart analysis and language-server-backed code analysis to an LLM over the Model Context Protocol via stdio.
+- Added `happ mcp setup` and `happ mcp remove` to register and unregister the server with claude, codex and opencode, project-scoped or user-wide, both supporting `--dry-run`.
+- Published the embedded helm-apps chart as MCP resources so a client can read the library contract verbatim.
+- Added `--parent-pid` to the MCP server so it exits with a host that dies without closing the pipe.
+
+### Changed
+
+- Extracted the analysis the LSP performed inline into shared `analysis_*` entry points that both the LSP and the MCP tools call, so the two front ends cannot drift.
+- `dyfflike` now produces structured changes carrying both sides of a change, not just rendered text.
+
+### Fixed
+
+- Web mode now serves local requests only: `Host` and `Origin` must be loopback, `POST /api/*` requires `Content-Type: application/json`, and `/exit` is `POST` only. This closes cross-origin writes through `/api/save-chart`, cross-origin reads through `/api/fs-list`, DNS rebinding, and shutdown from an `<img>` tag.
+- Web mode no longer mistakes the socket read timeout for the end of a request body, so a client that pauses between headers and body is no longer rejected with a JSON parse error.
+
 ## [1.1.7] - 2026-03-15
 
 ### Added
