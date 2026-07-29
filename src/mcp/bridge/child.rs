@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -21,6 +22,10 @@ use super::{path_to_uri, severity_label, uri_to_path, Diagnostic, LanguageSpec, 
 /// How long to wait for one response. Generous, because the first request to a
 /// cold `rust-analyzer` or `gopls` waits on indexing.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long a failure path waits for the server's stderr to reach EOF before
+/// giving up on its explanation. Only ever paid when start-up already failed.
+const STDERR_DRAIN_WAIT: Duration = Duration::from_secs(2);
 
 /// How long to wait for a server to publish diagnostics after a file is opened.
 /// Absence of diagnostics is itself an answer, so this cannot be long.
@@ -168,6 +173,9 @@ pub(crate) struct ChildProvider {
     published: HashMap<PathBuf, Vec<Diagnostic>>,
     /// What the server has said about itself, kept for failure messages.
     complaints: Arc<Mutex<Complaints>>,
+    /// Set when the stderr pipe reaches EOF, so a failure path can tell
+    /// "the server said nothing" from "the server has not been read yet".
+    drained: Arc<AtomicBool>,
     /// Progress tokens the server has begun and not yet ended.
     working: HashSet<String>,
     /// Whether the one-off wait for start-up work has already been paid.
@@ -221,14 +229,17 @@ impl ChildProvider {
         // Drained continuously: a server that fills its stderr pipe and blocks
         // would look exactly like one that hung.
         let complaints = Arc::new(Mutex::new(Complaints::default()));
+        let drained = Arc::new(AtomicBool::new(false));
         let sink = Arc::clone(&complaints);
+        let done = Arc::clone(&drained);
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 let Ok(mut buffer) = sink.lock() else {
-                    return;
+                    break;
                 };
                 buffer.printed(&line);
             }
+            done.store(true, Ordering::SeqCst);
         });
 
         let (sender, incoming) = mpsc::channel();
@@ -251,6 +262,7 @@ impl ChildProvider {
             capabilities: JsonValue::Null,
             published: HashMap::new(),
             complaints,
+            drained,
             working: HashSet::new(),
             warmed: false,
             proven: false,
@@ -266,7 +278,17 @@ impl ChildProvider {
     /// Adds whatever the server printed to its own stderr, which is routinely
     /// the only thing that says *why* -- a rustup shim reporting an uninstalled
     /// component looks identical to a hang without it.
+    ///
+    /// A server that dies on start-up loses a race here: the write that fails
+    /// with a broken pipe reports before the stderr thread has read the line
+    /// explaining the death, leaving only "Broken pipe (os error 32)". So this
+    /// first waits for stderr to reach EOF, which has already happened by the
+    /// time a dead server's pipe breaks.
     fn explain(&self, err: String) -> String {
+        let deadline = Instant::now() + STDERR_DRAIN_WAIT;
+        while !self.drained.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         match self
             .complaints
             .lock()
