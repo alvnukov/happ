@@ -9,6 +9,7 @@ const VUE_GLOBAL_PROD_JS: &str = include_str!("../assets/vue.global.prod.js");
 const CODEMIRROR_BUNDLE_JS: &str = include_str!("../assets/codemirror.bundle.js");
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#5a81e6"/><stop offset="100%" stop-color="#6ed1bb"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="14" fill="#1a1d22" stroke="url(#g)" stroke-width="3"/><path d="M19 19h8v10h10V19h8v26h-8V35H27v10h-8z" fill="#e9edf7"/></svg>"##;
 const MAX_HTTP_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_UPLOAD_FILES: usize = 2_048;
 const DEFAULT_MAX_UPLOAD_FILE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_UPLOAD_TOTAL_BYTES: usize = 64 * 1024 * 1024;
@@ -126,7 +127,21 @@ fn handle_connection(
     let route_path = path.split('?').next().unwrap_or(path);
     let body = http_body(&req);
 
+    if let Err(reason) = check_local_request(&req, method, route_path) {
+        return write_response(stream, 403, "text/plain; charset=utf-8", reason.as_bytes())
+            .map_err(|e| e.to_string());
+    }
+
     if route_path == "/exit" {
+        if method != "POST" {
+            return write_response(
+                stream,
+                405,
+                "text/plain; charset=utf-8",
+                b"/exit requires POST",
+            )
+            .map_err(|e| e.to_string());
+        }
         running.store(false, Ordering::SeqCst);
         return write_response(stream, 200, "text/plain; charset=utf-8", b"shutting down")
             .map_err(|e| e.to_string());
@@ -942,6 +957,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<String, String> {
     let mut buf = [0u8; 4096];
     let mut header_end = None;
     let mut content_length = 0usize;
+    let deadline = std::time::Instant::now() + BODY_READ_TIMEOUT;
 
     loop {
         let n = match stream.read(&mut buf) {
@@ -950,10 +966,22 @@ fn read_http_request(stream: &mut TcpStream) -> Result<String, String> {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                if header_end.is_some() {
+                // The short socket timeout keeps idle probes from stalling the
+                // single-threaded accept loop, so it must not be mistaken for the
+                // end of a body that is still arriving.
+                let Some(h_end) = header_end else {
+                    return Err("read timeout".to_string());
+                };
+                let body_len = data.len().saturating_sub(h_end + 4);
+                if body_len >= content_length {
                     break;
                 }
-                return Err("read timeout".to_string());
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "incomplete request body: got {body_len} of {content_length} bytes before timeout"
+                    ));
+                }
+                continue;
             }
             Err(e) => return Err(e.to_string()),
         };
@@ -1011,6 +1039,85 @@ fn parse_content_length(header: &str) -> usize {
 
 fn http_body(req: &str) -> &str {
     req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+}
+
+fn header_value<'a>(req: &'a str, name: &str) -> Option<&'a str> {
+    req.lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+}
+
+/// Strips the port from a Host or Origin authority, keeping IPv6 literals intact.
+fn authority_host(authority: &str) -> &str {
+    let authority = authority.trim();
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    authority.split(':').next().unwrap_or(authority)
+}
+
+fn host_is_loopback(authority: &str) -> bool {
+    let host = authority_host(authority);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn origin_is_loopback(origin: &str) -> bool {
+    let origin = origin.trim();
+    origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .map(host_is_loopback)
+        .unwrap_or(false)
+}
+
+fn is_json_content_type(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("application/json")
+}
+
+/// The web mode is a single-user local tool, so every request must look like it
+/// came from this machine's own browser or a local client. This rejects the two
+/// ways a page on another site can reach a loopback port: a cross-origin request
+/// (caught by Origin), and a hostname that resolves to 127.0.0.1 (caught by Host).
+/// Requiring JSON on the API turns every write into a preflighted request, which
+/// a foreign page cannot send at all.
+fn check_local_request(req: &str, method: &str, route_path: &str) -> Result<(), String> {
+    if let Some(host) = header_value(req, "host") {
+        if !host_is_loopback(host) {
+            return Err(format!(
+                "refused: Host '{host}' is not loopback. happ --web serves this machine only."
+            ));
+        }
+    }
+    if let Some(origin) = header_value(req, "origin") {
+        if !origin_is_loopback(origin) {
+            return Err(format!(
+                "refused: cross-origin request from '{origin}'. happ --web serves this machine only."
+            ));
+        }
+    }
+    if method == "POST" && route_path.starts_with("/api/") {
+        let content_type = header_value(req, "content-type").unwrap_or("");
+        if !is_json_content_type(content_type) {
+            return Err(format!(
+                "refused: {route_path} requires Content-Type: application/json (got '{content_type}')."
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn payload_string_list(payload: &serde_json::Value, key: &str) -> Vec<String> {
@@ -3097,7 +3204,9 @@ fn write_response(
     let reason = match code {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
         _ => "OK",
@@ -3541,13 +3650,93 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
 .form-field {{ display:flex; flex-direction:column; gap:6px; }}
 .form-field > label {{ font-size:12px; color:var(--muted); font-weight:600; }}
 .import-shell {{ display:flex; flex-direction:column; gap:12px; }}
+.import-command-bar {{
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  flex-wrap:wrap;
+  padding:12px;
+  border:1px solid var(--border);
+  border-radius:12px;
+  background:linear-gradient(180deg,#242b35 0%, #1b212a 100%);
+}}
+.import-command-bar .left,
+.import-command-bar .right {{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  flex-wrap:wrap;
+}}
+.import-context-grid {{
+  display:grid;
+  grid-template-columns:minmax(420px, 1.15fr) minmax(360px, 0.85fr);
+  gap:12px;
+  align-items:start;
+}}
+.context-card {{
+  border:1px solid var(--border);
+  border-radius:12px;
+  background:linear-gradient(180deg,#232934 0%, #1d232c 100%);
+  padding:14px;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}}
+.context-card-head {{
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  align-items:flex-start;
+}}
+.context-card-head h4 {{
+  margin:2px 0 0 0;
+  font-size:22px;
+  letter-spacing:-0.02em;
+  color:#eef2f7;
+}}
+.context-kicker {{
+  font-size:11px;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  color:#8fa0bd;
+  font-weight:700;
+}}
+.context-summary {{
+  border:1px solid var(--border);
+  border-radius:999px;
+  padding:7px 10px;
+  font-size:12px;
+  color:#d1dbec;
+  background:rgba(255,255,255,0.04);
+  white-space:normal;
+  max-width:100%;
+}}
+.import-context-fields {{ margin:0; }}
+.import-context-fields .form-field {{
+  min-width:0;
+}}
+.import-status-row {{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+}}
 .import-layout {{
   display:grid;
   grid-template-columns:minmax(520px, 1fr) minmax(520px, 1fr);
   gap:12px;
-  align-items:stretch;
-  height:calc(100vh - 260px);
-  min-height:560px;
+  align-items:start;
+  height:calc(100vh - 330px);
+  min-height:540px;
+}}
+.import-layout-column {{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  min-height:0;
+}}
+.import-layout-column > .import-section,
+.import-layout-column > .import-output {{
+  flex:1 1 auto;
 }}
 .import-config {{ display:flex; flex-direction:column; gap:12px; }}
 .import-config.compact {{
@@ -3555,12 +3744,108 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
   overflow:auto;
   padding-right:4px;
 }}
+.import-config-hero {{
+  border:1px solid #344154;
+  border-radius:12px;
+  padding:12px 14px;
+  background:linear-gradient(180deg,rgba(77,112,173,0.12) 0%, rgba(38,46,59,0.72) 100%);
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}}
+.import-config-hero-title {{
+  font-size:14px;
+  font-weight:700;
+  color:#eef2f7;
+}}
+.import-config-hero-body {{
+  font-size:12px;
+  line-height:1.45;
+  color:#b5c1d6;
+}}
 .import-config.compact .conv-grid {{
   grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
 }}
 .import-config.compact textarea {{
   min-height:110px;
   max-height:300px;
+}}
+.settings-grid {{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:12px;
+}}
+.settings-card {{
+  border:1px solid var(--border);
+  border-radius:12px;
+  background:linear-gradient(180deg,#232934 0%, #1d232c 100%);
+  padding:12px;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  min-width:0;
+}}
+.settings-card.wide {{
+  grid-column:1 / -1;
+}}
+.settings-card-head {{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+}}
+.settings-card-kicker {{
+  font-size:11px;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  color:#8fa0bd;
+  font-weight:700;
+}}
+.settings-card-title {{
+  font-size:15px;
+  font-weight:700;
+  color:#eef2f7;
+}}
+.settings-card-body {{
+  font-size:12px;
+  line-height:1.45;
+  color:#b5c1d6;
+}}
+.checks-grid {{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:8px;
+}}
+.checks-grid .chk {{
+  display:flex;
+  align-items:flex-start;
+  gap:8px;
+  border:1px solid #364255;
+  border-radius:10px;
+  padding:9px 10px;
+  background:rgba(255,255,255,0.025);
+}}
+.settings-text-grid {{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:12px;
+}}
+.settings-text-card {{
+  border:1px solid var(--border);
+  border-radius:12px;
+  background:linear-gradient(180deg,#232934 0%, #1d232c 100%);
+  padding:12px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  min-width:0;
+}}
+.settings-text-card textarea {{
+  min-height:140px;
+}}
+.settings-card textarea,
+.settings-text-card textarea {{
+  width:100%;
+  box-sizing:border-box;
 }}
 .import-output {{
   border:1px solid var(--border);
@@ -3645,6 +3930,12 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
   letter-spacing:-0.02em;
   color:#f3f5fb;
 }}
+.section-subtitle {{
+  margin:4px 0 0 0;
+  font-size:13px;
+  color:#9ba8bf;
+  line-height:1.45;
+}}
 .import-subtitle {{
   margin:2px 0 0 0;
   font-size:14px;
@@ -3692,7 +3983,11 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
 .path-field {{ grid-column: 1 / -1; }}
 .path-row {{ display:flex; gap:8px; align-items:center; }}
 .path-row input[type='text'] {{ flex:1; min-width:260px; }}
-.path-meta {{ font-size:12px; color:var(--muted); }}
+.path-meta {{
+  font-size:12px;
+  color:var(--muted);
+  min-height:16px;
+}}
 .segmented {{
   display:inline-flex;
   align-items:center;
@@ -3784,10 +4079,9 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
   text-overflow:ellipsis;
 }}
 .generated-toolbar {{
-  display:grid;
-  grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+  display:flex;
   gap:8px;
-  align-items:start;
+  align-items:flex-start;
   flex-wrap:wrap;
   margin:6px 0 10px 0;
 }}
@@ -3802,10 +4096,12 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
   align-items:center;
   gap:6px;
   flex-wrap:wrap;
+  flex:0 0 auto;
   border:1px solid var(--border);
   border-radius:10px;
   background:linear-gradient(180deg,#232934 0%, #1d232c 100%);
   padding:6px;
+  max-width:100%;
 }}
 .toolbar-group-title {{
   font-size:10px;
@@ -3828,6 +4124,107 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
   padding:6px 8px;
   font-size:12px;
   color:#c2ccdd;
+}}
+.source-mode-card {{
+  border:1px dashed #41506a;
+  border-radius:12px;
+  background:linear-gradient(180deg,rgba(54,63,79,0.34) 0%, rgba(27,33,42,0.55) 100%);
+  padding:18px;
+  min-height:240px;
+  display:flex;
+  flex-direction:column;
+  justify-content:center;
+  gap:10px;
+}}
+.source-mode-title {{
+  font-size:18px;
+  font-weight:700;
+  color:#eef2f7;
+}}
+.source-mode-body {{
+  font-size:14px;
+  line-height:1.55;
+  color:#b8c3d7;
+}}
+.source-mode-tags {{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+}}
+.source-editor-toolbar {{
+  display:flex;
+  justify-content:space-between;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-bottom:6px;
+}}
+.source-editor-toolbar .left,
+.source-editor-toolbar .right {{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  flex-wrap:wrap;
+}}
+.output-empty-note {{
+  margin:0 0 8px 0;
+  border:1px dashed #41506a;
+  border-radius:10px;
+  padding:10px 12px;
+  background:rgba(255,255,255,0.03);
+  color:#b8c3d7;
+  font-size:13px;
+  line-height:1.45;
+}}
+.output-empty-note code {{
+  font-family:ui-monospace, Menlo, monospace;
+  font-size:12px;
+  padding:1px 4px;
+  border:1px solid #3b4659;
+  border-radius:6px;
+  color:#d7e3f6;
+  background:#202734;
+}}
+.output-empty-state {{
+  display:flex;
+  flex:1 1 auto;
+  flex-direction:column;
+  justify-content:center;
+  gap:10px;
+  border:1px dashed #41506a;
+  border-radius:12px;
+  padding:18px;
+  background:linear-gradient(180deg,rgba(54,63,79,0.22) 0%, rgba(27,33,42,0.45) 100%);
+  color:#b8c3d7;
+}}
+.output-empty-title {{
+  font-size:18px;
+  font-weight:700;
+  color:#eef2f7;
+}}
+.output-empty-state.error {{
+  border-style:solid;
+  border-color:#664452;
+  background:linear-gradient(180deg,rgba(104,53,69,0.22) 0%, rgba(36,25,31,0.5) 100%);
+}}
+.output-empty-state.error .output-empty-title {{
+  color:#ffd4da;
+}}
+.output-empty-state.error .output-empty-body {{
+  color:#f0c1cb;
+}}
+.output-empty-body {{
+  font-size:14px;
+  line-height:1.5;
+  color:#b8c3d7;
+}}
+.output-empty-body code {{
+  font-family:ui-monospace, Menlo, monospace;
+  font-size:12px;
+  padding:1px 4px;
+  border:1px solid #3b4659;
+  border-radius:6px;
+  color:#d7e3f6;
+  background:#202734;
 }}
 .editor-shell {{
   border:1px solid var(--border);
@@ -3931,6 +4328,16 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
   scrollbar-gutter:stable both-edges;
   scrollbar-color:#77829a #1a1f28;
   scrollbar-width:thin;
+}}
+.import-section .source-editor-area .import-editor-shell,
+.import-output .import-editor-shell {{
+  min-height:320px;
+}}
+.import-section .source-editor-area .editor-host,
+.import-section .source-editor-area .yaml-editor,
+.import-section .source-editor-area .yaml-editor-highlight,
+.import-section .source-editor-area .yaml-editor-input {{
+  min-height:320px;
 }}
 .import-layout .yaml-editor-highlight::-webkit-scrollbar,
 .import-layout .yaml-editor-input::-webkit-scrollbar,
@@ -4271,11 +4678,16 @@ pre.wrap {{ white-space:pre-wrap; word-break:break-word; }}
   .tabs-row {{ align-items:flex-start; }}
   .view-controls {{ width:100%; justify-content:flex-start; }}
   .conv-grid {{ grid-template-columns:1fr; }}
+  .import-command-bar {{ flex-direction:column; align-items:stretch; }}
+  .import-context-grid {{ grid-template-columns:1fr; }}
+  .context-card-head {{ flex-direction:column; }}
   .import-layout {{ grid-template-columns:1fr; height:auto; min-height:0; }}
   .import-output {{ position:static; top:auto; }}
   .import-title h3 {{ font-size:30px; }}
   .segmented {{ width:100%; }}
   .segmented button {{ flex:1; text-align:center; }}
+  .settings-grid,
+  .settings-text-grid {{ grid-template-columns:1fr; }}
 }}
 </style>
 <script>
@@ -4356,21 +4768,17 @@ window.addEventListener('error', function(e) {{
       </div>
       <div class='helper-note'>Settings are persisted in localStorage.</div>
     </div>
-    <div class='import-toolbar'>
+    <div class='import-command-bar'>
       <div class='left'>
-        <button class='primary' @click='runMainImport'>Run import</button>
-        <button class='secondary' @click='openMainImportConfig'>Import configuration</button>
-        <button class='secondary' @click='clearMainImport'>Clear output</button>
+        <button class='primary' @click='runMainImport' :disabled='mainImportRunning'>{{{{ mainImportRunLabel }}}}</button>
+        <button class='secondary' @click='openMainImportConfig' :disabled='mainImportRunning'>Advanced settings</button>
+        <button class='secondary' @click='clearMainImport' :disabled='mainImportRunning'>Clear output</button>
       </div>
       <div class='right'>
         <span class='import-status'>{{{{ mainImportMessage || "Ready" }}}}</span>
         <span class='import-status'>docs/services: {{{{ mainImportSourceCount }}}}</span>
         <span class='import-status' :title='cmProbeReason || ""'>editor: {{{{ cmAvailable ? "cm6" : "fallback" }}}}</span>
       </div>
-    </div>
-    <div class='import-meta-line'>
-      <span class='import-status'>source: {{{{ mainImportSourceType }}}}</span>
-      <span class='path-chip' :title='mainImportPath || "-"'>path: {{{{ mainImportPath || "-" }}}}</span>
     </div>
     <div v-if='mainImportNeedsTemplateDecision' class='import-issues'>
       <div class='import-issues-head'>
@@ -4386,7 +4794,7 @@ window.addEventListener('error', function(e) {{
         <button class='primary' @click='allowDetectedTemplateIncludesAndRetry' :disabled='mainImportRunning'>Allow listed includes + Retry</button>
         <button class='secondary' @click='escapeUnsupportedTemplatesAndRetry' :disabled='mainImportRunning'>Escape unsupported templates + Retry</button>
         <button class='secondary' @click='appendDetectedTemplateIncludes' :disabled='mainImportRunning'>Add includes to allow list</button>
-        <button class='secondary' @click='openMainImportConfig' :disabled='mainImportRunning'>Review import config</button>
+        <button class='secondary' @click='openMainImportConfig' :disabled='mainImportRunning'>Review advanced settings</button>
       </div>
       <div class='import-issues-note'>Default mode is strict. Choose one action to continue import.</div>
       <details class='advanced-details' style='margin-top:8px;' v-if='mainImportRawError && mainImportRawError !== mainImportError'>
@@ -4395,101 +4803,181 @@ window.addEventListener('error', function(e) {{
       </details>
     </div>
     <div class='import-layout'>
-      <div class='import-section'>
-        <h4>{{{{ mainImportSourceEditorTitle }}}}</h4>
-        <div class='segmented' style='margin-bottom:8px;'>
-          <button type='button' :class='{{ active: mainImportSourceType === "chart" }}' @click='mainImportSourceType = "chart"'>Chart</button>
-          <button type='button' :class='{{ active: mainImportSourceType === "manifests" }}' @click='mainImportSourceType = "manifests"'>Manifests</button>
-        </div>
-        <div v-if='mainImportSourceType === "compose"' class='muted'>Source type is compose. Inline source editor is available for chart values and raw manifests.</div>
-        <div v-else class='source-editor-area'>
-          <div class='import-toolbar' style='margin-bottom:6px;'>
-            <div class='left'>
-              <button class='secondary' @click='loadMainImportSourceFromPath'>{{{{ mainImportSourceLoadLabel }}}}</button>
-              <button class='secondary' @click='pasteMainImportFromStdin' :disabled='!mainImportStdinText'>Paste stdin</button>
-              <button class='secondary' @click='resetMainImportSourceEditor'>Reset</button>
-              <button class='secondary' @click='clearMainImportSourceEditor' :disabled='!mainImportSourceEditorContent'>{{{{ mainImportSourceClearLabel }}}}</button>
+      <div class='import-layout-column'>
+        <div class='context-card'>
+          <div class='context-card-head'>
+            <div>
+              <div class='context-kicker'>Source & path</div>
+              <div class='context-summary'>{{{{ mainImportSourceSummary }}}}</div>
             </div>
-            <div class='right'>
-              <label class='chk'><input type='checkbox' v-model='mainImportUseSourceEditor'/> {{{{ mainImportSourceUseCheckboxLabel }}}}</label>
-              <label class='chk' v-if='mainImportSourceType === "manifests"'><input type='checkbox' v-model='mainImportManifestsInputOnly'/> input only (ignore path manifests)</label>
-              <div class='field-hint' v-if='mainImportSourceType === "manifests"'>Inline input supplements path manifests by default.</div>
+            <div class='import-status-row'>
+              <span class='import-status'>{{{{ mainImportSourceType }}}}</span>
+              <span class='path-chip' :title='mainImportPath || "-"'>{{{{ mainImportPathStateLabel }}}}</span>
             </div>
           </div>
-          <div class='editor-shell import-editor-shell'>
-            <div v-if='cmAvailable' class='editor-host' ref='mainImportSourceCmHost'></div>
-            <div v-else class='yaml-editor'>
-              <pre class='yaml-editor-highlight' aria-hidden='true' v-html='mainImportSourceHighlighted'></pre>
-              <textarea
-                class='yaml-editor-input'
-                v-model='mainImportSourceEditorContent'
-                ref='mainImportSourceInput'
-                spellcheck='false'
-                @scroll='syncMainImportSourceScroll'
-                @input='syncMainImportSourceScroll'
-                @select='onMainImportTextareaSelect'
-                @keyup='onMainImportTextareaSelect'
-                @mouseup='onMainImportTextareaSelect'
-                style='min-height:320px;'
-              ></textarea>
+          <div class='segmented' style='margin-bottom:8px;'>
+            <button type='button' :class='{{ active: mainImportSourceType === "chart" }}' @click='mainImportSourceType = "chart"'>Chart</button>
+            <button type='button' :class='{{ active: mainImportSourceType === "manifests" }}' @click='mainImportSourceType = "manifests"'>Manifests</button>
+            <button type='button' :class='{{ active: mainImportSourceType === "compose" }}' @click='mainImportSourceType = "compose"'>Compose</button>
+          </div>
+          <div class='import-context-fields'>
+            <div class='form-field path-field' style='grid-column: 1 / -1;'>
+              <label>Path on server</label>
+              <div class='path-row'>
+                <input type='text' v-model='mainImportPath' :placeholder='mainImportPathPlaceholder'/>
+                <button class='secondary' @click='openMainImportPicker'>Choose…</button>
+                <button class='secondary' @click='clearMainImportSelection'>Clear</button>
+              </div>
+              <div class='path-meta'>{{{{ mainImportPathMetaLabel }}}}</div>
+              <div class='field-hint'>{{{{ mainImportSourceContextHint }}}}</div>
+            </div>
+          </div>
+        </div>
+        <div class='import-section'>
+          <h4>{{{{ mainImportSourceEditorTitle }}}}</h4>
+          <div v-if='mainImportSourceType !== "compose"' class='section-subtitle'>{{{{ mainImportSourceEditorHint }}}}</div>
+          <div v-if='mainImportSourceType === "compose"' class='source-mode-card'>
+            <div class='source-mode-title'>Compose import is path-based</div>
+            <div class='source-mode-body'>{{{{ mainImportSourceEditorHint }}}}</div>
+            <div class='source-mode-tags'>
+              <span class='import-status'>docker-compose.yaml</span>
+              <span class='import-status'>server path required</span>
+            </div>
+          </div>
+          <div v-else class='source-editor-area'>
+            <div class='source-editor-toolbar'>
+              <div class='left'>
+                <button class='secondary' @click='loadMainImportSourceFromPath'>{{{{ mainImportSourceLoadLabel }}}}</button>
+                <button class='secondary' @click='pasteMainImportFromStdin' :disabled='!mainImportStdinText'>Paste stdin</button>
+                <button class='secondary' @click='resetMainImportSourceEditor'>Reset</button>
+                <button class='secondary' @click='clearMainImportSourceEditor' :disabled='!mainImportSourceEditorContent'>{{{{ mainImportSourceClearLabel }}}}</button>
+              </div>
+              <div class='right'>
+                <label class='chk'><input type='checkbox' v-model='mainImportUseSourceEditor'/> {{{{ mainImportSourceUseCheckboxLabel }}}}</label>
+                <label class='chk' v-if='mainImportSourceType === "manifests"'><input type='checkbox' v-model='mainImportManifestsInputOnly'/> input only (ignore path manifests)</label>
+              </div>
+            </div>
+            <div class='editor-shell import-editor-shell'>
+              <div v-if='cmAvailable' class='editor-host' ref='mainImportSourceCmHost'></div>
+              <div v-else class='yaml-editor'>
+                <pre class='yaml-editor-highlight' aria-hidden='true' v-html='mainImportSourceHighlighted'></pre>
+                <textarea
+                  class='yaml-editor-input'
+                  v-model='mainImportSourceEditorContent'
+                  ref='mainImportSourceInput'
+                  spellcheck='false'
+                  @scroll='syncMainImportSourceScroll'
+                  @input='syncMainImportSourceScroll'
+                  @select='onMainImportTextareaSelect'
+                  @keyup='onMainImportTextareaSelect'
+                  @mouseup='onMainImportTextareaSelect'
+                  style='min-height:320px;'
+                ></textarea>
+              </div>
             </div>
           </div>
         </div>
       </div>
-      <div class='import-output'>
-        <div class='panel-label' style='margin:0;'>Generated values.yaml</div>
-        <div class='generated-toolbar'>
-          <div class='toolbar-group'>
-            <span class='toolbar-group-title'>Analyze</span>
-            <button class='primary' @click='runMainImport'>Render + Analyze</button>
-            <button
-              class='secondary'
-              @click='runMainImportCompare'
-              :disabled='mainImportCompareRunning || !mainImportOutput || mainImportSourceType !== "chart"'>
-              {{{{ mainImportCompareRunning ? 'Comparing…' : 'Compare renders' }}}}
-            </button>
+      <div class='import-layout-column'>
+        <div class='context-card'>
+          <div class='context-card-head'>
+            <div>
+              <div class='context-kicker'>Render identity</div>
+              <div class='context-summary'>Render defaults used for import and generated chart validation.</div>
+            </div>
+            <div class='import-status-row'>
+              <span class='import-status'>env: {{{{ mainImportEnv || "dev" }}}}</span>
+              <span class='import-status'>release: {{{{ mainImportReleaseName || "imported" }}}}</span>
+            </div>
           </div>
-          <div class='toolbar-group'>
-            <span class='toolbar-group-title'>Values</span>
-            <button class='secondary' @click='copyMainImportOutput' :disabled='!mainImportOutput'>Copy values</button>
-            <button class='secondary' @click='openMainImportSaveChart' :disabled='!mainImportOutput'>Save as chart</button>
-          </div>
-          <div class='toolbar-group'>
-            <span class='toolbar-group-title'>Folding</span>
-            <button class='secondary' @click='foldMainImportLevel(1)'>L1</button>
-            <button class='secondary' @click='foldMainImportLevel(2)'>L2</button>
-            <button class='secondary' @click='foldMainImportLevel(3)'>L3</button>
-            <button class='secondary' @click='collapseAllMainImportSections'>Collapse</button>
-            <button class='secondary' @click='expandAllMainImportSections'>Expand</button>
+          <div class='import-context-fields'>
+            <div class='form-field'>
+              <label>Environment</label>
+              <input type='text' v-model='mainImportEnv' placeholder='dev'/>
+              <div class='field-hint'>Mapped to <code>global.env</code> for env-map resolution.</div>
+            </div>
+            <div class='form-field'>
+              <label>Release name</label>
+              <input type='text' v-model='mainImportReleaseName' placeholder='imported'/>
+              <div class='field-hint'>Used for rendering chart and generated chart validation.</div>
+            </div>
+            <div class='form-field'>
+              <label>Namespace (optional)</label>
+              <input type='text' v-model='mainImportNamespace' placeholder='default'/>
+              <div class='field-hint'>Set this if source chart relies on release namespace.</div>
+            </div>
+            <div class='form-field'>
+              <label>Kubernetes version (optional)</label>
+              <input type='text' v-model='mainImportKubeVersion' placeholder='1.29.0'/>
+              <div class='field-hint'>Empty means default Helm capabilities.</div>
+            </div>
           </div>
         </div>
-        <div class='editor-shell import-editor-shell'>
-          <div v-if='cmAvailable' class='editor-host generated' ref='mainImportGeneratedCmHost'></div>
-          <div v-else class='fallback-fold' @click='onMainImportFoldClick'>
-            <pre class='code-output yaml-fold-view' v-html='mainImportPreviewHtml'></pre>
+        <div class='import-output'>
+          <div class='panel-label' style='margin:0;'>Generated values.yaml</div>
+          <div class='generated-toolbar'>
+            <div class='toolbar-group' v-if='mainImportSourceType === "chart" && mainImportOutput'>
+              <span class='toolbar-group-title'>Verify</span>
+              <button
+                class='secondary'
+                @click='runMainImportCompare'
+                :disabled='mainImportCompareRunning || !mainImportOutput'>
+                {{{{ mainImportCompareRunning ? 'Comparing…' : 'Compare renders' }}}}
+              </button>
+            </div>
+            <div class='toolbar-group' v-if='mainImportOutput'>
+              <span class='toolbar-group-title'>Values</span>
+              <button class='secondary' @click='copyMainImportOutput' :disabled='!mainImportOutput'>Copy values</button>
+              <button class='secondary' @click='openMainImportSaveChart' :disabled='!mainImportOutput'>Save as chart</button>
+            </div>
+            <div class='toolbar-group' v-if='mainImportOutput'>
+              <span class='toolbar-group-title'>Folding</span>
+              <button class='secondary' @click='foldMainImportLevel(1)'>L1</button>
+              <button class='secondary' @click='foldMainImportLevel(2)'>L2</button>
+              <button class='secondary' @click='foldMainImportLevel(3)'>L3</button>
+              <button class='secondary' @click='collapseAllMainImportSections'>Collapse</button>
+              <button class='secondary' @click='expandAllMainImportSections'>Expand</button>
+            </div>
           </div>
-        </div>
-        <div v-if='mainImportTemplateIssues.length' class='import-issues'>
-          <div class='import-issues-head'>
-            <strong>Template issues</strong>
-            <span class='import-status'>{{{{ mainImportTemplateIssues.length }}}}</span>
+          <div v-show='mainImportOutput' class='editor-shell import-editor-shell'>
+            <div v-if='cmAvailable' class='editor-host generated' ref='mainImportGeneratedCmHost'></div>
+            <div v-else class='fallback-fold' @click='onMainImportFoldClick'>
+              <pre class='code-output yaml-fold-view' v-html='mainImportPreviewHtml'></pre>
+            </div>
           </div>
-          <div class='import-issues-list'>
-            <button
-              v-for='(issue, issueIdx) in mainImportTemplateIssues'
-              :key='"tmpl-issue-" + issueIdx'
-              class='secondary import-issue-item'
-              @click='focusMainImportTemplateIssue(issue)'>
-              <span class='issue-line'>{{{{ issue.lineNo ? ("L" + issue.lineNo) : "L?" }}}}</span>
-              <code>{{{{ issue.include }}}}</code>
-              <span class='muted'>{{{{ issue.mode }}}}</span>
-            </button>
+          <div v-if='!mainImportOutput && mainImportError && !mainImportNeedsTemplateDecision' class='output-empty-state error'>
+            <div class='output-empty-title'>Import failed</div>
+            <div class='output-empty-body'>{{{{ mainImportError }}}}</div>
+            <details class='advanced-details' v-if='mainImportRawError && mainImportRawError !== mainImportError'>
+              <summary>Technical details</summary>
+              <pre class='wrap' style='min-height:0; margin-top:8px;'>{{{{ mainImportRawError }}}}</pre>
+            </details>
           </div>
-          <div class='field-hint'>Escaped template includes are highlighted in generated values.</div>
+          <div v-if='!mainImportOutput && (!mainImportError || mainImportNeedsTemplateDecision)' class='output-empty-state'>
+            <div class='output-empty-title'>No generated values yet</div>
+            <div class='output-empty-body'>{{{{ mainImportOutputEmptyNote }}}}</div>
+          </div>
+          <div v-if='mainImportTemplateIssues.length' class='import-issues'>
+            <div class='import-issues-head'>
+              <strong>Template issues</strong>
+              <span class='import-status'>{{{{ mainImportTemplateIssues.length }}}}</span>
+            </div>
+            <div class='import-issues-list'>
+              <button
+                v-for='(issue, issueIdx) in mainImportTemplateIssues'
+                :key='"tmpl-issue-" + issueIdx'
+                class='secondary import-issue-item'
+                @click='focusMainImportTemplateIssue(issue)'>
+                <span class='issue-line'>{{{{ issue.lineNo ? ("L" + issue.lineNo) : "L?" }}}}</span>
+                <code>{{{{ issue.include }}}}</code>
+                <span class='muted'>{{{{ issue.mode }}}}</span>
+              </button>
+            </div>
+            <div class='field-hint'>Escaped template includes are highlighted in generated values.</div>
+          </div>
         </div>
       </div>
     </div>
-    <div class='err' v-if='mainImportError && !mainImportNeedsTemplateDecision' style='margin-top:8px;'>{{{{ mainImportError }}}}</div>
     <div class='muted' v-if='!cmAvailable && cmProbeReason' style='margin-top:6px;'>CodeMirror: {{{{ cmProbeReason }}}}</div>
     <div class='err' v-if='mainImportCompareError' style='margin-top:8px;'>{{{{ mainImportCompareError }}}}</div>
     <div class='muted' v-if='mainImportCompareMessage' style='margin-top:8px;'>{{{{ mainImportCompareMessage }}}}</div>
@@ -4510,91 +4998,27 @@ window.addEventListener('error', function(e) {{
   <div v-if='mainImportConfigOpen' class='fs-modal-backdrop'>
     <div class='fs-modal' style='width:min(1280px, 96vw);'>
       <div class='fs-head'>
-        <strong>Import configuration</strong>
+        <strong>Advanced import settings</strong>
         <button class='secondary' @click='loadSampleMainImport'>Sample config</button>
         <button class='secondary' @click='resetMainImportConfig'>Reset defaults</button>
         <button class='secondary' @click='cancelMainImportConfig'>Cancel</button>
         <button class='primary' @click='confirmMainImportConfig'>OK</button>
       </div>
       <div class='import-config compact'>
-        <div class='import-section'>
-          <h4>Source</h4>
-          <div class='import-fields'>
-            <div class='form-field path-field'>
-              <label>Source type</label>
-              <div class='segmented'>
-                <button type='button' :class='{{ active: mainImportSourceType === "chart" }}' @click='mainImportSourceType = "chart"'>Chart</button>
-                <button type='button' :class='{{ active: mainImportSourceType === "manifests" }}' @click='mainImportSourceType = "manifests"'>Manifests</button>
-                <button type='button' :class='{{ active: mainImportSourceType === "compose" }}' @click='mainImportSourceType = "compose"'>Compose</button>
-              </div>
-              <div class='field-hint'>Select what you import. Path picker on this server adapts to selected source type.</div>
-            </div>
-            <div class='form-field path-field'>
-              <label>Path on server</label>
-              <div class='path-row'>
-                <input type='text' v-model='mainImportPath' :placeholder='mainImportPathPlaceholder'/>
-                <button class='secondary' @click='openMainImportPicker'>Choose…</button>
-                <button class='secondary' @click='clearMainImportSelection'>Clear</button>
-              </div>
-              <div class='path-meta'>{{{{ mainImportPickedFilesLabel || "No selected server path" }}}}</div>
-            </div>
-          </div>
+        <div class='import-config-hero'>
+          <div class='import-config-hero-title'>Main screen owns source and render identity</div>
+          <div class='import-config-hero-body'>Use this dialog only for import behavior, optimization and Helm rendering overrides. Source type, server path, environment and release identity stay visible on the main screen so you can verify them before every import.</div>
         </div>
 
         <div class='import-section'>
-          <h4>Render Options</h4>
-          <div class='import-fields'>
-            <div class='form-field'>
-              <label>Environment</label>
-              <input type='text' v-model='mainImportEnv' placeholder='dev'/>
-              <div class='field-hint'>Mapped to <code>global.env</code> for env-map resolution.</div>
-            </div>
-            <div class='form-field'>
-              <label>Release name</label>
-              <input type='text' v-model='mainImportReleaseName' placeholder='imported'/>
-              <div class='field-hint'>Used for rendering chart and generated chart validation.</div>
-            </div>
-            <div class='form-field'>
-              <label>Namespace (optional)</label>
-              <input type='text' v-model='mainImportNamespace' placeholder='default'/>
-              <div class='field-hint'>Set this if source chart relies on release namespace.</div>
-            </div>
-            <div class='form-field'>
-              <label>Kubernetes version (optional)</label>
-              <input type='text' v-model='mainImportKubeVersion' placeholder='1.29.0'/>
-              <div class='field-hint'>Example: <code>1.29.0</code>. Empty means default Helm capabilities.</div>
-            </div>
-            <div class='form-field path-field'>
-              <label>Include options</label>
-              <div class='checks-inline'>
-                <label class='chk'><input type='checkbox' v-model='mainImportIncludeStatus'/> include status</label>
-                <label class='chk'><input type='checkbox' v-model='mainImportIncludeCrds'/> include CRDs</label>
-                <label class='chk'><input type='checkbox' v-model='mainImportYamlAnchors'/> YAML anchors optimize</label>
-                <label class='chk'><input type='checkbox' v-model='mainImportIncludeProfiles'/> _include optimize (recursive merge)</label>
+          <h4>Import behavior</h4>
+          <div class='settings-grid'>
+            <div class='settings-card'>
+              <div class='settings-card-head'>
+                <div class='settings-card-kicker'>Mapping</div>
+                <div class='settings-card-title'>Generated values layout</div>
+                <div class='settings-card-body'>Control how imported data is grouped and whether import stays on supported library helpers or falls back to raw manifests.</div>
               </div>
-              <div class='field-hint'>Use CRDs when you want generated chart to include source chart CRDs.</div>
-            </div>
-            <div class='form-field'>
-              <label>Unsupported templates</label>
-              <select v-model='mainImportUnsupportedTemplateMode'>
-                <option value='error'>error (recommended)</option>
-                <option value='escape'>escape as literal</option>
-              </select>
-              <div class='field-hint'>In <code>error</code> mode import stops and asks for explicit decision.</div>
-            </div>
-            <div class='form-field path-field'>
-              <label>Allow template includes (one per line)</label>
-              <textarea v-model='mainImportAllowTemplateIncludesText' spellcheck='false' style='min-height:90px;'></textarea>
-              <div class='field-hint'>Examples: <code>opensearch-cluster.*</code>, <code>custom.helper</code>.</div>
-            </div>
-          </div>
-        </div>
-
-        <div class='import-section'>
-          <h4>Advanced</h4>
-          <details class='advanced-details'>
-            <summary>Mapping and Helm flags</summary>
-            <div class='advanced-body'>
               <div class='import-fields'>
                 <div class='form-field'>
                   <label>Group name</label>
@@ -4614,32 +5038,93 @@ window.addEventListener('error', function(e) {{
                   </select>
                   <div class='field-hint'><code>helpers</code> maps into supported library entities. <code>raw</code> keeps generic manifests.</div>
                 </div>
+              </div>
+            </div>
+            <div class='settings-card'>
+              <div class='settings-card-head'>
+                <div class='settings-card-kicker'>Optimization</div>
+                <div class='settings-card-title'>Dedup and extraction</div>
+                <div class='settings-card-body'>Tune how aggressively repeated fragments are extracted into reusable structures during import.</div>
+              </div>
+              <div class='import-fields'>
                 <div class='form-field'>
                   <label>Min include bytes</label>
                   <input type='number' min='0' step='1' v-model.number='mainImportMinIncludeBytes'/>
                   <div class='field-hint'>Dedup threshold for include profile extraction.</div>
                 </div>
-              </div>
-              <div class='conv-grid'>
-                <div>
-                  <div class='panel-label'>values files (--values), one per line</div>
-                  <textarea v-model='mainImportValuesFilesText' spellcheck='false' style='min-height:120px;'></textarea>
-                </div>
-                <div>
-                  <div class='panel-label'>set flags (--set), one per line</div>
-                  <textarea v-model='mainImportSetText' spellcheck='false' style='min-height:120px;'></textarea>
-                </div>
-                <div>
-                  <div class='panel-label'>set-string / set-file / set-json, one per line</div>
-                  <textarea v-model='mainImportExtraSetText' spellcheck='false' style='min-height:120px;'></textarea>
-                </div>
-                <div>
-                  <div class='panel-label'>api versions (--api-version), one per line</div>
-                  <textarea v-model='mainImportApiVersionsText' spellcheck='false' style='min-height:120px;'></textarea>
+                <div class='form-field path-field'>
+                  <label>Include options</label>
+                  <div class='checks-grid'>
+                    <label class='chk'><input type='checkbox' v-model='mainImportIncludeStatus'/> include status</label>
+                    <label class='chk'><input type='checkbox' v-model='mainImportIncludeCrds'/> include CRDs</label>
+                    <label class='chk'><input type='checkbox' v-model='mainImportYamlAnchors'/> YAML anchors optimize</label>
+                    <label class='chk'><input type='checkbox' v-model='mainImportIncludeProfiles'/> _include optimize (recursive merge)</label>
+                  </div>
+                  <div class='field-hint'>Use CRDs when you want generated chart to include source chart CRDs.</div>
                 </div>
               </div>
             </div>
-          </details>
+            <div class='settings-card wide'>
+              <div class='settings-card-head'>
+                <div class='settings-card-kicker'>Templates</div>
+                <div class='settings-card-title'>Unsupported include handling</div>
+                <div class='settings-card-body'>Strict mode stops import and asks for an explicit decision. Use the allow list only for helpers you know are safe for the current chart family.</div>
+              </div>
+              <div class='import-fields'>
+                <div class='form-field'>
+                  <label>Unsupported templates</label>
+                  <select v-model='mainImportUnsupportedTemplateMode'>
+                    <option value='error'>error (recommended)</option>
+                    <option value='escape'>escape as literal</option>
+                  </select>
+                  <div class='field-hint'>In <code>error</code> mode import stops and asks for explicit decision.</div>
+                </div>
+                <div class='form-field path-field'>
+                  <label>Allow template includes (one per line)</label>
+                  <textarea v-model='mainImportAllowTemplateIncludesText' spellcheck='false' style='min-height:110px;'></textarea>
+                  <div class='field-hint'>Examples: <code>opensearch-cluster.*</code>, <code>custom.helper</code>.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class='import-section'>
+          <h4>Helm flags</h4>
+          <div class='settings-text-grid'>
+            <div class='settings-text-card'>
+              <div class='settings-card-head'>
+                <div class='settings-card-kicker'>Values files</div>
+                <div class='settings-card-title'>Additional values inputs</div>
+                <div class='settings-card-body'>One path per line. Applied as repeated <code>--values</code> flags during source render.</div>
+              </div>
+              <textarea v-model='mainImportValuesFilesText' spellcheck='false'></textarea>
+            </div>
+            <div class='settings-text-card'>
+              <div class='settings-card-head'>
+                <div class='settings-card-kicker'>Set flags</div>
+                <div class='settings-card-title'>Inline scalar overrides</div>
+                <div class='settings-card-body'>One entry per line in Helm <code>key=value</code> form. Applied as repeated <code>--set</code> flags.</div>
+              </div>
+              <textarea v-model='mainImportSetText' spellcheck='false'></textarea>
+            </div>
+            <div class='settings-text-card'>
+              <div class='settings-card-head'>
+                <div class='settings-card-kicker'>Extended set flags</div>
+                <div class='settings-card-title'>String, file and JSON overrides</div>
+                <div class='settings-card-body'>One entry per line for <code>--set-string</code>, <code>--set-file</code> or <code>--set-json</code>.</div>
+              </div>
+              <textarea v-model='mainImportExtraSetText' spellcheck='false'></textarea>
+            </div>
+            <div class='settings-text-card'>
+              <div class='settings-card-head'>
+                <div class='settings-card-kicker'>API versions</div>
+                <div class='settings-card-title'>Capability overrides</div>
+                <div class='settings-card-body'>One API version per line. Passed as repeated <code>--api-version</code> flags when rendering the source.</div>
+              </div>
+              <textarea v-model='mainImportApiVersionsText' spellcheck='false'></textarea>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -5447,9 +5932,75 @@ const app = Vue.createApp({{
       }}
       return this.highlightDyff(this.dyffOutput || '');
     }},
+    mainImportRunLabel() {{
+      if (this.mainImportRunning) {{
+        if (this.mainImportSourceType === 'compose') {{
+          return 'Importing compose...';
+        }}
+        if (this.mainImportSourceType === 'manifests') {{
+          return 'Importing manifests...';
+        }}
+        return 'Importing chart...';
+      }}
+      if (this.mainImportSourceType === 'compose') {{
+        return 'Import compose';
+      }}
+      if (this.mainImportSourceType === 'manifests') {{
+        return 'Import manifests';
+      }}
+      return 'Import chart';
+    }},
+    mainImportSourceSummary() {{
+      if (this.mainImportSourceType === 'compose') {{
+        return 'docker-compose import resolved from a server path.';
+      }}
+      if (this.mainImportSourceType === 'manifests') {{
+        return 'Raw manifests from a server path, inline input, or both.';
+      }}
+      return 'Helm chart directory with optional inline values overrides.';
+    }},
+    mainImportSourceContextHint() {{
+      if (this.mainImportSourceType === 'compose') {{
+        return 'Select docker-compose.yaml on the server. Compose import stays path-based so service discovery remains deterministic.';
+      }}
+      if (this.mainImportSourceType === 'manifests') {{
+        return 'Select a manifest file or directory. Inline input supplements path manifests by default; enable input-only to ignore the path.';
+      }}
+      return 'Select a chart directory. Load values.yaml only when you want to inspect or override the chart input.';
+    }},
+    mainImportSourceEditorHint() {{
+      if (this.mainImportSourceType === 'compose') {{
+        return 'Compose mode does not use inline editor input. Keep the source in versioned files and select it through the server path.';
+      }}
+      if (this.mainImportSourceType === 'manifests') {{
+        return 'Use inline manifests for pasted input or focused edits. Input-only mode ignores manifests discovered from the server path.';
+      }}
+      return 'Use inline values only when you want to override or inspect the selected chart before import.';
+    }},
+    mainImportPathStateLabel() {{
+      if (this.mainImportPath) {{
+        return 'server path selected';
+      }}
+      if (this.mainImportSourceType === 'manifests') {{
+        return 'path optional';
+      }}
+      return 'path required';
+    }},
+    mainImportPathMetaLabel() {{
+      if (this.mainImportPath && String(this.mainImportPath).trim()) {{
+        return 'Selected: ' + String(this.mainImportPath).trim();
+      }}
+      return 'No selected server path';
+    }},
+    mainImportOutputEmptyNote() {{
+      if (this.mainImportSourceType === 'chart') {{
+        return 'Run import to generate values.yaml. Compare, copy and save actions become available after the first successful import.';
+      }}
+      return 'Run import to generate values.yaml. Copy and save actions become available after the first successful import.';
+    }},
     mainImportSourceEditorTitle() {{
       if (this.mainImportSourceType === 'compose') {{
-        return 'Source input';
+        return 'Compose source';
       }}
       if (this.mainImportSourceType === 'manifests') {{
         return 'Source raw manifests';
@@ -8963,7 +9514,7 @@ const app = Vue.createApp({{
       try {{ await navigator.clipboard.writeText(this.jqOutput); }} catch(_) {{}}
     }},
     async exitUi() {{
-      try {{ await fetch('/exit'); }} finally {{ window.close(); }}
+      try {{ await fetch('/exit', {{ method: 'POST' }}); }} finally {{ window.close(); }}
     }}
   }}
 }});
@@ -9007,11 +9558,103 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn request_with(headers: &[(&str, &str)]) -> String {
+        let mut req = String::from("POST /api/jq HTTP/1.1\r\n");
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n{}");
+        req
+    }
+
+    #[test]
+    fn header_value_is_case_insensitive_and_stops_at_body() {
+        let req = request_with(&[
+            ("Host", "127.0.0.1:18088"),
+            ("content-type", "application/json"),
+        ]);
+        assert_eq!(header_value(&req, "HOST"), Some("127.0.0.1:18088"));
+        assert_eq!(header_value(&req, "Content-Type"), Some("application/json"));
+        assert_eq!(header_value(&req, "origin"), None);
+    }
+
+    #[test]
+    fn loopback_authorities_are_recognized_with_and_without_port() {
+        assert!(host_is_loopback("127.0.0.1:18088"));
+        assert!(host_is_loopback("localhost"));
+        assert!(host_is_loopback("[::1]:18088"));
+        assert!(host_is_loopback("127.0.0.2"));
+        assert!(!host_is_loopback("evil.example"));
+        assert!(!host_is_loopback("192.168.1.10:18088"));
+        assert!(origin_is_loopback("http://127.0.0.1:18088"));
+        assert!(!origin_is_loopback("https://evil.example"));
+        assert!(!origin_is_loopback("null"));
+    }
+
+    #[test]
+    fn local_browser_request_is_accepted() {
+        let req = request_with(&[
+            ("Host", "127.0.0.1:18088"),
+            ("Origin", "http://127.0.0.1:18088"),
+            ("content-type", "application/json"),
+        ]);
+        assert!(check_local_request(&req, "POST", "/api/jq").is_ok());
+    }
+
+    #[test]
+    fn cli_request_without_origin_is_accepted() {
+        let req = request_with(&[
+            ("Host", "127.0.0.1:18088"),
+            ("Content-Type", "application/json; charset=utf-8"),
+        ]);
+        assert!(check_local_request(&req, "POST", "/api/jq").is_ok());
+    }
+
+    #[test]
+    fn cross_origin_request_is_refused() {
+        let req = request_with(&[
+            ("Host", "127.0.0.1:18088"),
+            ("Origin", "https://evil.example"),
+            ("content-type", "application/json"),
+        ]);
+        let err = check_local_request(&req, "POST", "/api/save-chart").expect_err("must refuse");
+        assert!(err.contains("cross-origin"), "{err}");
+    }
+
+    #[test]
+    fn rebound_hostname_is_refused() {
+        let req = request_with(&[
+            ("Host", "evil.example"),
+            ("content-type", "application/json"),
+        ]);
+        let err = check_local_request(&req, "POST", "/api/fs-list").expect_err("must refuse");
+        assert!(err.contains("not loopback"), "{err}");
+    }
+
+    #[test]
+    fn simple_request_content_type_is_refused_on_api() {
+        let req = request_with(&[("Host", "127.0.0.1:18088"), ("Content-Type", "text/plain")]);
+        let err = check_local_request(&req, "POST", "/api/save-chart").expect_err("must refuse");
+        assert!(err.contains("application/json"), "{err}");
+
+        let no_type = request_with(&[("Host", "127.0.0.1:18088")]);
+        assert!(check_local_request(&no_type, "POST", "/api/save-chart").is_err());
+    }
+
+    #[test]
+    fn page_and_assets_do_not_require_json_content_type() {
+        let req = request_with(&[("Host", "127.0.0.1:18088")]);
+        assert!(check_local_request(&req, "GET", "/").is_ok());
+        assert!(check_local_request(&req, "GET", "/assets/vue.global.prod.js").is_ok());
+        assert!(check_local_request(&req, "POST", "/exit").is_ok());
+    }
+
     #[test]
     fn page_contains_exit_button() {
         let html = render_page_html("a: 1", "global:\n  env: dev");
         assert!(html.contains("Exit"));
         assert!(html.contains("/exit"));
+        assert!(html.contains("method: 'POST'"));
         assert!(html.contains("/assets/vue.global.prod.js"));
         assert!(html.contains("/assets/codemirror.bundle.js"));
         assert!(html.contains("id='app'"));
