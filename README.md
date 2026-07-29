@@ -195,6 +195,19 @@ use happ
 happ --web --web-open-browser=false
 ```
 
+Web mode is a single-user local tool, and the server enforces that:
+
+- `Host` must be a loopback address, so a hostname that resolves to `127.0.0.1`
+  cannot reach it;
+- `Origin`, when the client sends one, must be loopback too, so a page on another
+  site cannot drive the API through the browser;
+- `POST /api/*` requires `Content-Type: application/json`, which makes every API
+  call a preflighted request that a foreign page cannot send;
+- `/exit` is `POST` only, so it cannot be triggered by an image tag or a prefetch.
+
+Local clients keep working unchanged: `curl` without an `Origin` header is accepted,
+and the UI itself already sends JSON on every call.
+
 ## UI development
 
 `happ` web UI is server-rendered from Rust, so the local dev loop is:

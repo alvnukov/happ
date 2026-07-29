@@ -4,7 +4,13 @@
   "version": "1.0.0",
   "scripts": {
     "build:cm": "esbuild codemirror-entry.js --bundle --format=iife --target=es2017 --outfile=../assets/codemirror.bundle.js",
+    "build:cm:watch": "esbuild codemirror-entry.js --bundle --format=iife --target=es2017 --outfile=../assets/codemirror.bundle.js --watch",
     "test:ui": "playwright test",
+    "test:ui:headed": "playwright test --headed",
+    "test:ui:debug": "playwright test --debug",
+    "test:ui:e2e": "playwright test tests/e2e.spec.mjs",
+    "test:ui:visual": "playwright test tests/visual.spec.mjs",
+    "test:ui:visual:update": "playwright test tests/visual.spec.mjs --update-snapshots",
     "test:ui:update": "playwright test --update-snapshots",
     "test:ui:install": "playwright install chromium",
     "lint": "eslint . --max-warnings=0",

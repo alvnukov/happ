@@ -21,6 +21,45 @@ test("main flows and converter behavior work", async ({ page }) => {
   await expect(output).toContainText("68617070");
 });
 
+test("main import keeps mode-specific context explicit", async ({ page }) => {
+  await page.goto("/");
+  await stabilizePage(page);
+
+  await expect(page.getByRole("button", { name: "Import chart" })).toBeVisible();
+  await expect(page.getByText("No generated values yet")).toBeVisible();
+
+  await page.getByRole("button", { name: "Manifests" }).click();
+  await expect(page.getByRole("button", { name: "Import manifests" })).toBeVisible();
+  await expect(page.getByText("path optional")).toBeVisible();
+  await expect(page.getByText("input only (ignore path manifests)")).toBeVisible();
+
+  await page.getByRole("button", { name: "Compose" }).click();
+  await expect(page.getByRole("button", { name: "Import compose" })).toBeVisible();
+  await expect(page.getByText("Compose import is path-based")).toBeVisible();
+  await expect(page.getByText("server path required")).toBeVisible();
+
+  await page.getByRole("button", { name: "Advanced settings" }).click();
+  await expect(page.getByText("Main screen owns source and render identity")).toBeVisible();
+  await expect(page.getByText("Generated values layout")).toBeVisible();
+  await expect(page.getByText("Dedup and extraction")).toBeVisible();
+  await expect(page.getByText("Unsupported include handling")).toBeVisible();
+  await expect(page.getByText("Capability overrides")).toBeVisible();
+});
+
+test("main import keeps selected path and error state consistent", async ({ page }) => {
+  await page.goto("/");
+  await stabilizePage(page);
+
+  const missingChartPath = "/definitely/missing-happ-chart";
+  const sourcePathInput = page.locator(".context-card").first().locator("input[type='text']").first();
+  await sourcePathInput.fill(missingChartPath);
+  await expect(page.getByText(`Selected: ${missingChartPath}`)).toBeVisible();
+
+  await page.getByRole("button", { name: "Import chart" }).click();
+  await expect(page.getByText("Import failed")).toBeVisible();
+  await expect(page.getByText("No generated values yet")).toHaveCount(0);
+});
+
 test("accessibility smoke has no critical issues", async ({ page }) => {
   await page.goto("/");
   await stabilizePage(page);

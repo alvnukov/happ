@@ -5,6 +5,12 @@ import { defineConfig } from "@playwright/test";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rustRoot = path.resolve(__dirname, "..");
+const baseURL = process.env.HAPP_WEB_BASE_URL || "http://127.0.0.1:18088";
+const listenAddr = process.env.HAPP_WEB_LISTEN_ADDR || new URL(baseURL).host;
+const skipManagedServer = process.env.HAPP_WEB_SKIP_SERVER === "1";
+const webServerCommand =
+  process.env.HAPP_WEB_SERVER_CMD ||
+  `sh -lc 'exec ./target/debug/happ --web --web-addr ${listenAddr} --web-open-browser=false < /dev/null'`;
 
 export default defineConfig({
   testDir: "./tests",
@@ -23,17 +29,19 @@ export default defineConfig({
     ["json", { outputFile: "test-results/playwright-report.json" }],
   ],
   use: {
-    baseURL: "http://127.0.0.1:18088",
+    baseURL,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "retain-on-failure",
     viewport: { width: 1720, height: 1080 },
   },
-  webServer: {
-    command: "sh -lc 'exec ./target/debug/happ --web --web-addr 127.0.0.1:18088 --web-open-browser=false < /dev/null'",
-    cwd: rustRoot,
-    url: "http://127.0.0.1:18088",
-    reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
-  },
+  webServer: skipManagedServer
+    ? undefined
+    : {
+        command: webServerCommand,
+        cwd: rustRoot,
+        url: baseURL,
+        reuseExistingServer: !process.env.CI,
+        timeout: 120_000,
+      },
 });
