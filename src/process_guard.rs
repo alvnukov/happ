@@ -3,6 +3,36 @@ use std::process::{Child, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Exits once the process that spawned us is gone.
+///
+/// A stdio server is only useful to its client; an editor or an MCP host that
+/// dies without closing the pipe would otherwise leave the server resident.
+/// `EPERM` means the PID exists but belongs to someone else, which is still
+/// alive as far as we are concerned.
+#[cfg(unix)]
+pub(crate) fn watch_parent(parent_pid: Option<u32>) {
+    let Some(pid) = parent_pid.filter(|pid| *pid != 0) else {
+        return;
+    };
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(2));
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        if alive {
+            continue;
+        }
+        if matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        ) {
+            continue;
+        }
+        std::process::exit(0);
+    });
+}
+
+#[cfg(not(unix))]
+pub(crate) fn watch_parent(_parent_pid: Option<u32>) {}
+
 #[derive(Debug)]
 pub(crate) struct ChildOutput {
     pub(crate) status: ExitStatus,

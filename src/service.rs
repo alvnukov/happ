@@ -18,6 +18,8 @@ pub enum Error {
     #[error(transparent)]
     Lsp(#[from] crate::lsp::Error),
     #[error(transparent)]
+    Mcp(#[from] crate::mcp::Error),
+    #[error(transparent)]
     ChartAnalyzer(#[from] crate::chart_analyzer::Error),
     #[error("convert: {0}")]
     Convert(String),
@@ -54,6 +56,7 @@ pub fn run_with(cli: Cli) -> Result<(), Error> {
         Command::Compose(args) => run_compose_command(&args),
         Command::Validate(args) => run_validate_command(&args),
         Command::Lsp(args) => Ok(crate::lsp::run(args)?),
+        Command::Mcp(args) => Ok(crate::mcp::run(args)?),
         Command::Completion(args) => run_completion_command(&args),
         Command::Jq(args) => run_jq_command(&args),
         Command::Yq(args) => run_yq_command(&args),

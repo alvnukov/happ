@@ -60,6 +60,14 @@ pub enum Command {
     Compose(ImportArgs),
     Validate(ValidateArgs),
     Lsp(LspArgs),
+    #[command(
+        about = "Serve helm-apps chart analysis to an LLM over the Model Context Protocol",
+        long_about = "Run happ as an MCP server over stdio.\n\
+                      Exposes the helm-apps analysis happ does for the editor -- include \
+                      expansion, env-map resolution, manifest preview, values diagnostics -- as \
+                      tools an MCP client can call."
+    )]
+    Mcp(McpArgs),
     Completion(CompletionArgs),
     #[command(
         about = "Run jq-like query syntax on JSON or YAML input",
@@ -126,6 +134,125 @@ pub struct LspArgs {
         help = "Parent process PID to monitor; exit LSP when parent is gone"
     )]
     pub parent_pid: Option<u32>,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct McpArgs {
+    #[arg(
+        long,
+        default_value_t = true,
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Use stdio transport for Model Context Protocol"
+    )]
+    pub stdio: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Chart directory (or values file) used when a tool call omits chart_path"
+    )]
+    pub chart: Option<String>,
+    #[arg(
+        long = "parent-pid",
+        help = "Parent process PID to monitor; exit MCP server when parent is gone"
+    )]
+    pub parent_pid: Option<u32>,
+    #[arg(
+        long = "language-server",
+        value_name = "LANG=COMMAND",
+        help = "Override the language server for a language (repeatable), e.g. go=/opt/bin/gopls"
+    )]
+    pub language_servers: Vec<String>,
+    #[command(subcommand)]
+    pub command: Option<McpCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum McpCommand {
+    #[command(about = "Register happ as an MCP server in your AI clients")]
+    Setup(McpSetupArgs),
+    #[command(
+        about = "Remove happ from your AI clients' MCP server lists",
+        visible_alias = "uninstall"
+    )]
+    Remove(McpRemoveArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct McpSetupArgs {
+    #[arg(
+        long,
+        short = 'c',
+        value_name = "CLIENT",
+        value_delimiter = ',',
+        num_args = 1..,
+        required = true,
+        help = "Clients to configure, comma-separated: claude,codex,opencode"
+    )]
+    pub clients: Vec<String>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Write the user-wide config instead of the project one"
+    )]
+    pub global: bool,
+    #[arg(
+        long = "dry-run",
+        action = ArgAction::SetTrue,
+        help = "Report what would change instead of writing it"
+    )]
+    pub dry_run: bool,
+    #[arg(
+        long = "no-instructions",
+        action = ArgAction::SetTrue,
+        help = "Do not add the happ block to CLAUDE.md / AGENTS.md"
+    )]
+    pub no_instructions: bool,
+    #[arg(
+        long = "no-skills",
+        action = ArgAction::SetTrue,
+        help = "Do not install the happ-charts and happ-code skills"
+    )]
+    pub no_skills: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct McpRemoveArgs {
+    #[arg(
+        long,
+        short = 'c',
+        value_name = "CLIENT",
+        value_delimiter = ',',
+        num_args = 1..,
+        required = true,
+        help = "Clients to clean up, comma-separated: claude,codex,opencode"
+    )]
+    pub clients: Vec<String>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Clean the user-wide config instead of the project one"
+    )]
+    pub global: bool,
+    #[arg(
+        long = "dry-run",
+        action = ArgAction::SetTrue,
+        help = "Report what would change instead of writing it"
+    )]
+    pub dry_run: bool,
+    #[arg(
+        long = "no-instructions",
+        action = ArgAction::SetTrue,
+        help = "Leave the happ block in CLAUDE.md / AGENTS.md alone"
+    )]
+    pub no_instructions: bool,
+    #[arg(
+        long = "no-skills",
+        action = ArgAction::SetTrue,
+        help = "Leave the installed happ skills in place"
+    )]
+    pub no_skills: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]

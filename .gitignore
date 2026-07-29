@@ -9,6 +9,9 @@ web/test-results/
 web/test-artifacts/
 .tmp/
 
+# MCP registration for local development: holds absolute paths for this machine
+.mcp.json
+
 # Local upstream research (do not commit)
 _upstream/
 helm-upstream/

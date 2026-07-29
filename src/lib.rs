@@ -13,6 +13,7 @@ pub mod gotemplates;
 mod inspectweb;
 mod library_values;
 mod lsp;
+mod mcp;
 pub mod output;
 mod process_guard;
 mod query;
