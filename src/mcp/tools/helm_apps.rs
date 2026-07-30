@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::{limit_schema, optional_str, required_str, truncate};
+use crate::helm_overrides::ValueOverrides;
 use crate::lsp::ChartValuesSource;
 use crate::mcp::ServerContext;
 
@@ -92,6 +93,25 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                     "description": "For op='render': 'fast' (default) renders in-process and needs \
                                     no tooling; 'helm' and 'werf' shell out and match the real \
                                     deployment exactly.",
+                },
+                "values_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Extra values files layered on the chart's own, in order, the \
+                                    way `helm -f` does. Relative paths resolve against the chart \
+                                    directory. Applies to every op.",
+                },
+                "set": {
+                    "type": "object",
+                    "description": "Values to override, the way `helm --set` does: keys are dotted \
+                                    paths such as 'global.vars.HOST' or 'hosts[0].name', with \
+                                    '\\\\.' keeping a dot inside a key. Applied after values_files. \
+                                    Applies to every op.",
+                },
+                "set_string": {
+                    "type": "object",
+                    "description": "Like `set`, but every value stays a string, the way \
+                                    `helm --set-string` does.",
                 },
                 "limit": limit_schema("output lines"),
             },
@@ -966,7 +986,97 @@ fn chart_source(context: &ServerContext, args: &JsonValue) -> Result<ChartValues
         .ok_or_else(|| {
             "no chart to work on: pass 'chart', or start happ with --chart".to_string()
         })?;
-    crate::lsp::locate_chart_values(&path)
+    let source = crate::lsp::locate_chart_values(&path)?;
+    let overrides = value_overrides(args, &source.chart_root)?;
+    Ok(source.with_overrides(overrides))
+}
+
+/// Reads `values_files`, `set` and `set_string` off the request.
+///
+/// Every op takes them, because a chart is judged by the values it is deployed
+/// with: answering `lint` or `resolve` from values.yaml alone while `render`
+/// sees the deployment's own `-f` files is the disagreement this closes.
+fn value_overrides(
+    args: &JsonValue,
+    chart_root: &std::path::Path,
+) -> Result<ValueOverrides, String> {
+    let mut overrides = ValueOverrides::default();
+
+    if let Some(entries) = args.get("values_files") {
+        let entries = entries
+            .as_array()
+            .ok_or_else(|| "'values_files' must be a list of paths".to_string())?;
+        for entry in entries {
+            let raw = entry
+                .as_str()
+                .ok_or_else(|| "'values_files' entries must be strings".to_string())?;
+            overrides.files.push(resolve_values_file(raw, chart_root)?);
+        }
+    }
+
+    for (field, into_string) in [("set", false), ("set_string", true)] {
+        let Some(value) = args.get(field) else {
+            continue;
+        };
+        let map = value
+            .as_object()
+            .ok_or_else(|| format!("'{field}' must be an object of path -> value"))?;
+        for (path, raw) in map {
+            if into_string {
+                overrides
+                    .set_string
+                    .push((path.clone(), scalar_to_string(raw)?));
+            } else {
+                // A JSON string is what a `--set` flag would have carried, so
+                // it gets Helm's typing; anything already typed is kept.
+                let typed = match raw {
+                    JsonValue::String(text) => crate::helm_overrides::typed_set_value(text),
+                    other => other.clone(),
+                };
+                overrides.set.push((path.clone(), typed));
+            }
+        }
+    }
+
+    // Applied for real deep inside the values pipeline, where a failure can
+    // only surface as "failed to parse values root". Running them once here
+    // against an empty tree costs nothing and reports the actual reason -- an
+    // unreadable file, a `--set` path that does not parse -- to the caller who
+    // can still fix it.
+    if !overrides.is_empty() {
+        overrides.apply(&mut serde_json::Map::new())?;
+    }
+
+    Ok(overrides)
+}
+
+/// Finds a caller-named values file, preferring one relative to the chart.
+fn resolve_values_file(raw: &str, chart_root: &std::path::Path) -> Result<PathBuf, String> {
+    let given = PathBuf::from(raw);
+    if given.is_absolute() {
+        return Ok(given);
+    }
+    let from_chart = chart_root.join(&given);
+    if from_chart.exists() {
+        return Ok(from_chart);
+    }
+    if given.exists() {
+        return Ok(given);
+    }
+    Err(format!(
+        "values file '{raw}' not found: tried '{}' and '{}'",
+        from_chart.display(),
+        given.display()
+    ))
+}
+
+fn scalar_to_string(value: &JsonValue) -> Result<String, String> {
+    match value {
+        JsonValue::String(text) => Ok(text.clone()),
+        JsonValue::Number(number) => Ok(number.to_string()),
+        JsonValue::Bool(flag) => Ok(flag.to_string()),
+        other => Err(format!("'set_string' values must be scalars, got {other}")),
+    }
 }
 
 #[cfg(test)]
@@ -1308,6 +1418,129 @@ mod tests {
     #[test]
     fn contract_rejects_an_unknown_section() {
         assert!(run(&context(), json!({ "op": "contract", "name": "nonsense" })).is_err());
+    }
+
+    /// The values a chart is deployed with live outside it, so an analysis
+    /// that reads only values.yaml describes a chart nobody ships.
+    #[test]
+    fn an_extra_values_file_reaches_every_op() {
+        let chart = chart_fixture();
+        let extra = chart.path().join("ci-values.yaml");
+        std::fs::write(
+            &extra,
+            "apps-stateless:\n  api:\n    replicas:\n      _default: 7\n",
+        )
+        .expect("write extra values");
+
+        let resolved = run(
+            &context(),
+            json!({
+                "op": "resolve",
+                "chart": chart_arg(&chart),
+                "group": "apps-stateless",
+                "app": "api",
+                "values_path": "replicas",
+                "values_files": ["ci-values.yaml"],
+            }),
+        )
+        .expect("resolve");
+        assert!(resolved.contains('7'), "{resolved}");
+
+        // The same file has to reach a whole-tree op, not just entity lookup.
+        let queried = run(
+            &context(),
+            json!({
+                "op": "query",
+                "chart": chart_arg(&chart),
+                "query": ".[\"apps-stateless\"].api.replicas",
+                "values_files": ["ci-values.yaml"],
+            }),
+        )
+        .expect("query");
+        assert!(queried.contains('7'), "{queried}");
+    }
+
+    #[test]
+    fn set_overrides_the_values_file_it_follows() {
+        let chart = chart_fixture();
+        let extra = chart.path().join("ci-values.yaml");
+        std::fs::write(
+            &extra,
+            "global:\n  env: dev\n  vars:\n    HOST: from-file\n",
+        )
+        .expect("write extra values");
+
+        let queried = run(
+            &context(),
+            json!({
+                "op": "query",
+                "chart": chart_arg(&chart),
+                "query": ".global.vars",
+                "values_files": ["ci-values.yaml"],
+                "set": {"global.vars.PORT": "8080"},
+                "set_string": {"global.vars.HOST": "from-set"},
+            }),
+        )
+        .expect("query");
+        assert!(queried.contains("from-set"), "{queried}");
+        assert!(queried.contains("8080"), "{queried}");
+    }
+
+    /// `--set` types its values the way Helm does, so a port is a number and
+    /// a chart that compares it against one still works.
+    #[test]
+    fn set_values_keep_helms_typing_and_set_string_does_not() {
+        let chart = chart_fixture();
+        let queried = run(
+            &context(),
+            json!({
+                "op": "query",
+                "chart": chart_arg(&chart),
+                "query": "[.global.a, .global.b]",
+                "set": {"global.a": "8080"},
+                "set_string": {"global.b": "8080"},
+            }),
+        )
+        .expect("query");
+        assert!(queried.contains("8080"), "{queried}");
+        assert!(
+            queried.contains("\"8080\""),
+            "set_string must stay a string: {queried}"
+        );
+    }
+
+    #[test]
+    fn a_missing_values_file_names_where_it_looked() {
+        let chart = chart_fixture();
+        let err = run(
+            &context(),
+            json!({
+                "op": "apps",
+                "chart": chart_arg(&chart),
+                "values_files": ["nope.yaml"],
+            }),
+        )
+        .err()
+        .expect("a missing values file must fail");
+        assert!(err.contains("nope.yaml"), "{err}");
+    }
+
+    /// A bad `--set` path is applied far inside the values pipeline, where the
+    /// only error the caller could see is a generic parse failure.
+    #[test]
+    fn a_malformed_set_path_reports_the_path_itself() {
+        let chart = chart_fixture();
+        let err = run(
+            &context(),
+            json!({
+                "op": "apps",
+                "chart": chart_arg(&chart),
+                "set": {"global..vars": "x"},
+            }),
+        )
+        .err()
+        .expect("a malformed --set path must fail");
+        assert!(err.contains("global..vars"), "{err}");
     }
 
     #[test]

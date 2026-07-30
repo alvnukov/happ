@@ -335,6 +335,19 @@ description sits in the model's context on every request.
 | `contract` | — | the library's own rules: groups, functions, env selection |
 | `template` | `name` | source of a library template or `define` |
 
+A chart is judged by the values it is deployed with, so every op above also
+takes the values the deployment layers on top:
+
+| argument | means |
+|----------|-------|
+| `values_files` | extra values files, in order, the way `helm -f` does. Relative paths resolve against the chart directory. |
+| `set` | overrides by dotted path, the way `helm --set` does — `global.vars.HOST`, `hosts[0].name`, `config\.yaml` for a dot inside a key. Applied after `values_files`. |
+| `set_string` | the same, but every value stays a string. |
+
+They are applied before `_include` and `_includeFile` expansion, which is where
+Helm applies them too, so `resolve`, `lint` and `query` describe the same chart
+`render` produces rather than the one values.yaml describes on its own.
+
 `op=lint` checks the chart against the library contract, including mistakes that
 otherwise surface only as an unreadable Go template trace:
 

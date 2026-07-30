@@ -4,6 +4,7 @@ use crate::env_map::{
 };
 use crate::go_compat::parse::parse_action_compat;
 use crate::gotemplates::{scan_template_actions, GoTemplateScanError};
+use crate::helm_overrides::ValueOverrides;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response, ResponseError};
 use lsp_types::{
     notification::{Notification as LspNotificationTrait, PublishDiagnostics},
@@ -452,6 +453,14 @@ fn list_entities_request(
     state: &ServerState,
     params: ListEntitiesParams,
 ) -> Result<ListEntitiesResult, String> {
+    list_entities_request_with_overrides(state, params, &ValueOverrides::default())
+}
+
+fn list_entities_request_with_overrides(
+    state: &ServerState,
+    params: ListEntitiesParams,
+    value_overrides: &ValueOverrides,
+) -> Result<ListEntitiesResult, String> {
     let text = resolve_request_text(state, params.uri.as_deref(), params.text)?;
     let resolved = resolve_values_root(
         params.uri.as_deref(),
@@ -459,6 +468,7 @@ fn list_entities_request(
         params.env,
         params.apply_includes.unwrap_or(true),
         params.apply_env_resolution.unwrap_or(true),
+        value_overrides,
     )?;
 
     Ok(ListEntitiesResult {
@@ -487,14 +497,20 @@ fn resolve_values_root(
     env: Option<String>,
     apply_includes: bool,
     apply_env: bool,
+    value_overrides: &ValueOverrides,
 ) -> Result<ResolvedValuesRoot, String> {
     let request_uri = uri.and_then(|value| value.parse::<Uri>().ok());
 
     let root_map = if apply_includes {
-        parse_and_expand_values_root(request_uri.as_ref(), text)
+        parse_and_expand_values_root(request_uri.as_ref(), text, value_overrides)
             .ok_or_else(|| "failed to parse values root with include expansion".to_string())?
     } else {
-        parse_yaml_map_to_json_map(text)?
+        // Include expansion is where overrides normally land, so the literal
+        // view has to apply them itself or it would answer about a different
+        // chart than every other view.
+        let mut root_map = parse_yaml_map_to_json_map(text)?;
+        value_overrides.apply(&mut root_map)?;
+        root_map
     };
 
     let expanded = JsonValue::Object(root_map);
@@ -519,6 +535,14 @@ fn resolve_entity_request(
     state: &ServerState,
     params: ResolveEntityParams,
 ) -> Result<ResolveEntityResult, String> {
+    resolve_entity_request_with_overrides(state, params, &ValueOverrides::default())
+}
+
+fn resolve_entity_request_with_overrides(
+    state: &ServerState,
+    params: ResolveEntityParams,
+    value_overrides: &ValueOverrides,
+) -> Result<ResolveEntityResult, String> {
     let context = resolve_entity_context(
         state,
         params.uri,
@@ -528,6 +552,7 @@ fn resolve_entity_request(
         params.env,
         params.apply_includes,
         params.apply_env_resolution,
+        value_overrides,
     )?;
     Ok(ResolveEntityResult {
         entity: context.entity,
@@ -540,6 +565,14 @@ fn resolve_entity_request(
 fn render_entity_manifest_request(
     state: &ServerState,
     params: RenderEntityManifestParams,
+) -> Result<RenderEntityManifestResult, String> {
+    render_entity_manifest_request_with_overrides(state, params, &ValueOverrides::default())
+}
+
+fn render_entity_manifest_request_with_overrides(
+    state: &ServerState,
+    params: RenderEntityManifestParams,
+    value_overrides: &ValueOverrides,
 ) -> Result<RenderEntityManifestResult, String> {
     let request_uri = params
         .uri
@@ -557,9 +590,11 @@ fn render_entity_manifest_request(
         params.env,
         params.apply_includes,
         params.apply_env_resolution,
+        value_overrides,
     )?;
-    let parsed_source_root = parse_source_values_root(request_uri.as_ref(), &request_text)
-        .ok_or_else(|| "failed to parse values root for manifest preview".to_string())?;
+    let parsed_source_root =
+        parse_source_values_root(request_uri.as_ref(), &request_text, value_overrides)
+            .ok_or_else(|| "failed to parse values root for manifest preview".to_string())?;
     let fast_source_root = if renderer == ManifestPreviewRenderer::Fast {
         Some(build_fast_manifest_source_root(&parsed_source_root)?)
     } else {
@@ -657,6 +692,7 @@ fn resolve_entity_context(
     env: Option<String>,
     apply_includes: Option<bool>,
     apply_env_resolution: Option<bool>,
+    value_overrides: &ValueOverrides,
 ) -> Result<ResolvedEntityContext, String> {
     let text = resolve_request_text(state, uri.as_deref(), text)?;
 
@@ -667,6 +703,7 @@ fn resolve_entity_context(
         env,
         apply_includes,
         apply_env_resolution.unwrap_or(true),
+        value_overrides,
     )?;
 
     let entity = read_entity(&resolved.root, &group, &app)?;
@@ -1838,6 +1875,14 @@ fn publish_diagnostics(
 }
 
 fn build_diagnostics(uri: &Uri, text: &str) -> Vec<Diagnostic> {
+    build_diagnostics_with_overrides(uri, text, &ValueOverrides::default())
+}
+
+fn build_diagnostics_with_overrides(
+    uri: &Uri,
+    text: &str,
+    value_overrides: &ValueOverrides,
+) -> Vec<Diagnostic> {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut diagnostics = Vec::new();
 
@@ -1905,7 +1950,12 @@ fn build_diagnostics(uri: &Uri, text: &str) -> Vec<Diagnostic> {
     diagnostics.extend(build_unknown_group_diagnostics(&lines));
     diagnostics.extend(build_scalar_include_diagnostics(&lines));
     diagnostics.extend(build_ambiguous_env_diagnostics(&lines));
-    diagnostics.extend(build_template_diagnostics(uri, text, &lines));
+    diagnostics.extend(build_template_diagnostics(
+        uri,
+        text,
+        &lines,
+        value_overrides,
+    ));
 
     diagnostics
 }
@@ -1977,7 +2027,8 @@ fn template_assist_request(
     let cursor_in_action = cursor_offset.saturating_sub(action_start);
 
     let expanded_values =
-        parse_and_expand_values_root(request_uri.as_ref(), &text).map(JsonValue::Object);
+        parse_and_expand_values_root(request_uri.as_ref(), &text, &ValueOverrides::default())
+            .map(JsonValue::Object);
     let mut completions = Vec::new();
 
     if let Some(path_ctx) = find_template_path_completion_context(action_text, cursor_in_action) {
@@ -2178,10 +2229,16 @@ fn yaml_line_comment_start(body: &str) -> Option<usize> {
     None
 }
 
-fn build_template_diagnostics(_uri: &Uri, text: &str, lines: &[&str]) -> Vec<Diagnostic> {
+fn build_template_diagnostics(
+    _uri: &Uri,
+    text: &str,
+    lines: &[&str],
+    value_overrides: &ValueOverrides,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let line_index = TextLineIndex::new(text);
-    let expanded_values = parse_and_expand_values_root(Some(_uri), text).map(JsonValue::Object);
+    let expanded_values =
+        parse_and_expand_values_root(Some(_uri), text, value_overrides).map(JsonValue::Object);
 
     let (spans, scan_errors) = scan_template_actions(text);
     // A commented-out template is not a template. Helm never parses it, so
@@ -2579,7 +2636,11 @@ fn builtin_root_schema(root: TemplatePathRoot) -> Option<&'static JsonValue> {
     }
 }
 
-fn parse_source_values_root(uri: Option<&Uri>, text: &str) -> Option<ParsedSourceValuesRoot> {
+fn parse_source_values_root(
+    uri: Option<&Uri>,
+    text: &str,
+    value_overrides: &ValueOverrides,
+) -> Option<ParsedSourceValuesRoot> {
     let mut overrides: HashMap<PathBuf, String> = HashMap::new();
     let mut current_base_dir: Option<PathBuf> = None;
     let mut root_source_path: Option<PathBuf> = None;
@@ -2624,10 +2685,14 @@ fn parse_source_values_root(uri: Option<&Uri>, text: &str) -> Option<ParsedSourc
         }
     }
 
-    let root_map = match root_map {
+    let mut root_map = match root_map {
         Some(root_map) => root_map,
         None => parse_yaml_map_to_json_map(text).ok()?,
     };
+    // Helm layers the caller's `-f` files and `--set` flags over everything the
+    // chart ships, and does it before any template runs -- so they land here,
+    // ahead of `_include_files` and `_include` expansion.
+    value_overrides.apply(&mut root_map).ok()?;
     let include_base_dir = root_source_path
         .as_deref()
         .and_then(Path::parent)
@@ -2645,8 +2710,9 @@ fn parse_source_values_root(uri: Option<&Uri>, text: &str) -> Option<ParsedSourc
 fn parse_values_root_with_file_includes(
     uri: Option<&Uri>,
     text: &str,
+    value_overrides: &ValueOverrides,
 ) -> Option<(JsonMap<String, JsonValue>, Option<PathBuf>)> {
-    let parsed = parse_source_values_root(uri, text)?;
+    let parsed = parse_source_values_root(uri, text, value_overrides)?;
     let with_files = expand_values_with_file_includes(
         &parsed.root_map,
         parsed.include_base_dir.as_deref(),
@@ -2659,8 +2725,9 @@ fn parse_values_root_with_file_includes(
 fn parse_and_expand_values_root(
     uri: Option<&Uri>,
     text: &str,
+    value_overrides: &ValueOverrides,
 ) -> Option<JsonMap<String, JsonValue>> {
-    let (with_files, _) = parse_values_root_with_file_includes(uri, text)?;
+    let (with_files, _) = parse_values_root_with_file_includes(uri, text, value_overrides)?;
     expand_includes_in_values(&with_files).ok()
 }
 
@@ -4860,6 +4927,9 @@ pub(crate) struct ChartValuesSource {
     pub(crate) values_path: PathBuf,
     pub(crate) uri: String,
     pub(crate) text: String,
+    /// The `-f` files and `--set` flags the deployment adds on top, so every
+    /// analysis answers about the values the chart is really rendered from.
+    pub(crate) overrides: ValueOverrides,
 }
 
 impl ChartValuesSource {
@@ -4869,6 +4939,11 @@ impl ChartValuesSource {
 
     fn params_text(&self) -> Option<String> {
         Some(self.text.clone())
+    }
+
+    pub(crate) fn with_overrides(mut self, overrides: ValueOverrides) -> Self {
+        self.overrides = overrides;
+        self
     }
 }
 
@@ -4923,6 +4998,7 @@ pub(crate) fn locate_chart_values(path: &Path) -> Result<ChartValuesSource, Stri
         values_path,
         uri,
         text,
+        overrides: ValueOverrides::default(),
     })
 }
 
@@ -4931,7 +5007,7 @@ pub(crate) fn analysis_list_entities(
     source: &ChartValuesSource,
     env: Option<String>,
 ) -> Result<JsonValue, String> {
-    let result = list_entities_request(
+    let result = list_entities_request_with_overrides(
         &ServerState::default(),
         ListEntitiesParams {
             uri: source.params_uri(),
@@ -4940,6 +5016,7 @@ pub(crate) fn analysis_list_entities(
             apply_includes: None,
             apply_env_resolution: None,
         },
+        &source.overrides,
     )?;
     serde_json::to_value(result).map_err(|err| format!("serialize entity list: {err}"))
 }
@@ -4953,7 +5030,7 @@ pub(crate) fn analysis_resolve_entity(
     apply_includes: Option<bool>,
     apply_env_resolution: Option<bool>,
 ) -> Result<JsonValue, String> {
-    let result = resolve_entity_request(
+    let result = resolve_entity_request_with_overrides(
         &ServerState::default(),
         ResolveEntityParams {
             uri: source.params_uri(),
@@ -4964,6 +5041,7 @@ pub(crate) fn analysis_resolve_entity(
             apply_includes,
             apply_env_resolution,
         },
+        &source.overrides,
     )?;
     serde_json::to_value(result).map_err(|err| format!("serialize resolved entity: {err}"))
 }
@@ -4976,7 +5054,7 @@ pub(crate) fn analysis_render_entity_manifest(
     env: Option<String>,
     renderer: Option<String>,
 ) -> Result<JsonValue, String> {
-    let result = render_entity_manifest_request(
+    let result = render_entity_manifest_request_with_overrides(
         &ServerState::default(),
         RenderEntityManifestParams {
             uri: source.params_uri(),
@@ -4988,6 +5066,7 @@ pub(crate) fn analysis_render_entity_manifest(
             apply_includes: None,
             apply_env_resolution: None,
         },
+        &source.overrides,
     )?;
     serde_json::to_value(result).map_err(|err| format!("serialize rendered manifest: {err}"))
 }
@@ -5005,6 +5084,7 @@ pub(crate) fn analysis_resolved_root(
         env,
         apply_includes.unwrap_or(true),
         apply_env_resolution.unwrap_or(true),
+        &source.overrides,
     )?;
     Ok((resolved.root, resolved.used_env))
 }
@@ -5013,7 +5093,14 @@ pub(crate) fn analysis_resolved_root(
 pub(crate) fn analysis_environments(
     source: &ChartValuesSource,
 ) -> Result<(JsonValue, String), String> {
-    let resolved = resolve_values_root(Some(&source.uri), &source.text, None, true, false)?;
+    let resolved = resolve_values_root(
+        Some(&source.uri),
+        &source.text,
+        None,
+        true,
+        false,
+        &source.overrides,
+    )?;
     let discovery = serde_json::to_value(&resolved.env_discovery)
         .map_err(|err| format!("serialize env discovery: {err}"))?;
     Ok((discovery, resolved.default_env))
@@ -5025,20 +5112,22 @@ pub(crate) fn analysis_diagnostics(source: &ChartValuesSource) -> Result<Vec<Jso
         .uri
         .parse()
         .map_err(|_| format!("values path is not a usable URI: {}", source.uri))?;
-    Ok(build_diagnostics(&uri, &source.text)
-        .iter()
-        .map(|diagnostic| {
-            json!({
-                "line": diagnostic.range.start.line + 1,
-                "column": diagnostic.range.start.character + 1,
-                "endLine": diagnostic.range.end.line + 1,
-                "endColumn": diagnostic.range.end.character + 1,
-                "severity": diagnostic_severity_label(diagnostic.severity),
-                "code": diagnostic_code_label(diagnostic),
-                "message": diagnostic.message,
+    Ok(
+        build_diagnostics_with_overrides(&uri, &source.text, &source.overrides)
+            .iter()
+            .map(|diagnostic| {
+                json!({
+                    "line": diagnostic.range.start.line + 1,
+                    "column": diagnostic.range.start.character + 1,
+                    "endLine": diagnostic.range.end.line + 1,
+                    "endColumn": diagnostic.range.end.character + 1,
+                    "severity": diagnostic_severity_label(diagnostic.severity),
+                    "code": diagnostic_code_label(diagnostic),
+                    "message": diagnostic.message,
+                })
             })
-        })
-        .collect())
+            .collect(),
+    )
 }
 
 fn diagnostic_severity_label(severity: Option<DiagnosticSeverity>) -> &'static str {
@@ -7473,7 +7562,9 @@ global:
         let uri = format!("file://{}", values_path.to_string_lossy())
             .parse::<Uri>()
             .expect("uri");
-        let merged = parse_and_expand_values_root(Some(&uri), values_text).expect("merged root");
+        let merged =
+            parse_and_expand_values_root(Some(&uri), values_text, &ValueOverrides::default())
+                .expect("merged root");
 
         assert_eq!(
             merged
@@ -7527,7 +7618,8 @@ global:
             .parse::<Uri>()
             .expect("uri");
         let merged =
-            parse_and_expand_values_root(Some(&uri), secret_override).expect("merged root");
+            parse_and_expand_values_root(Some(&uri), secret_override, &ValueOverrides::default())
+                .expect("merged root");
 
         assert_eq!(
             merged
