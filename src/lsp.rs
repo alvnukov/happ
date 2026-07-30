@@ -1137,25 +1137,29 @@ fn assemble_root_level_values_layers(
     Ok(root)
 }
 
+/// Points an existing werf context at the environment being previewed.
+///
+/// `fl.currentEnv` reads `$.Values.werf.env` before `$.Values.global.env`, so a
+/// chart carrying werf values would otherwise resolve for whatever env those
+/// name rather than the one asked for.
+///
+/// It deliberately does not *create* the context. The library emits its `repo`
+/// label from inside `{{- with $.Values.werf }}`, so inventing an empty map
+/// made every preview carry a `repo: ""` that `helm template` never produces --
+/// on the chart this was measured against, the only difference between the two
+/// renderers across 84 apps.
 fn ensure_fast_preview_werf_context(values: &mut JsonValue, env: &str) {
-    let Some(root) = values.as_object_mut() else {
+    if env.trim().is_empty() {
+        return;
+    }
+    let Some(werf) = values
+        .as_object_mut()
+        .and_then(|root| root.get_mut("werf"))
+        .and_then(JsonValue::as_object_mut)
+    else {
         return;
     };
-    let werf = root
-        .entry("werf".to_string())
-        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
-    if !werf.is_object() {
-        *werf = JsonValue::Object(JsonMap::new());
-    }
-    let Some(werf_obj) = werf.as_object_mut() else {
-        return;
-    };
-    if !env.trim().is_empty() {
-        werf_obj.insert("env".to_string(), JsonValue::String(env.to_string()));
-    }
-    werf_obj
-        .entry("repo".to_string())
-        .or_insert_with(|| JsonValue::String(String::new()));
+    werf.insert("env".to_string(), JsonValue::String(env.to_string()));
 }
 
 fn build_manifest_entity_isolation_set_values_from_resolved_root(
@@ -6291,6 +6295,29 @@ apps-stateless:
             .and_then(|g| g.get("env"))
             .and_then(JsonValue::as_str);
         assert_eq!(env_value, Some("prod"));
+    }
+
+    /// The library prints its `repo` label from inside
+    /// `{{- with $.Values.werf }}`, so inventing that context made every fast
+    /// preview carry a `repo: ""` no `helm template` produces. Measured across
+    /// 84 apps of a real chart, it was the only difference between the two.
+    #[test]
+    fn a_fast_preview_does_not_invent_a_werf_context() {
+        let mut values = json!({"global": {"env": "dc1"}});
+        ensure_fast_preview_werf_context(&mut values, "dc1");
+        assert_eq!(values.get("werf"), None, "{values}");
+    }
+
+    /// It still has to point an existing one at the env being previewed:
+    /// `fl.currentEnv` reads `$.Values.werf.env` ahead of `global.env`, so a
+    /// chart carrying werf values would otherwise resolve for the wrong one.
+    #[test]
+    fn a_fast_preview_repoints_a_werf_context_it_was_given() {
+        let mut values = json!({"werf": {"env": "stale", "repo": "reg/app"}});
+        ensure_fast_preview_werf_context(&mut values, "dc1");
+        assert_eq!(values["werf"]["env"], json!("dc1"));
+        // Whatever else the chart supplies is left as the chart wrote it.
+        assert_eq!(values["werf"]["repo"], json!("reg/app"));
     }
 
     #[test]
