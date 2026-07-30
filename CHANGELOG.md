@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.2.1] - 2026-07-30
+
+### Added
+
+- Added fleet-wide `helm_apps op=query_manifests`, with `{group, app, manifest}` provenance and server-side `kind`/`resource` filtering before jq.
+- Added value-origin reporting and focused per-resource manifest rendering for helm-apps applications.
+
+### Changed
+
+- Reduced repeated chart loading across MCP analysis operations and made truncated render responses point callers to named resources instead of larger output limits.
+
+### Fixed
+
+- Aligned fast, Helm and werf renders on the same assembled values root, release identity and environment behavior.
+- Improved diagnostics for invalid app names, unresolved includes, environment maps, query mistakes and incomplete container images.
+
 ## [1.2.0] - 2026-07-29
 
 ### Added
