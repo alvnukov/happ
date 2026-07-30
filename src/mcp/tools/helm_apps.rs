@@ -11,7 +11,7 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use super::{limit_schema, optional_str, required_str, truncate};
+use super::{limit_schema, optional_str, optional_u32, required_str, truncate};
 use crate::helm_overrides::ValueOverrides;
 use crate::lsp::{ChartValuesSource, ReleaseIdentity};
 use crate::mcp::ServerContext;
@@ -94,9 +94,20 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                 "renderer": {
                     "type": "string",
                     "enum": ["fast", "helm", "werf"],
-                    "description": "For op='render': 'fast' (default) renders in-process and needs \
-                                    no tooling; 'helm' and 'werf' shell out and match the real \
-                                    deployment exactly.",
+                    "description": "For op='render': 'fast' (default) links helm's own engine and \
+                                    needs no tooling on PATH; 'helm' and 'werf' shell out to the \
+                                    real binaries. All three are given the same values.",
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "For op='render': keep only this Kubernetes kind, e.g. \
+                                    'Deployment'. An app renders several resources and a question \
+                                    is usually about one.",
+                },
+                "resource": {
+                    "type": "string",
+                    "description": "For op='render': keep only the resource with this \
+                                    metadata.name. Combines with kind.",
                 },
                 "values_files": {
                     "type": "array",
@@ -141,7 +152,9 @@ pub(crate) fn call(context: &ServerContext, args: &JsonValue) -> Result<String, 
         "overview" => chart_overview(context, args)?,
         "apps" => list_entities(context, args)?,
         "resolve" => resolve_entity(context, args)?,
-        "render" => render_entity_manifest(context, args)?,
+        // Capped by the op itself: it knows the answer is a list of named
+        // resources, so it can say what a cap left out.
+        "render" => return render_entity_manifest(context, args),
         "origin" => explain_value_origin(context, args)?,
         "lint" => lint_values(context, args)?,
         "diff" => diff_entity_envs(context, args)?,
@@ -542,15 +555,147 @@ fn render_entity_manifest(context: &ServerContext, args: &JsonValue) -> Result<S
         ""
     };
 
-    let incomplete = describe_containers_without_image(manifest);
+    let narrowed = narrow_rendered(
+        manifest,
+        optional_str(args, "kind").as_deref(),
+        optional_str(args, "resource").as_deref(),
+    )?;
+    let incomplete = describe_containers_without_image(&narrowed);
     let unknown_env =
         unknown_env_notice(&rendered["envDiscovery"], asked_env_for_notice.as_deref());
 
-    Ok(format!(
+    let header = format!(
         "# {group}.{app} rendered for env '{used_env}' by the {renderer} renderer\
-         {disabled_note}{fidelity}{incomplete}{unknown_env}\n{manifest}",
-    ))
+         {disabled_note}{fidelity}{incomplete}{unknown_env}",
+    );
+    Ok(truncate_render(narrowed, args, &header))
 }
+
+/// One rendered document, kept next to the text it came from.
+struct RenderedDocument {
+    kind: String,
+    name: String,
+    text: String,
+}
+
+/// Splits a render into documents, discarding the empty ones a chart emits.
+fn rendered_documents(manifest: &str) -> Vec<RenderedDocument> {
+    use serde::Deserialize;
+
+    let mut out = Vec::new();
+    // Split on the separator rather than reserialising: what the caller wants
+    // to read is the chart's own formatting, comments and ordering included.
+    for chunk in manifest.split("\n---") {
+        let text = chunk.trim_start_matches("---").trim();
+        if text.is_empty() {
+            continue;
+        }
+        let Some(doc) = serde_yaml::Deserializer::from_str(text)
+            .next()
+            .and_then(|document| serde_yaml::Value::deserialize(document).ok())
+        else {
+            continue;
+        };
+        let Some(kind) = doc.get("kind").and_then(|kind| kind.as_str()) else {
+            continue;
+        };
+        out.push(RenderedDocument {
+            kind: kind.to_string(),
+            name: doc
+                .get("metadata")
+                .and_then(|meta| meta.get("name"))
+                .and_then(|name| name.as_str())
+                .unwrap_or("<unnamed>")
+                .to_string(),
+            text: text.to_string(),
+        });
+    }
+    out
+}
+
+/// Keeps the documents the caller asked about.
+///
+/// An app of this chart renders up to eight resources and a question is almost
+/// always about one of them; rendering all of them to read a Deployment costs
+/// the model several thousand tokens it then has to skip past.
+fn narrow_rendered(
+    manifest: &str,
+    kind: Option<&str>,
+    name: Option<&str>,
+) -> Result<String, String> {
+    if kind.is_none() && name.is_none() {
+        return Ok(manifest.to_string());
+    }
+    let documents = rendered_documents(manifest);
+    let matches = |doc: &RenderedDocument| {
+        kind.is_none_or(|wanted| doc.kind.eq_ignore_ascii_case(wanted))
+            && name.is_none_or(|wanted| doc.name == wanted)
+    };
+    let kept: Vec<&RenderedDocument> = documents.iter().filter(|doc| matches(doc)).collect();
+    if kept.is_empty() {
+        let asked = match (kind, name) {
+            (Some(kind), Some(name)) => format!("{kind}/{name}"),
+            (Some(kind), None) => kind.to_string(),
+            (None, Some(name)) => name.to_string(),
+            (None, None) => String::new(),
+        };
+        return Err(format!(
+            "this app renders no '{asked}'. It renders: {}",
+            document_index(&documents).join(", ")
+        ));
+    }
+    Ok(kept
+        .iter()
+        .map(|doc| doc.text.as_str())
+        .collect::<Vec<&str>>()
+        .join("\n---\n"))
+}
+
+/// The documents a render produced, as `Kind/name`.
+fn document_index(documents: &[RenderedDocument]) -> Vec<String> {
+    documents
+        .iter()
+        .map(|doc| format!("{}/{}", doc.kind, doc.name))
+        .collect()
+}
+
+/// Caps a render, and says what was cut in terms the caller can ask for.
+///
+/// The generic cap ends mid-document and advises raising `limit`, which asks
+/// for the whole thing again at a higher price. A render is a list of named
+/// resources, so the useful thing to hand back is that list.
+fn truncate_render(manifest: String, args: &JsonValue, header: &str) -> String {
+    let limit = optional_u32(args, "limit")
+        .map(|value| value as usize)
+        .unwrap_or(RENDER_MAX_LINES)
+        .max(1);
+    let header_lines = header.lines().count();
+    let body_limit = limit.saturating_sub(header_lines).max(1);
+    let lines: Vec<&str> = manifest.lines().collect();
+    if lines.len() <= body_limit {
+        return format!("{header}\n{manifest}");
+    }
+
+    let documents = rendered_documents(&manifest);
+    let index = if documents.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n# It renders {}: {}.\n# Narrow with kind= or resource= rather than raising limit.",
+            documents.len(),
+            document_index(&documents).join(", ")
+        )
+    };
+    format!(
+        "{header}{index}\n{}\n\n[truncated: showing {body_limit} of {} manifest lines]",
+        lines[..body_limit].join("\n"),
+        lines.len(),
+    )
+}
+
+/// A rendered app is the one answer that routinely runs past the common cap,
+/// and half a Deployment is worse than none.
+const RENDER_MAX_LINES: usize = 600;
 
 /// Warns about containers the render left with no image.
 ///
@@ -2320,6 +2465,58 @@ apps-stateless:
             "ap",
         );
         assert!(missed.contains("This chart has no"), "{missed}");
+    }
+
+    const TWO_DOCS: &str = "# a comment the caller wrote\n\
+                            apiVersion: apps/v1\nkind: Deployment\n\
+                            metadata:\n  name: api\nspec:\n  replicas: 2\n\
+                            ---\napiVersion: v1\nkind: Service\n\
+                            metadata:\n  name: api\nspec:\n  ports: []\n";
+
+    #[test]
+    fn a_render_can_be_narrowed_to_one_resource() {
+        let only_service = narrow_rendered(TWO_DOCS, Some("service"), None).expect("service");
+        assert!(only_service.contains("kind: Service"), "{only_service}");
+        assert!(!only_service.contains("kind: Deployment"), "{only_service}");
+        // The chart's own formatting survives, comments included.
+        let with_comment = narrow_rendered(TWO_DOCS, Some("Deployment"), None).expect("deployment");
+        assert!(
+            with_comment.contains("# a comment the caller wrote"),
+            "{with_comment}"
+        );
+
+        let by_name = narrow_rendered(TWO_DOCS, None, Some("api")).expect("by name");
+        assert_eq!(rendered_documents(&by_name).len(), 2);
+
+        let unfiltered = narrow_rendered(TWO_DOCS, None, None).expect("unfiltered");
+        assert_eq!(unfiltered, TWO_DOCS);
+    }
+
+    /// Asking for a kind the app does not render is a question about what it
+    /// does render, so the error answers that instead of just saying no.
+    #[test]
+    fn narrowing_to_nothing_lists_what_the_app_does_render() {
+        let err = narrow_rendered(TWO_DOCS, Some("Ingress"), None)
+            .err()
+            .expect("no Ingress");
+        assert!(err.contains("renders no 'Ingress'"), "{err}");
+        assert!(err.contains("Deployment/api"), "{err}");
+        assert!(err.contains("Service/api"), "{err}");
+    }
+
+    /// The generic cap ends mid-document and says to raise `limit`, which buys
+    /// the whole thing again at a higher price. A render is a list of named
+    /// resources, so the cap hands that list back.
+    #[test]
+    fn a_capped_render_names_the_resources_it_cut() {
+        let capped = truncate_render(TWO_DOCS.to_string(), &json!({ "limit": 5 }), "# header");
+        assert!(capped.contains("It renders 2:"), "{capped}");
+        assert!(capped.contains("Deployment/api"), "{capped}");
+        assert!(capped.contains("kind= or resource="), "{capped}");
+        assert!(capped.contains("[truncated:"), "{capped}");
+
+        let untouched = truncate_render(TWO_DOCS.to_string(), &json!({}), "# header");
+        assert!(!untouched.contains("[truncated:"), "{untouched}");
     }
 
     /// A wrong app name has been answered with near misses for a while. A

@@ -349,11 +349,23 @@ They are applied before `_include` and `_includeFile` expansion, which is where
 Helm applies them too, so `resolve`, `lint` and `query` describe the same chart
 `render` produces rather than the one values.yaml describes on its own.
 
+Every renderer is given the same assembled values root, so `renderer='helm'`
+and `renderer='werf'` answer about the deployment the arguments describe rather
+than about the chart's own files. The difference between the three is the
+engine: `fast` links helm's own and needs nothing on `PATH`, the other two shell
+out to the installed binaries.
+
 `op=render` additionally takes `release_name` and `namespace`, which templates
 read as `$.Release.Name` and `$.Release.Namespace`. The namespace is not
 cosmetic: helm-apps stamps it onto the bindings it generates, and charts
 commonly derive values from it, so rendering without the real one answers about
 a different deployment.
+
+An app renders several resources and a question is usually about one, so
+`op=render` takes `kind` and `resource` — on a chart measured here, asking for
+the `Service` alone costs 881 bytes against 12.9 KB for everything the app
+produces. A render too long for `limit` says which resources it holds, so the
+next call can ask for one instead of buying the whole thing again.
 
 `op=origin` answers the question `op=resolve` leaves open. On a chart whose
 apps inherit through several `_include` profiles, knowing what a value is
@@ -375,11 +387,16 @@ otherwise surface only as an unreadable Go template trace:
 `op=resolve` carries a warning when the chart has an error that stops it
 rendering, because happ resolves values more leniently than the library renders
 them. `op=render` leads with the cause of a failure rather than the template
-trace, says when an app is disabled for the environment it was asked about, and
-notes that the default `fast` renderer is an in-process approximation. It also
-names any container it rendered without an image: helm-apps takes the image from
-werf metadata or from values the deployment supplies, so a render that succeeds
-without them still produces a workload Kubernetes rejects.
+trace, and says when an app is disabled for the environment it was asked about.
+It also names any container it rendered without an image: helm-apps takes the
+image from werf metadata or from values the deployment supplies, so a render
+that succeeds without them still produces a workload Kubernetes rejects.
+
+Where happ can tell that an answer is not the one you meant to ask for, it says
+so rather than answering confidently: `global.env` is a free-form string, so a
+misspelt environment is not an error and every env map simply falls through to
+`_default`. happ knows which names the chart writes down, and marks an answer
+built for a name that is not among them.
 
 `code` — code intelligence backed by real language servers:
 
