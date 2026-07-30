@@ -328,6 +328,7 @@ description sits in the model's context on every request.
 | `overview` | — | groups, apps, environments, library version, violation counts |
 | `apps` | — | every app as `group.app` with its enabled state |
 | `resolve` | `group`, `app` | the app's values after include expansion and env selection |
+| `origin` | `group`, `app` | which profile set each value, through which `_include` chain, and by which env key |
 | `render` | `group`, `app` | the Kubernetes manifests the app produces |
 | `lint` | — | violations of the helm-apps contract |
 | `diff` | `group`, `app`, `from_env`, `to_env` | how the app differs between two environments |
@@ -353,6 +354,12 @@ read as `$.Release.Name` and `$.Release.Namespace`. The namespace is not
 cosmetic: helm-apps stamps it onto the bindings it generates, and charts
 commonly derive values from it, so rendering without the real one answers about
 a different deployment.
+
+`op=origin` answers the question `op=resolve` leaves open. On a chart whose
+apps inherit through several `_include` profiles, knowing what a value is
+settles far less than knowing which profile set it: the answer names the
+profile, the chain it was reached through, the file and line it is written on,
+and the env-map key that was selected. Narrow it with `values_path`.
 
 `op=lint` checks the chart against the library contract, including mistakes that
 otherwise surface only as an unreadable Go template trace:

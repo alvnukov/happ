@@ -382,6 +382,34 @@ pub(crate) fn matching_env_regexes(map: &JsonMap<String, JsonValue>, env: &str) 
     matched
 }
 
+/// Which key of an env map the chart picks, for reporting rather than
+/// resolving.
+///
+/// `None` when the value at `key` is not an env map at all, or is one that
+/// names nothing for `env` — the two cases a reader has to tell apart when a
+/// field turns out to be absent.
+pub(crate) fn app_env_selection(value: &JsonValue, env: &str, key: &str) -> Option<String> {
+    let map = value.as_object()?;
+    if !is_env_map(map, Some(key), Scope::AppValue) {
+        return None;
+    }
+    if map.contains_key(env) {
+        return Some(env.to_string());
+    }
+    if let Some(pattern) = matching_env_regexes(map, env).first() {
+        return Some(pattern.clone());
+    }
+    map.contains_key(DEFAULT_ENV_KEY)
+        .then(|| DEFAULT_ENV_KEY.to_string())
+}
+
+/// Whether the value at `key` inside an app is read as an env map at all.
+pub(crate) fn is_app_env_map(value: &JsonValue, key: &str) -> bool {
+    value
+        .as_object()
+        .is_some_and(|map| is_env_map(map, Some(key), Scope::AppValue))
+}
+
 /// Selects the value an env map yields for `env`.
 ///
 /// `None` when the map holds no value for `env` and no `_default`, which under

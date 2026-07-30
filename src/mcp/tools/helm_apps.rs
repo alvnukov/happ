@@ -30,6 +30,7 @@ pub(crate) fn tool() -> JsonValue {
   overview                              groups, apps, environments, library version, violations
   apps                                  every app as group.app, with its enabled state
   resolve   group+app                   the app's values as the library actually sees them
+  origin    group+app                   where each of those values came from
   render    group+app                   the Kubernetes manifests the app produces
   lint                                  violations of the helm-apps contract
   diff      group+app+from_env+to_env    how the app differs between two environments
@@ -44,7 +45,7 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                 "op": {
                     "type": "string",
                     "enum": [
-                        "overview", "apps", "resolve", "render",
+                        "overview", "apps", "resolve", "render", "origin",
                         "lint", "diff", "query", "contract", "template",
                     ],
                     "description": "Operation to run.",
@@ -74,8 +75,9 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                 },
                 "values_path": {
                     "type": "string",
-                    "description": "For op='resolve': dot-separated subpath inside the app, e.g. \
-                                    'containers.main.env'. Keys containing dots need op='query'.",
+                    "description": "For op='resolve' and op='origin': dot-separated subpath inside \
+                                    the app, e.g. 'containers.main.env'. Keys containing dots need \
+                                    op='query'.",
                 },
                 "apply_includes": {
                     "type": "boolean",
@@ -140,6 +142,7 @@ pub(crate) fn call(context: &ServerContext, args: &JsonValue) -> Result<String, 
         "apps" => list_entities(context, args)?,
         "resolve" => resolve_entity(context, args)?,
         "render" => render_entity_manifest(context, args)?,
+        "origin" => explain_value_origin(context, args)?,
         "lint" => lint_values(context, args)?,
         "diff" => diff_entity_envs(context, args)?,
         "query" => query_values(context, args)?,
@@ -147,8 +150,8 @@ pub(crate) fn call(context: &ServerContext, args: &JsonValue) -> Result<String, 
         "template" => library_template(args)?,
         other => {
             return Err(format!(
-                "unknown op '{other}' -- expected one of: overview, apps, resolve, render, lint, \
-                 diff, query, contract, template"
+                "unknown op '{other}' -- expected one of: overview, apps, resolve, render, \
+                 origin, lint, diff, query, contract, template"
             ))
         }
     };
@@ -370,6 +373,73 @@ fn resolve_entity(context: &ServerContext, args: &JsonValue) -> Result<String, S
 /// chart with a fatal contract violation still produces a clean-looking
 /// `resolve` answer. Acting on those values would be acting on something that
 /// never reaches a cluster, so the answer has to carry the caveat with it.
+/// Says where each of an app's values came from.
+///
+/// On a chart whose apps inherit through several `_include` profiles, knowing
+/// what a value is settles far less than knowing which profile set it: that is
+/// the difference between reading the answer and being able to change it.
+fn explain_value_origin(context: &ServerContext, args: &JsonValue) -> Result<String, String> {
+    let source = chart_source(context, args)?;
+    let group = required_str(args, "group")?;
+    let app = required_str(args, "app")?;
+    let values_path = optional_str(args, "values_path");
+
+    let (origins, used_env) = crate::lsp::analysis_value_origins(
+        &source,
+        &group,
+        &app,
+        optional_str(args, "env"),
+        values_path.as_deref(),
+    )
+    .map_err(|err| explain_missing_entity(err, &source, &group, &app))?;
+
+    let mut lines = vec![format!(
+        "# where {group}.{app} gets its values, for env '{used_env}'"
+    )];
+    for origin in &origins {
+        let mut source_note = origin.from.clone();
+        if !origin.via.is_empty() {
+            // The chain reads outermost first, which is the order the app
+            // itself names them in.
+            source_note.push_str(&format!(" (via {})", origin.via.join(" -> ")));
+        }
+        if let Some(selector) = &origin.selector {
+            source_note.push_str(&format!(", env key '{selector}'"));
+        }
+        if let Some(defined_in) = &origin.defined_in {
+            source_note.push_str(&format!("\n    defined at {defined_in}"));
+        }
+        lines.push(format!(
+            "{}: {}\n    from {source_note}",
+            origin.path,
+            render_origin_value(&origin.value),
+        ));
+    }
+    if values_path.is_none() {
+        lines.push(format!(
+            "\n{} values. Narrow with values_path.",
+            origins.len()
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Renders a resolved value on one line, since the point here is the source.
+fn render_origin_value(value: &JsonValue) -> String {
+    let text = match value {
+        JsonValue::Null => "(absent for this env)".to_string(),
+        JsonValue::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let flattened = text.replace('\n', " ");
+    let trimmed = flattened.trim();
+    if trimmed.chars().count() > 90 {
+        let head: String = trimmed.chars().take(90).collect();
+        return format!("{head}...");
+    }
+    trimmed.to_string()
+}
+
 fn blocking_error_banner(source: &ChartValuesSource) -> String {
     let Ok(diagnostics) = crate::lsp::analysis_diagnostics(source) else {
         return String::new();
@@ -1910,6 +1980,122 @@ spec:
             Some("apps-jobs.vega-bootstrap-db"),
             "{nearest:?}"
         );
+    }
+
+    /// A chart fixture whose value is inherited through a chain, so provenance
+    /// has something to attribute.
+    fn inherited_chart_fixture() -> tempfile::TempDir {
+        let dir = chart_fixture();
+        std::fs::write(
+            dir.path().join("values.yaml"),
+            "\
+global:
+  env: dev
+  _includes:
+    base-app:
+      priorityClassName:
+        _default: standard
+        dc1: production-medium
+      replicas: 1
+    team-app:
+      _include: [ \"base-app\" ]
+      revisionHistoryLimit: 3
+apps-stateless:
+  api:
+    _include: [ \"team-app\" ]
+    enabled: true
+    replicas: 4
+",
+        )
+        .expect("write values");
+        dir
+    }
+
+    /// Knowing what a value is settles far less than knowing which profile set
+    /// it -- that is the difference between reading the answer and being able
+    /// to change it.
+    #[test]
+    fn origin_names_the_profile_the_chain_and_the_env_key() {
+        let chart = inherited_chart_fixture();
+        let text = run(
+            &context(),
+            json!({
+                "op": "origin",
+                "chart": chart_arg(&chart),
+                "group": "apps-stateless",
+                "app": "api",
+                "env": "dc1",
+                "values_path": "priorityClassName",
+            }),
+        )
+        .expect("origin");
+
+        assert!(text.contains("production-medium"), "{text}");
+        assert!(text.contains("from base-app"), "{text}");
+        // Reached through team-app, which is what the app actually names.
+        assert!(text.contains("via team-app"), "{text}");
+        assert!(text.contains("env key 'dc1'"), "{text}");
+        assert!(text.contains("values.yaml:"), "{text}");
+    }
+
+    /// The app's own value has to win over everything it inherits, and be
+    /// attributed to the app rather than to a profile.
+    #[test]
+    fn a_value_the_app_writes_itself_is_attributed_to_the_app() {
+        let chart = inherited_chart_fixture();
+        let text = run(
+            &context(),
+            json!({
+                "op": "origin",
+                "chart": chart_arg(&chart),
+                "group": "apps-stateless",
+                "app": "api",
+                "values_path": "replicas",
+            }),
+        )
+        .expect("origin");
+        assert!(text.contains("replicas: 4"), "{text}");
+        assert!(text.contains("from api"), "{text}");
+        assert!(!text.contains("via"), "{text}");
+    }
+
+    /// `_default` is a selection too, and saying which one was taken is the
+    /// point of reporting the key at all.
+    #[test]
+    fn origin_reports_the_default_env_key_when_that_is_what_matched() {
+        let chart = inherited_chart_fixture();
+        let text = run(
+            &context(),
+            json!({
+                "op": "origin",
+                "chart": chart_arg(&chart),
+                "group": "apps-stateless",
+                "app": "api",
+                "env": "dev",
+                "values_path": "priorityClassName",
+            }),
+        )
+        .expect("origin");
+        assert!(text.contains("standard"), "{text}");
+        assert!(text.contains("env key '_default'"), "{text}");
+    }
+
+    #[test]
+    fn origin_rejects_a_path_the_app_does_not_have() {
+        let chart = inherited_chart_fixture();
+        let err = run(
+            &context(),
+            json!({
+                "op": "origin",
+                "chart": chart_arg(&chart),
+                "group": "apps-stateless",
+                "app": "api",
+                "values_path": "nosuchthing",
+            }),
+        )
+        .err()
+        .expect("an unknown path must fail");
+        assert!(err.contains("nosuchthing"), "{err}");
     }
 
     #[test]

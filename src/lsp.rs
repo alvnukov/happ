@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 use serde_yaml::{Mapping as YamlMapping, Number as YamlNumber, Value as YamlValue};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -5152,6 +5152,234 @@ pub(crate) fn analysis_list_entities(
         &source.overrides,
     )?;
     serde_json::to_value(result).map_err(|err| format!("serialize entity list: {err}"))
+}
+
+/// Where one value in an app came from.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ValueOrigin {
+    /// Dotted path inside the app.
+    pub(crate) path: String,
+    /// The profile that supplied it, or the app's own name.
+    pub(crate) from: String,
+    /// The `_include` chain that pulled that profile in, outermost first.
+    /// Empty when the app names the profile directly, or wrote the value.
+    pub(crate) via: Vec<String>,
+    /// Where that profile is written, as `file:line`, when it could be found.
+    pub(crate) defined_in: Option<String>,
+    /// The env-map key selected for the requested environment, when the value
+    /// is one. `None` means it is a plain value, the same either way.
+    pub(crate) selector: Option<String>,
+    /// The value the chart ends up with, after env selection.
+    pub(crate) value: JsonValue,
+}
+
+/// One layer contributing to an app, lowest precedence first.
+struct ValueLayer {
+    label: String,
+    via: Vec<String>,
+    values: JsonMap<String, JsonValue>,
+}
+
+/// Explains where each of an app's values came from.
+///
+/// `resolve` answers what a value is; on a chart with deep `_include` chains
+/// the harder question is why. This replays the same layering `expand_node`
+/// performs -- every included profile in order, then the app's own values on
+/// top -- recording which layer last wrote each path.
+pub(crate) fn analysis_value_origins(
+    source: &ChartValuesSource,
+    group: &str,
+    app: &str,
+    env: Option<String>,
+    values_path: Option<&str>,
+) -> Result<(Vec<ValueOrigin>, String), String> {
+    // Unexpanded, so the layers are still separate; env maps left intact so the
+    // selector can be reported rather than silently applied.
+    let literal = resolve_values_root(
+        Some(&source.uri),
+        &source.text,
+        env.clone(),
+        false,
+        false,
+        &source.overrides,
+    )?;
+    let used_env = literal.used_env.clone();
+    let includes_map = literal
+        .root
+        .get("global")
+        .and_then(as_obj)
+        .and_then(|global| global.get("_includes"))
+        .and_then(as_obj)
+        .cloned()
+        .unwrap_or_default();
+    let entity = read_entity(&literal.root, group, app)?;
+    let app_map = as_obj(&entity)
+        .cloned()
+        .ok_or_else(|| format!("{group}.{app} is not a map"))?;
+
+    let mut layers = Vec::new();
+    for include_name in normalize_include(app_map.get("_include")) {
+        collect_profile_layers(&include_name, &includes_map, &mut Vec::new(), &mut layers);
+    }
+    let mut own = app_map.clone();
+    own.remove("_include");
+    layers.push(ValueLayer {
+        label: app.to_string(),
+        via: Vec::new(),
+        values: own,
+    });
+
+    // Later layers win, exactly as `merge_maps` has them win.
+    let mut attributed: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+    for layer in &layers {
+        record_layer_paths(
+            &JsonValue::Object(layer.values.clone()),
+            &mut Vec::new(),
+            layer,
+            &mut attributed,
+        );
+    }
+
+    let resolved = analysis_resolve_entity(
+        source,
+        group.to_string(),
+        app.to_string(),
+        env,
+        Some(true),
+        Some(true),
+    )?;
+    let resolved_entity = resolved.get("entity").cloned().unwrap_or(JsonValue::Null);
+
+    let definition_sites = include_definition_sites(source);
+    let wanted = values_path.map(str::trim).filter(|path| !path.is_empty());
+    let mut origins = Vec::new();
+    for (path, (from, via)) in attributed {
+        if let Some(wanted) = wanted {
+            if path.as_str() != wanted && !path.starts_with(&format!("{wanted}.")) {
+                continue;
+            }
+        }
+        let key = path.rsplit('.').next().unwrap_or(&path);
+        let literal_value = value_at_path(&JsonValue::Object(app_layered(&layers)), &path);
+        let selector = literal_value
+            .as_ref()
+            .and_then(|value| crate::env_map::app_env_selection(value, &used_env, key));
+        let defined_in = definition_sites.get(&from).cloned();
+        origins.push(ValueOrigin {
+            path: path.clone(),
+            from,
+            via,
+            defined_in,
+            selector,
+            value: value_at_path(&resolved_entity, &path).unwrap_or(JsonValue::Null),
+        });
+    }
+
+    if origins.is_empty() {
+        return Err(match wanted {
+            Some(wanted) => format!("no value at '{wanted}' inside {group}.{app}"),
+            None => format!("{group}.{app} has no values to explain"),
+        });
+    }
+    Ok((origins, used_env))
+}
+
+/// Where each include profile is written, as `file:line`.
+///
+/// Reuses the cross-file scan the diagnostics already perform, so provenance
+/// cannot point somewhere the editor would not.
+fn include_definition_sites(source: &ChartValuesSource) -> HashMap<String, String> {
+    let Ok(uri) = source.uri.parse::<Uri>() else {
+        return HashMap::new();
+    };
+    let context = build_stitched_values_context(&uri, &source.text);
+    let mut sites = HashMap::new();
+    for definition in context.include_definitions {
+        // Relative to the chart, because that is how a reader refers to the
+        // file; absolute only when it genuinely lies outside.
+        let file = definition
+            .source_file
+            .strip_prefix(&source.chart_root)
+            .unwrap_or(&definition.source_file);
+        sites.entry(definition.name).or_insert(format!(
+            "{}:{}",
+            file.display(),
+            definition.source_line + 1
+        ));
+    }
+    sites
+}
+
+/// The layers merged together, which is what env selection then reads.
+fn app_layered(layers: &[ValueLayer]) -> JsonMap<String, JsonValue> {
+    let mut merged = JsonMap::new();
+    for layer in layers {
+        merged = merge_maps(&merged, &layer.values);
+    }
+    merged
+}
+
+/// Flattens a profile and everything it includes, lowest precedence first.
+fn collect_profile_layers(
+    name: &str,
+    includes_map: &JsonMap<String, JsonValue>,
+    chain: &mut Vec<String>,
+    out: &mut Vec<ValueLayer>,
+) {
+    if chain.iter().any(|seen| seen == name) {
+        return;
+    }
+    let Some(profile) = includes_map.get(name).and_then(as_obj) else {
+        return;
+    };
+    chain.push(name.to_string());
+    for child in normalize_include(profile.get("_include")) {
+        collect_profile_layers(&child, includes_map, chain, out);
+    }
+    chain.pop();
+
+    let mut values = profile.clone();
+    values.remove("_include");
+    out.push(ValueLayer {
+        label: name.to_string(),
+        via: chain.clone(),
+        values,
+    });
+}
+
+/// Records every path a layer writes, so a later layer can overwrite it.
+///
+/// Recursion stops at an env map: the branches inside one are environments,
+/// not paths a chart author would recognise.
+fn record_layer_paths(
+    value: &JsonValue,
+    path: &mut Vec<String>,
+    layer: &ValueLayer,
+    out: &mut BTreeMap<String, (String, Vec<String>)>,
+) {
+    let key = path.last().cloned().unwrap_or_default();
+    let is_env_map = !path.is_empty() && crate::env_map::is_app_env_map(value, &key);
+    match value {
+        JsonValue::Object(map) if !is_env_map && !map.is_empty() => {
+            for (child_key, child) in map {
+                path.push(child_key.clone());
+                record_layer_paths(child, path, layer, out);
+                path.pop();
+            }
+        }
+        _ if path.is_empty() => {}
+        _ => {
+            out.insert(path.join("."), (layer.label.clone(), layer.via.clone()));
+        }
+    }
+}
+
+fn value_at_path(value: &JsonValue, path: &str) -> Option<JsonValue> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current.clone())
 }
 
 /// One app's values with includes expanded and env maps collapsed.
