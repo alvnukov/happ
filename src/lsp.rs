@@ -4774,10 +4774,19 @@ fn collect_include_file_refs(lines: &[&str]) -> Vec<IncludeFileRef> {
                 continue;
             }
             let sub_indent = count_indent(sub_line);
-            if sub_indent <= indent {
+            if sub_indent < indent {
                 break;
             }
-            if let Some((_li, raw)) = parse_list_item_raw(sub_line) {
+            let item = parse_list_item_raw(sub_line);
+            // YAML lets a block sequence sit at its key's own indentation, and
+            // that is how a root-level `_include_files:` is normally written --
+            // demanding a deeper indent found none of its entries. Anything at
+            // that indentation that is not a list item is the next sibling key,
+            // which does end the sequence.
+            if sub_indent == indent && item.is_none() {
+                break;
+            }
+            if let Some((_li, raw)) = item {
                 let path = unquote(raw.trim());
                 if !path.is_empty() {
                     refs.push(IncludeFileRef {
@@ -5069,7 +5078,11 @@ fn find_parent_key_with_mask(
         let Some((key_indent, key, _value)) = parse_key_line(lines[i]) else {
             continue;
         };
-        if key_indent < indent {
+        // A key at the item's own indentation owns it: YAML lets a block
+        // sequence sit level with its key, which is how `_include:` lists are
+        // written throughout helm-apps values. Requiring a strictly smaller
+        // indent walked past that key and blamed its grandparent instead.
+        if key_indent <= indent {
             return Some(key.to_string());
         }
     }
@@ -6630,6 +6643,82 @@ apps-stateless:
         assert!(diagnostics.iter().all(|d| !d
             .message
             .contains("Unused include profile: _include_from_file")));
+    }
+
+    /// A root-level `_include_files:` writes its entries flush left, at the
+    /// key's own indentation. The scanner used to require a deeper indent, so
+    /// it read no entries at all and every profile the included files consume
+    /// looked unused -- the shape the vega chart reported all ten profiles on.
+    #[test]
+    fn diagnostics_follow_a_flush_left_include_files_list() {
+        let td = TempDir::new().expect("tmp");
+        fs::create_dir_all(td.path().join("values/services")).expect("mkdir");
+        fs::write(
+            td.path().join("values/services/api.yaml"),
+            r#"
+apps-stateless:
+  api:
+    _include: [ "vega-app" ]
+"#,
+        )
+        .expect("write service");
+        let values_path = td.path().join("values.yaml");
+
+        let src = r#"
+global:
+  _includes:
+    vega-app:
+      enabled: true
+_include_files:
+- values/services/api.yaml
+"#;
+        fs::write(&values_path, src).expect("write values");
+        let uri = format!("file://{}", values_path.to_string_lossy())
+            .parse::<Uri>()
+            .expect("uri");
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("Unused include profile: vega-app")),
+            "{diagnostics:#?}"
+        );
+    }
+
+    /// The consumers of a profile normally write `_include:` with its list
+    /// level with the key, and the usage scan used to attribute those items to
+    /// the key above `_include:` -- so the profile still looked unused.
+    #[test]
+    fn a_flush_left_include_list_counts_as_a_usage() {
+        let lines: Vec<&str> = concat!(
+            "apps-ingresses:\n",
+            "  dns-api:\n",
+            "    _include:\n",
+            "    - vega-app-ingress\n",
+            "    annotations: |\n",
+            "      nginx.ingress.kubernetes.io/use-regex: \"true\"\n",
+        )
+        .split('\n')
+        .collect();
+        let used: Vec<String> = collect_include_usages(&lines)
+            .into_iter()
+            .map(|usage| usage.name)
+            .collect();
+        assert_eq!(used, vec!["vega-app-ingress".to_string()]);
+    }
+
+    /// The sibling key after the sequence must still end it, or every later
+    /// list in the file would be swallowed as an include path.
+    #[test]
+    fn a_flush_left_include_files_list_stops_at_the_next_key() {
+        let lines: Vec<&str> = "_include_files:\n- a.yaml\n- b.yaml\nother:\n- c.yaml\n"
+            .split('\n')
+            .collect();
+        let paths: Vec<String> = collect_include_file_refs(&lines)
+            .into_iter()
+            .map(|file_ref| file_ref.path)
+            .collect();
+        assert_eq!(paths, vec!["a.yaml".to_string(), "b.yaml".to_string()]);
     }
 
     #[test]
