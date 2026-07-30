@@ -10,6 +10,7 @@ mod dyfflike;
 mod env_map;
 pub mod go_compat;
 pub mod gotemplates;
+mod helm_overrides;
 mod inspectweb;
 mod library_values;
 mod lsp;
