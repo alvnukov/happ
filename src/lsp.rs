@@ -106,6 +106,8 @@ struct RenderEntityManifestParams {
     renderer: Option<String>,
     apply_includes: Option<bool>,
     apply_env_resolution: Option<bool>,
+    release_name: Option<String>,
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -615,6 +617,10 @@ fn render_entity_manifest_request_with_overrides(
         &context.root,
         &context.used_env,
         renderer,
+        &ReleaseIdentity {
+            name: params.release_name,
+            namespace: params.namespace,
+        },
     )?;
     Ok(RenderEntityManifestResult {
         manifest,
@@ -793,6 +799,13 @@ fn collect_enabled_entities(values: &JsonValue) -> Vec<EnabledEntityRef> {
     out
 }
 
+/// The release name a preview renders under when the caller names none.
+///
+/// One name for every renderer: the fast path used to say `happ-lsp-preview`
+/// while `helm` said `helm-apps-preview`, so a chart reading `$.Release.Name`
+/// got a different answer depending on which renderer was asked.
+const HELM_PREVIEW_RELEASE: &str = "helm-apps-preview";
+
 fn render_manifest_for_entity(
     chart_root: &Path,
     current_path: Option<&Path>,
@@ -802,6 +815,7 @@ fn render_manifest_for_entity(
     resolved_root: &JsonValue,
     env: &str,
     renderer: ManifestPreviewRenderer,
+    release: &ReleaseIdentity,
 ) -> Result<String, String> {
     if renderer != ManifestPreviewRenderer::Fast {
         return render_manifest_for_entity_via_cli(
@@ -812,6 +826,7 @@ fn render_manifest_for_entity(
             resolved_root,
             env,
             renderer,
+            release,
         );
     }
 
@@ -843,8 +858,8 @@ fn render_manifest_for_entity(
         allow_template_includes: Vec::new(),
         unsupported_template_mode: "error".into(),
         verify_equivalence: false,
-        release_name: "happ-lsp-preview".into(),
-        namespace: None,
+        release_name: release.named().unwrap_or(HELM_PREVIEW_RELEASE).to_string(),
+        namespace: release.in_namespace().map(str::to_string),
         values_files: vec![values_path.to_string_lossy().to_string()],
         set_values: Vec::new(),
         set_string_values: Vec::new(),
@@ -872,6 +887,7 @@ fn render_manifest_for_entity_via_cli(
     resolved_root: &JsonValue,
     env: &str,
     renderer: ManifestPreviewRenderer,
+    release: &ReleaseIdentity,
 ) -> Result<String, String> {
     let current_path = current_path.ok_or_else(|| {
         format!(
@@ -887,7 +903,14 @@ fn render_manifest_for_entity_via_cli(
         _ => chart_root.to_path_buf(),
     };
     let command = manifest_renderer_command(renderer);
-    let args = build_manifest_backend_args(renderer, &work_dir, &values_files, &set_values, env);
+    let args = build_manifest_backend_args(
+        renderer,
+        &work_dir,
+        &values_files,
+        &set_values,
+        env,
+        release,
+    );
     let output = Command::new(command)
         .args(&args)
         .current_dir(&work_dir)
@@ -1217,6 +1240,7 @@ fn build_manifest_backend_args(
     values_files: &[PathBuf],
     set_values: &[String],
     env: &str,
+    release: &ReleaseIdentity,
 ) -> Vec<String> {
     let mut value_args: Vec<String> = Vec::new();
     for value_file in values_files {
@@ -1239,6 +1263,12 @@ fn build_manifest_backend_args(
             args.push("--set-string".to_string());
             args.push(format!("global.env={normalized_env}"));
         }
+        // Only passed when the caller named one: a namespace flag the backend
+        // does not know about must not break a render nobody asked to place.
+        if let Some(namespace) = release.in_namespace() {
+            args.push("--namespace".to_string());
+            args.push(namespace.to_string());
+        }
         args
     };
 
@@ -1246,7 +1276,7 @@ fn build_manifest_backend_args(
         ManifestPreviewRenderer::Helm | ManifestPreviewRenderer::Fast => with_env({
             let mut args = vec![
                 "template".to_string(),
-                "helm-apps-preview".to_string(),
+                release.named().unwrap_or(HELM_PREVIEW_RELEASE).to_string(),
                 chart_dir.to_string_lossy().to_string(),
             ];
             args.extend(value_args);
@@ -4922,6 +4952,34 @@ fn parse_list_item_raw(line: &str) -> Option<(usize, &str)> {
 
 /// A values document located on disk, addressed the way the LSP addresses an
 /// open buffer.
+/// The release a chart is rendered as, which templates read through
+/// `$.Release`.
+///
+/// helm-apps stamps `$.Release.Namespace` onto the bindings it generates, and
+/// charts routinely derive values from it -- the namespace is not cosmetic, so
+/// rendering without the real one answers about a different deployment.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReleaseIdentity {
+    pub(crate) name: Option<String>,
+    pub(crate) namespace: Option<String>,
+}
+
+impl ReleaseIdentity {
+    fn named(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    }
+
+    fn in_namespace(&self) -> Option<&str> {
+        self.namespace
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    }
+}
+
 pub(crate) struct ChartValuesSource {
     pub(crate) chart_root: PathBuf,
     pub(crate) values_path: PathBuf,
@@ -4930,6 +4988,8 @@ pub(crate) struct ChartValuesSource {
     /// The `-f` files and `--set` flags the deployment adds on top, so every
     /// analysis answers about the values the chart is really rendered from.
     pub(crate) overrides: ValueOverrides,
+    /// The release the chart is rendered as.
+    pub(crate) release: ReleaseIdentity,
 }
 
 impl ChartValuesSource {
@@ -4943,6 +5003,11 @@ impl ChartValuesSource {
 
     pub(crate) fn with_overrides(mut self, overrides: ValueOverrides) -> Self {
         self.overrides = overrides;
+        self
+    }
+
+    pub(crate) fn with_release(mut self, release: ReleaseIdentity) -> Self {
+        self.release = release;
         self
     }
 }
@@ -4999,6 +5064,7 @@ pub(crate) fn locate_chart_values(path: &Path) -> Result<ChartValuesSource, Stri
         uri,
         text,
         overrides: ValueOverrides::default(),
+        release: ReleaseIdentity::default(),
     })
 }
 
@@ -5065,6 +5131,8 @@ pub(crate) fn analysis_render_entity_manifest(
             renderer,
             apply_includes: None,
             apply_env_resolution: None,
+            release_name: source.release.name.clone(),
+            namespace: source.release.namespace.clone(),
         },
         &source.overrides,
     )?;
@@ -8205,6 +8273,8 @@ apps-stateless:
                 apply_includes: Some(true),
                 apply_env_resolution: Some(true),
                 renderer: Some("fast".to_string()),
+                release_name: None,
+                namespace: None,
             },
         )
         .expect("render manifest");
@@ -8263,6 +8333,8 @@ apps-stateless:
                 apply_includes: Some(true),
                 apply_env_resolution: Some(true),
                 renderer: Some("fast".to_string()),
+                release_name: None,
+                namespace: None,
             },
         )
         .expect("render manifest");
@@ -8327,6 +8399,8 @@ apps-stateless:
                 apply_includes: Some(true),
                 apply_env_resolution: Some(true),
                 renderer: Some("fast".to_string()),
+                release_name: None,
+                namespace: None,
             },
         )
         .expect("render manifest");
@@ -8397,6 +8471,8 @@ apps-stateless:
                 apply_includes: Some(true),
                 apply_env_resolution: Some(true),
                 renderer: Some("fast".to_string()),
+                release_name: None,
+                namespace: None,
             },
         )
         .expect("render manifest");
@@ -8468,6 +8544,8 @@ apps-stateless:
                 apply_includes: Some(true),
                 apply_env_resolution: Some(true),
                 renderer: Some("fast".to_string()),
+                release_name: None,
+                namespace: None,
             },
         )
         .expect("render manifest");
@@ -8652,6 +8730,73 @@ apps-stateless:
         assert_eq!(selected, vec![primary_values]);
     }
 
+    /// helm-apps stamps `$.Release.Namespace` onto the bindings it generates,
+    /// so a render placed in the wrong namespace answers about a different
+    /// deployment.
+    #[test]
+    fn a_named_release_and_namespace_reach_the_helm_backend() {
+        let args = build_manifest_backend_args(
+            ManifestPreviewRenderer::Helm,
+            Path::new("/tmp/chart"),
+            &[],
+            &[],
+            "demo",
+            &ReleaseIdentity {
+                name: Some("vega".to_string()),
+                namespace: Some("customer-prod".to_string()),
+            },
+        );
+        assert_eq!(args.first().map(String::as_str), Some("template"));
+        assert_eq!(args.get(1).map(String::as_str), Some("vega"));
+        let namespace_at = args
+            .iter()
+            .position(|arg| arg == "--namespace")
+            .expect("namespace flag");
+        assert_eq!(
+            args.get(namespace_at + 1).map(String::as_str),
+            Some("customer-prod")
+        );
+    }
+
+    /// A backend that does not know `--namespace` must not fail a render that
+    /// never asked to be placed anywhere.
+    #[test]
+    fn an_unnamed_release_adds_no_namespace_flag() {
+        for renderer in [ManifestPreviewRenderer::Helm, ManifestPreviewRenderer::Werf] {
+            let args = build_manifest_backend_args(
+                renderer,
+                Path::new("/tmp/chart"),
+                &[],
+                &[],
+                "demo",
+                &ReleaseIdentity {
+                    name: None,
+                    // Whitespace is not a namespace.
+                    namespace: Some("   ".to_string()),
+                },
+            );
+            assert!(
+                !args.iter().any(|arg| arg == "--namespace"),
+                "{renderer:?}: {args:?}"
+            );
+        }
+    }
+
+    /// The fast path used to render under `happ-lsp-preview` while helm used
+    /// `helm-apps-preview`, so `$.Release.Name` depended on the renderer.
+    #[test]
+    fn every_renderer_defaults_to_one_preview_release_name() {
+        let args = build_manifest_backend_args(
+            ManifestPreviewRenderer::Fast,
+            Path::new("/tmp/chart"),
+            &[],
+            &[],
+            "demo",
+            &ReleaseIdentity::default(),
+        );
+        assert_eq!(args.get(1).map(String::as_str), Some(HELM_PREVIEW_RELEASE));
+    }
+
     #[test]
     fn build_manifest_backend_args_for_helm_uses_values_sets_and_global_env() {
         let args = build_manifest_backend_args(
@@ -8666,6 +8811,7 @@ apps-stateless:
                 "apps-stateless.app-2.enabled=false".to_string(),
             ],
             "demo",
+            &ReleaseIdentity::default(),
         );
 
         assert_eq!(
@@ -8696,6 +8842,7 @@ apps-stateless:
             &[PathBuf::from("/tmp/project/.helm/values.yaml")],
             &["apps-stateless.app-1.enabled=true".to_string()],
             "demo",
+            &ReleaseIdentity::default(),
         );
 
         assert_eq!(

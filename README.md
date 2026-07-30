@@ -348,6 +348,12 @@ They are applied before `_include` and `_includeFile` expansion, which is where
 Helm applies them too, so `resolve`, `lint` and `query` describe the same chart
 `render` produces rather than the one values.yaml describes on its own.
 
+`op=render` additionally takes `release_name` and `namespace`, which templates
+read as `$.Release.Name` and `$.Release.Namespace`. The namespace is not
+cosmetic: helm-apps stamps it onto the bindings it generates, and charts
+commonly derive values from it, so rendering without the real one answers about
+a different deployment.
+
 `op=lint` checks the chart against the library contract, including mistakes that
 otherwise surface only as an unreadable Go template trace:
 

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use super::{limit_schema, optional_str, required_str, truncate};
 use crate::helm_overrides::ValueOverrides;
-use crate::lsp::ChartValuesSource;
+use crate::lsp::{ChartValuesSource, ReleaseIdentity};
 use crate::mcp::ServerContext;
 
 pub(crate) const NAME: &str = "helm_apps";
@@ -112,6 +112,17 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                     "type": "object",
                     "description": "Like `set`, but every value stays a string, the way \
                                     `helm --set-string` does.",
+                },
+                "release_name": {
+                    "type": "string",
+                    "description": "For op='render': the Helm release name, read by templates as \
+                                    `$.Release.Name`.",
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "For op='render': the namespace to render into, read as \
+                                    `$.Release.Namespace`. helm-apps stamps it onto the bindings \
+                                    it generates, and charts commonly derive values from it.",
                 },
                 "limit": limit_schema("output lines"),
             },
@@ -988,7 +999,11 @@ fn chart_source(context: &ServerContext, args: &JsonValue) -> Result<ChartValues
         })?;
     let source = crate::lsp::locate_chart_values(&path)?;
     let overrides = value_overrides(args, &source.chart_root)?;
-    Ok(source.with_overrides(overrides))
+    let release = ReleaseIdentity {
+        name: optional_str(args, "release_name"),
+        namespace: optional_str(args, "namespace"),
+    };
+    Ok(source.with_overrides(overrides).with_release(release))
 }
 
 /// Reads `values_files`, `set` and `set_string` off the request.
