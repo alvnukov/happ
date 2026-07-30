@@ -748,11 +748,19 @@ fn library_template(args: &JsonValue) -> Result<String, String> {
         let Some(source) = crate::assets::embedded_helm_apps_file(&path) else {
             continue;
         };
-        let body = crate::templateanalyzer::extract_define_blocks(source)
-            .remove(&name)
-            .unwrap_or_else(|| source.to_string());
+        // `extract_define_blocks` hands back the whole `define ... end` block,
+        // wrapper included, so adding a wrapper here would emit the header and
+        // the `end` twice and produce a fragment that does not parse. When
+        // extraction finds nothing there is no block to quote, so say which
+        // file to read instead of passing the entire file off as one `define`.
+        let Some(body) = crate::templateanalyzer::extract_define_blocks(source).remove(&name)
+        else {
+            return Ok(format!(
+                "# `{name}` is defined in happ://helm-apps/{path}, but its `define` block could not be isolated.\n# Read that file with op='template' and name='{path}'."
+            ));
+        };
         return Ok(format!(
-            "# `{name}`, defined in happ://helm-apps/{path}\n{{{{- define \"{name}\" -}}}}{body}{{{{- end -}}}}"
+            "# `{name}`, defined in happ://helm-apps/{path}\n{body}"
         ));
     }
 
@@ -1311,6 +1319,31 @@ mod tests {
             text.contains("happ://helm-apps/templates/fl-functions/_value.tpl"),
             "{text}"
         );
+    }
+
+    /// The block used to be wrapped a second time, so the answer opened with
+    /// `{{- define "fl.value" -}}{{- define "fl.value" }}` and closed with two
+    /// `end`s -- a fragment no Go template parser accepts.
+    #[test]
+    fn a_quoted_define_is_emitted_exactly_once() {
+        let text =
+            run(&context(), json!({ "op": "template", "name": "fl.value" })).expect("template");
+        assert_eq!(
+            text.matches("define \"fl.value\"").count(),
+            1,
+            "the define header must appear once: {text}"
+        );
+
+        // Re-extracting the block out of the answer must yield the answer's own
+        // template text, which only holds if the delimiters are balanced.
+        let quoted = text
+            .split_once('\n')
+            .map(|(_, body)| body)
+            .expect("a header line precedes the block");
+        let reparsed = crate::templateanalyzer::extract_define_blocks(quoted)
+            .remove("fl.value")
+            .expect("the quoted block must parse as a define");
+        assert_eq!(reparsed.trim(), quoted.trim(), "{text}");
     }
 
     #[test]
