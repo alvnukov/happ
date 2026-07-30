@@ -507,11 +507,19 @@ fn resolve_values_root(
         parse_and_expand_values_root(request_uri.as_ref(), text, value_overrides)
             .ok_or_else(|| "failed to parse values root with include expansion".to_string())?
     } else {
-        // Include expansion is where overrides normally land, so the literal
-        // view has to apply them itself or it would answer about a different
-        // chart than every other view.
-        let mut root_map = parse_yaml_map_to_json_map(text)?;
-        value_overrides.apply(&mut root_map)?;
+        // `_include_files` and `_include` are two different things, and only
+        // the second is what "do not expand includes" means. A modular chart
+        // keeps most of its apps in the files the first names, so skipping
+        // those too answered "no such app" for an app plainly in the chart.
+        // Load the files; leave the profiles unexpanded, which is what was
+        // asked for.
+        let (root_map, _) = parse_values_root_with_file_includes_as(
+            request_uri.as_ref(),
+            text,
+            value_overrides,
+            FileIncludeMode::MergedInPlace,
+        )
+        .ok_or_else(|| "failed to parse values root".to_string())?;
         root_map
     };
 
@@ -2742,11 +2750,26 @@ fn parse_values_root_with_file_includes(
     text: &str,
     value_overrides: &ValueOverrides,
 ) -> Option<(JsonMap<String, JsonValue>, Option<PathBuf>)> {
+    parse_values_root_with_file_includes_as(
+        uri,
+        text,
+        value_overrides,
+        FileIncludeMode::AsIncludeProfile,
+    )
+}
+
+fn parse_values_root_with_file_includes_as(
+    uri: Option<&Uri>,
+    text: &str,
+    value_overrides: &ValueOverrides,
+    mode: FileIncludeMode,
+) -> Option<(JsonMap<String, JsonValue>, Option<PathBuf>)> {
     let parsed = parse_source_values_root(uri, text, value_overrides)?;
-    let with_files = expand_values_with_file_includes(
+    let with_files = expand_values_with_file_includes_as(
         &parsed.root_map,
         parsed.include_base_dir.as_deref(),
         &parsed.overrides,
+        mode,
     )
     .ok()?;
     Some((with_files, parsed.chart_root))
@@ -2831,6 +2854,20 @@ fn expand_values_with_file_includes(
     include_base_dir: Option<&Path>,
     overrides: &HashMap<PathBuf, String>,
 ) -> Result<JsonMap<String, JsonValue>, String> {
+    expand_values_with_file_includes_as(
+        values,
+        include_base_dir,
+        overrides,
+        FileIncludeMode::AsIncludeProfile,
+    )
+}
+
+fn expand_values_with_file_includes_as(
+    values: &JsonMap<String, JsonValue>,
+    include_base_dir: Option<&Path>,
+    overrides: &HashMap<PathBuf, String>,
+    mode: FileIncludeMode,
+) -> Result<JsonMap<String, JsonValue>, String> {
     let mut injected_includes: JsonMap<String, JsonValue> = JsonMap::new();
     let mut file_stack: HashSet<PathBuf> = HashSet::new();
     let processed = process_file_include_node(
@@ -2840,6 +2877,7 @@ fn expand_values_with_file_includes(
         &mut injected_includes,
         overrides,
         &mut file_stack,
+        mode,
     )?;
     let mut root = as_obj(&processed)
         .cloned()
@@ -2867,6 +2905,19 @@ fn expand_values_with_file_includes(
     Ok(root)
 }
 
+/// How `_include_files` should deliver what it names.
+///
+/// helm-apps itself carries those files in through the include mechanism, so
+/// the default turns each one into a synthetic profile and leaves the actual
+/// merging to include expansion. A caller that has asked *not* to expand
+/// profiles still needs the files, though -- that is where a modular chart
+/// keeps most of its apps -- so it merges them in place instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileIncludeMode {
+    AsIncludeProfile,
+    MergedInPlace,
+}
+
 fn process_file_include_node(
     node: &JsonValue,
     include_base_dir: Option<&Path>,
@@ -2874,6 +2925,7 @@ fn process_file_include_node(
     injected_includes: &mut JsonMap<String, JsonValue>,
     overrides: &HashMap<PathBuf, String>,
     file_stack: &mut HashSet<PathBuf>,
+    mode: FileIncludeMode,
 ) -> Result<JsonValue, String> {
     match node {
         JsonValue::Array(items) => Ok(JsonValue::Array(items.clone())),
@@ -2899,6 +2951,7 @@ fn process_file_include_node(
                         injected_includes,
                         overrides,
                         file_stack,
+                        mode,
                     )?;
                     let mut include_payload =
                         as_obj(&loaded_processed).cloned().unwrap_or_default();
@@ -2928,11 +2981,24 @@ fn process_file_include_node(
                             injected_includes,
                             overrides,
                             file_stack,
+                            mode,
                         )?;
                         if let Some(processed_map) = as_obj(&loaded_processed).cloned() {
-                            injected_includes
-                                .insert(include_name.clone(), JsonValue::Object(processed_map));
-                            include_names.push(include_name);
+                            match mode {
+                                FileIncludeMode::AsIncludeProfile => {
+                                    injected_includes.insert(
+                                        include_name.clone(),
+                                        JsonValue::Object(processed_map),
+                                    );
+                                    include_names.push(include_name);
+                                }
+                                // Same precedence the include would have given
+                                // it: the file underneath, the node's own
+                                // values on top.
+                                FileIncludeMode::MergedInPlace => {
+                                    current = merge_maps(&processed_map, &current);
+                                }
+                            }
                         }
                     }
                 }
@@ -2966,6 +3032,7 @@ fn process_file_include_node(
                             injected_includes,
                             overrides,
                             file_stack,
+                            mode,
                         )?,
                     );
                     continue;

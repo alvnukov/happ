@@ -79,8 +79,10 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                 },
                 "apply_includes": {
                     "type": "boolean",
-                    "description": "For op='resolve': expand include profiles (default true). \
-                                    False shows the values as literally written.",
+                    "description": "For op='resolve': expand `_include` profiles (default true). \
+                                    False shows the app's values as literally written. Files named \
+                                    by `_include_files` are loaded either way, since that is where \
+                                    a modular chart keeps its apps.",
                 },
                 "apply_env_resolution": {
                     "type": "boolean",
@@ -1770,6 +1772,42 @@ spec:
 ";
         assert!(containers_without_image(manifest).is_empty());
         assert!(describe_containers_without_image(manifest).is_empty());
+    }
+
+    /// `_include_files` says where an app is written; `_include` says what it
+    /// inherits. Asking not to expand the second used to skip the first too,
+    /// so a modular chart answered "no such app" for an app plainly in it.
+    #[test]
+    fn an_app_in_an_included_file_survives_apply_includes_false() {
+        let chart = chart_fixture();
+        std::fs::create_dir_all(chart.path().join("values/services")).expect("mkdir");
+        std::fs::write(
+            chart.path().join("values/services/api2.yaml"),
+            "apps-stateless:\n  api2:\n    _include: [ \"shared\" ]\n    replicas: 3\n",
+        )
+        .expect("write service");
+        std::fs::write(
+            chart.path().join("values.yaml"),
+            "global:\n  env: dev\n  _includes:\n    shared:\n      enabled: true\n\
+             apps-stateless:\n  api:\n    enabled: true\n_include_files:\n- values/services/api2.yaml\n",
+        )
+        .expect("write values");
+
+        let literal = run(
+            &context(),
+            json!({
+                "op": "resolve",
+                "chart": chart_arg(&chart),
+                "group": "apps-stateless",
+                "app": "api2",
+                "apply_includes": false,
+            }),
+        )
+        .expect("the app lives in an included file, so it must resolve");
+        assert!(literal.contains('3'), "{literal}");
+        // Not expanding profiles is still what was asked for: the `_include`
+        // reference stays, and what it would have brought in does not appear.
+        assert!(literal.contains("shared"), "{literal}");
     }
 
     #[test]
