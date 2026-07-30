@@ -13,9 +13,9 @@ use lsp_types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
-use serde_yaml::{Mapping as YamlMapping, Number as YamlNumber, Value as YamlValue};
+use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -228,8 +228,6 @@ struct HappPreviewThemeSyntax {
 struct ResolvedEntityContext {
     root: JsonValue,
     entity: JsonValue,
-    global: JsonValue,
-    apply_includes: bool,
     default_env: String,
     used_env: String,
     env_discovery: EnvironmentDiscovery,
@@ -715,13 +713,10 @@ fn resolve_entity_context(
     )?;
 
     let entity = read_entity(&resolved.root, &group, &app)?;
-    let global = read_global(&resolved.root);
 
     Ok(ResolvedEntityContext {
         root: resolved.root,
         entity,
-        global,
-        apply_includes,
         default_env: resolved.default_env,
         used_env: resolved.used_env,
         env_discovery: resolved.env_discovery,
@@ -1174,7 +1169,7 @@ fn build_manifest_backend_args(
     ];
 
     let normalized_env = env.trim();
-    let mut with_env = |mut args: Vec<String>| {
+    let with_env = |mut args: Vec<String>| {
         if !normalized_env.is_empty() {
             args.push("--set-string".to_string());
             args.push(format!("global.env={normalized_env}"));
@@ -1292,17 +1287,6 @@ fn read_entity(values: &JsonValue, group: &str, app: &str) -> Result<JsonValue, 
         .and_then(as_obj)
         .ok_or_else(|| format!("app not found at {group}.{app}"))?;
     Ok(JsonValue::Object(app_map.clone()))
-}
-
-fn read_global(values: &JsonValue) -> JsonValue {
-    let root = match as_obj(values) {
-        Some(v) => v,
-        None => return JsonValue::Object(JsonMap::new()),
-    };
-    root.get("global")
-        .and_then(as_obj)
-        .map(|m| JsonValue::Object(m.clone()))
-        .unwrap_or_else(|| JsonValue::Object(JsonMap::new()))
 }
 
 fn normalize_include_fields_yaml(value: &mut YamlValue) {
@@ -2316,19 +2300,6 @@ fn is_werf_secret_values_file(path: &Path) -> bool {
             normalized == "secret-values.yaml" || normalized == "secret-values.yml"
         })
         .unwrap_or(false)
-}
-
-fn expand_values_with_file_includes(
-    values: &JsonMap<String, JsonValue>,
-    include_base_dir: Option<&Path>,
-    overrides: &HashMap<PathBuf, String>,
-) -> Result<JsonMap<String, JsonValue>, String> {
-    expand_values_with_file_includes_as(
-        values,
-        include_base_dir,
-        overrides,
-        FileIncludeMode::AsIncludeProfile,
-    )
 }
 
 fn expand_values_with_file_includes_as(
@@ -3416,6 +3387,15 @@ struct StitchedIncludeNameContext {
 struct StitchedValuesContext {
     include_definitions: Vec<StitchedIncludeDefinition>,
     include_usages: Vec<StitchedIncludeUsage>,
+    entity_definitions: Vec<StitchedEntityDefinition>,
+}
+
+/// Where an app itself is written, as opposed to a profile it includes.
+#[derive(Debug, Clone)]
+struct StitchedEntityDefinition {
+    app: String,
+    source_file: PathBuf,
+    source_line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -3482,6 +3462,49 @@ fn build_stitched_values_context(uri: &Uri, text: &str) -> StitchedValuesContext
     context
 }
 
+/// The apps a document writes down, as `(group, app, line)`.
+///
+/// Only the level immediately under an `apps-*` key counts: below that are the
+/// app's own values, and a chart is free to have an app with a value named
+/// after another app.
+fn collect_entity_definitions(lines: &[&str]) -> Vec<(String, String, usize)> {
+    let blocked = block_scalar_content_lines(lines);
+    let mut out = Vec::new();
+    let mut group: Option<(usize, String)> = None;
+    let mut app_indent: Option<usize> = None;
+
+    for (index, line) in lines.iter().enumerate() {
+        if blocked.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some((indent, key, _value)) = parse_key_line(line) else {
+            continue;
+        };
+        if group
+            .as_ref()
+            .is_some_and(|(group_indent, _)| indent <= *group_indent)
+        {
+            group = None;
+            app_indent = None;
+        }
+        let Some((group_indent, group_name)) = group.as_ref() else {
+            if key.starts_with("apps-") {
+                group = Some((indent, key.to_string()));
+                app_indent = None;
+            }
+            continue;
+        };
+        if indent <= *group_indent {
+            continue;
+        }
+        let level = *app_indent.get_or_insert(indent);
+        if indent == level {
+            out.push((group_name.clone(), key.to_string(), index));
+        }
+    }
+    out
+}
+
 fn collect_stitched_data_from_text(
     text: &str,
     source_path: &Path,
@@ -3509,6 +3532,14 @@ fn collect_stitched_data_from_text(
             name: def.name,
             source_file: source_path.to_path_buf(),
             source_line: def.line,
+        });
+    }
+
+    for (_group, app, line) in collect_entity_definitions(&lines) {
+        context.entity_definitions.push(StitchedEntityDefinition {
+            app,
+            source_file: source_path.to_path_buf(),
+            source_line: line,
         });
     }
 
@@ -4754,7 +4785,12 @@ pub(crate) fn analysis_value_origins(
         let selector = literal_value
             .as_ref()
             .and_then(|value| crate::env_map::app_env_selection(value, &used_env, key));
-        let defined_in = definition_sites.get(&from).cloned();
+        // The app's own layer carries the app's name, which a profile may share.
+        let defined_in = if from == app {
+            definition_sites.get(&entity_site_key(app)).cloned()
+        } else {
+            definition_sites.get(&from).cloned()
+        };
         origins.push(ValueOrigin {
             path: path.clone(),
             from,
@@ -4785,21 +4821,41 @@ fn include_definition_sites(source: &ChartValuesSource) -> HashMap<String, Strin
         return HashMap::new();
     };
     let context = build_stitched_values_context(&uri, &source.text);
+    // Relative to the chart, because that is how a reader refers to the file;
+    // absolute only when it genuinely lies outside.
+    let relative = |path: &Path| -> String {
+        path.strip_prefix(&source.chart_root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
     let mut sites = HashMap::new();
     for definition in context.include_definitions {
-        // Relative to the chart, because that is how a reader refers to the
-        // file; absolute only when it genuinely lies outside.
-        let file = definition
-            .source_file
-            .strip_prefix(&source.chart_root)
-            .unwrap_or(&definition.source_file);
         sites.entry(definition.name).or_insert(format!(
             "{}:{}",
-            file.display(),
+            relative(&definition.source_file),
             definition.source_line + 1
         ));
     }
+    // The app's own layer is labelled with the app's name, and used to be the
+    // one layer with nowhere to go: a reader who wanted to change the value
+    // still had to search 36 files for it. Kept under a key no profile can
+    // collide with, since a chart may well name a profile after an app.
+    for definition in context.entity_definitions {
+        sites
+            .entry(entity_site_key(&definition.app))
+            .or_insert(format!(
+                "{}:{}",
+                relative(&definition.source_file),
+                definition.source_line + 1
+            ));
+    }
     sites
+}
+
+/// Namespaces an app's own definition site away from the profile names.
+fn entity_site_key(app: &str) -> String {
+    format!("app\u{0}{app}")
 }
 
 /// The layers merged together, which is what env selection then reads.
@@ -5430,6 +5486,52 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    /// Only the level immediately under an `apps-*` key is an app. A chart is
+    /// free to give an app a value named after another app, and a block scalar
+    /// is free to contain anything at all.
+    #[test]
+    fn entity_definitions_are_the_level_under_a_group_and_nothing_deeper() {
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  api:
+    enabled: true
+    containers:
+      main:
+        image: x
+  worker:
+    enabled: false
+    hostAliases: |-
+      apps-stateless:
+        not-an-app:
+          enabled: true
+apps-jobs:
+  migrate:
+    enabled: true
+"#;
+        let lines: Vec<&str> = src.split('\n').collect();
+        let found: Vec<(String, String)> = collect_entity_definitions(&lines)
+            .into_iter()
+            .map(|(group, app, _)| (group, app))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("apps-stateless".to_string(), "api".to_string()),
+                ("apps-stateless".to_string(), "worker".to_string()),
+                ("apps-jobs".to_string(), "migrate".to_string()),
+            ]
+        );
+
+        let line = collect_entity_definitions(&lines)
+            .into_iter()
+            .find(|(_, app, _)| app == "worker")
+            .map(|(_, _, line)| line)
+            .expect("worker");
+        assert_eq!(lines.get(line).map(|line| line.trim()), Some("worker:"));
+    }
 
     #[test]
     fn include_analysis_detects_unresolved_and_unused() {

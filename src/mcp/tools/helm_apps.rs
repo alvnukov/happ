@@ -357,7 +357,7 @@ fn resolve_entity(context: &ServerContext, args: &JsonValue) -> Result<String, S
 
     if let Some(values_path) = optional_str(args, "values_path") {
         entity = select_subpath(&entity, &values_path)
-            .ok_or_else(|| format!("no such path inside {group}.{app}: {values_path}"))?;
+            .ok_or_else(|| explain_missing_subpath(&entity, &values_path, &group, &app))?;
     }
 
     Ok(format!(
@@ -1256,6 +1256,67 @@ fn select_subpath(value: &JsonValue, path: &str) -> Option<JsonValue> {
         };
     }
     Some(current.clone())
+}
+
+/// Says where a `values_path` stopped matching, and what was there instead.
+///
+/// A wrong app name has been answered with near misses for a while; a wrong
+/// path was answered with nothing at all, which left `envvars` for `envVars`
+/// costing a round trip that carried no information.
+fn explain_missing_subpath(value: &JsonValue, path: &str, group: &str, app: &str) -> String {
+    let mut current = value;
+    let mut walked: Vec<&str> = Vec::new();
+    for segment in path.split('.').filter(|segment| !segment.is_empty()) {
+        let next = match current {
+            JsonValue::Object(map) => map.get(segment),
+            JsonValue::Array(items) => segment
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| items.get(index)),
+            _ => None,
+        };
+        let Some(next) = next else {
+            let where_it_stopped = if walked.is_empty() {
+                format!("{group}.{app}")
+            } else {
+                format!("{group}.{app}.{}", walked.join("."))
+            };
+            let available = match current {
+                JsonValue::Object(map) => {
+                    let keys: Vec<String> = map.keys().cloned().collect();
+                    let near = nearest_by_name(&keys, segment);
+                    if keys.len() <= NEAR_MISS_LIMIT {
+                        format!(" It holds: {}.", keys.join(", "))
+                    } else {
+                        format!(" Closest of its {} keys: {}.", keys.len(), near.join(", "))
+                    }
+                }
+                JsonValue::Array(items) => format!(" It is a list of {}.", items.len()),
+                other => format!(" It is not a map but {other}."),
+            };
+            return format!(
+                "no such path inside {group}.{app}: {path}\n'{segment}' is not in \
+                 {where_it_stopped}.{available}"
+            );
+        };
+        walked.push(segment);
+        current = next;
+    }
+    format!("no such path inside {group}.{app}: {path}")
+}
+
+/// The names closest to the one that missed, by edit distance.
+fn nearest_by_name(known: &[String], wanted: &str) -> Vec<String> {
+    let mut scored: Vec<(usize, &String)> = known
+        .iter()
+        .map(|name| (edit_distance(name, wanted), name))
+        .collect();
+    scored.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+    scored
+        .into_iter()
+        .take(NEAR_MISS_LIMIT)
+        .map(|(_, name)| name.clone())
+        .collect()
 }
 
 /// Renders a diffed value on one line, since the report is line-oriented.
@@ -2259,6 +2320,41 @@ apps-stateless:
             "ap",
         );
         assert!(missed.contains("This chart has no"), "{missed}");
+    }
+
+    /// A wrong app name has been answered with near misses for a while. A
+    /// wrong path was answered with nothing, so `envvars` for `envVars` cost a
+    /// round trip that carried no information back.
+    #[test]
+    fn a_values_path_that_missed_names_the_keys_that_were_there() {
+        let entity = json!({
+            "enabled": true,
+            "containers": { "main": { "envVars": { "PORT": 8080 }, "image": "x" } }
+        });
+
+        let deep =
+            explain_missing_subpath(&entity, "containers.main.envvars", "apps-stateless", "api");
+        assert!(
+            deep.contains("'envvars' is not in apps-stateless.api.containers.main"),
+            "{deep}"
+        );
+        assert!(deep.contains("envVars"), "{deep}");
+
+        let top = explain_missing_subpath(&entity, "replicaz", "apps-stateless", "api");
+        assert!(
+            top.contains("'replicaz' is not in apps-stateless.api."),
+            "{top}"
+        );
+        assert!(top.contains("enabled"), "{top}");
+
+        // Stopping on a scalar is a different mistake and reads differently.
+        let through_scalar = explain_missing_subpath(
+            &entity,
+            "containers.main.image.name",
+            "apps-stateless",
+            "api",
+        );
+        assert!(through_scalar.contains("not a map"), "{through_scalar}");
     }
 
     #[test]
