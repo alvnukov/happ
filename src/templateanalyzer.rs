@@ -291,47 +291,40 @@ pub fn collect_values_paths_in_template(src: &str) -> Vec<Vec<String>> {
 pub fn extract_define_blocks(src: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut stack: Vec<TemplateBlockFrame> = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < src.len() {
-        let Some(slice) = src.get(cursor..) else {
-            break;
+
+    // Scanned the way Go scans, because a template helper may carry the
+    // delimiters inside a string literal -- `contains "{{" $value` is real
+    // helm-apps code. Searching for the next `}}` ends the action inside that
+    // literal and then reads the rest of it as further actions, which is how
+    // `fl._renderValue` used to come back one `end` short and unparseable.
+    let (spans, _errors) = scan_go_template_actions(src);
+    for span in spans {
+        let Some(action) = src
+            .get(span.start..span.end)
+            .and_then(|raw| raw.strip_prefix("{{"))
+            .and_then(|raw| raw.strip_suffix("}}"))
+            .map(str::trim)
+        else {
+            continue;
         };
-        let Some(open_rel) = slice.find("{{") else {
-            break;
-        };
-        let open = cursor + open_rel;
-        let action_start = open + 2;
-        let Some(close_rel) = src[action_start..].find("}}") else {
-            break;
-        };
-        let close = action_start + close_rel;
-        let full_close = close + 2;
-        let action = src[action_start..close].trim();
-        let token = template_action_token(action);
-        match token.as_str() {
-            "define" => {
-                if let Some(name) = template_define_name(action) {
-                    stack.push(TemplateBlockFrame::Define { name, start: open });
-                } else {
-                    stack.push(TemplateBlockFrame::Other);
-                }
-            }
+        match template_action_token(action).as_str() {
+            "define" => match template_define_name(action) {
+                Some(name) => stack.push(TemplateBlockFrame::Define {
+                    name,
+                    start: span.start,
+                }),
+                None => stack.push(TemplateBlockFrame::Other),
+            },
             "if" | "range" | "with" | "block" => stack.push(TemplateBlockFrame::Other),
             "end" => {
-                let Some(frame) = stack.pop() else {
-                    cursor = full_close;
-                    continue;
-                };
-                let TemplateBlockFrame::Define { name, start } = frame else {
-                    cursor = full_close;
+                let Some(TemplateBlockFrame::Define { name, start }) = stack.pop() else {
                     continue;
                 };
                 out.entry(name)
-                    .or_insert_with(|| src[start..full_close].to_string());
+                    .or_insert_with(|| src[start..span.end].to_string());
             }
             _ => {}
         }
-        cursor = full_close;
     }
     out
 }
@@ -668,6 +661,36 @@ fn scan_errors_to_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape helm-apps' own `fl._renderValue` has: the delimiters appear
+    /// inside string literals, both as a bare `"{{"` and inside a `printf`
+    /// format that spells out a whole `{{ ... }}` action. Scanning for the next
+    /// `}}` ended the action inside the literal and then read the rest of it as
+    /// real actions, so the block came back one `end` short and would not parse.
+    #[test]
+    fn a_define_survives_delimiters_written_inside_string_literals() {
+        let src = concat!(
+            "{{- define \"fl._renderValue\" }}\n",
+            "  {{- if contains \"{{\" $valAsString }}\n",
+            "    {{- $result = tpl (printf \"%s{{ with $.RelativeScope }}%s{{ end }}%s\" $a $b) $ }}\n",
+            "  {{- end }}\n",
+            "{{- end -}}\n",
+        );
+        let blocks = extract_define_blocks(src);
+        let block = blocks
+            .get("fl._renderValue")
+            .expect("the define must be found");
+        assert!(
+            block.trim_end().ends_with("{{- end -}}"),
+            "the block must reach its own closing end: {block}"
+        );
+        // Re-extracting what was returned yields the same block, which only
+        // holds if the delimiters balance.
+        assert_eq!(
+            extract_define_blocks(block).get("fl._renderValue"),
+            Some(block),
+        );
+    }
 
     #[test]
     fn include_extraction_reads_only_quoted_include_name_without_trailing_context_dot() {
