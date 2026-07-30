@@ -4548,18 +4548,39 @@ impl ChartValuesSource {
     }
 }
 
+/// Expands a leading `~`, which a shell would have done and an API caller cannot.
+///
+/// A model writing the path it read in a README writes `~/src/chart`, and the
+/// bare failure that used to follow cost a round trip to learn that this one
+/// caller has no shell behind it.
+pub(crate) fn expand_home_dir(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let Some(rest) = text.strip_prefix('~') else {
+        return path.to_path_buf();
+    };
+    // `~user` belongs to whoever can look users up; only the bare `~` is ours.
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return path.to_path_buf();
+    }
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return path.to_path_buf();
+    };
+    PathBuf::from(home).join(rest.trim_start_matches('/'))
+}
+
 /// Turns a user-supplied path into the values document analysis starts from.
 ///
 /// Accepts either the chart directory or a values file inside it, because a
 /// caller that only knows "the chart lives here" is the common case, and a
 /// caller pointing at `values-prod.yaml` is the useful exception.
 pub(crate) fn locate_chart_values(path: &Path) -> Result<ChartValuesSource, String> {
+    let path = expand_home_dir(path);
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .map_err(|err| format!("resolve current directory: {err}"))?
-            .join(path)
+            .join(&path)
     };
     if !absolute.exists() {
         return Err(format!("path does not exist: {}", absolute.display()));
@@ -4661,7 +4682,7 @@ pub(crate) fn analysis_value_origins(
     app: &str,
     env: Option<String>,
     values_path: Option<&str>,
-) -> Result<(Vec<ValueOrigin>, String), String> {
+) -> Result<(Vec<ValueOrigin>, String, JsonValue), String> {
     // Unexpanded, so the layers are still separate; env maps left intact so the
     // selector can be reported rather than silently applied.
     let literal = resolve_values_root(
@@ -4750,7 +4771,9 @@ pub(crate) fn analysis_value_origins(
             None => format!("{group}.{app} has no values to explain"),
         });
     }
-    Ok((origins, used_env))
+    let discovery = serde_json::to_value(&literal.env_discovery)
+        .map_err(|err| format!("serialize env discovery: {err}"))?;
+    Ok((origins, used_env, discovery))
 }
 
 /// Where each include profile is written, as `file:line`.
@@ -4909,7 +4932,7 @@ pub(crate) fn analysis_resolved_root(
     env: Option<String>,
     apply_includes: Option<bool>,
     apply_env_resolution: Option<bool>,
-) -> Result<(JsonValue, String), String> {
+) -> Result<(JsonValue, String, JsonValue), String> {
     let resolved = resolve_values_root(
         Some(&source.uri),
         &source.text,
@@ -4918,24 +4941,9 @@ pub(crate) fn analysis_resolved_root(
         apply_env_resolution.unwrap_or(true),
         &source.overrides,
     )?;
-    Ok((resolved.root, resolved.used_env))
-}
-
-/// The env names a chart mentions, split into literals and regex keys.
-pub(crate) fn analysis_environments(
-    source: &ChartValuesSource,
-) -> Result<(JsonValue, String), String> {
-    let resolved = resolve_values_root(
-        Some(&source.uri),
-        &source.text,
-        None,
-        true,
-        false,
-        &source.overrides,
-    )?;
     let discovery = serde_json::to_value(&resolved.env_discovery)
         .map_err(|err| format!("serialize env discovery: {err}"))?;
-    Ok((discovery, resolved.default_env))
+    Ok((resolved.root, resolved.used_env, discovery))
 }
 
 /// The same diagnostics the editor underlines, as plain data.

@@ -361,9 +361,13 @@ fn resolve_entity(context: &ServerContext, args: &JsonValue) -> Result<String, S
     }
 
     Ok(format!(
-        "# {group}.{app} resolved for env '{used_env}'{}\n{}",
+        "# {group}.{app} resolved for env '{used_env}'{}\n{}{}",
         blocking_error_banner(&source),
-        to_yaml(&entity)?
+        to_yaml(&entity)?,
+        unknown_env_notice(
+            &resolved["envDiscovery"],
+            optional_str(args, "env").as_deref()
+        ),
     ))
 }
 
@@ -384,7 +388,7 @@ fn explain_value_origin(context: &ServerContext, args: &JsonValue) -> Result<Str
     let app = required_str(args, "app")?;
     let values_path = optional_str(args, "values_path");
 
-    let (origins, used_env) = crate::lsp::analysis_value_origins(
+    let (origins, used_env, discovery) = crate::lsp::analysis_value_origins(
         &source,
         &group,
         &app,
@@ -421,7 +425,11 @@ fn explain_value_origin(context: &ServerContext, args: &JsonValue) -> Result<Str
             origins.len()
         ));
     }
-    Ok(lines.join("\n"))
+    Ok(format!(
+        "{}{}",
+        lines.join("\n"),
+        unknown_env_notice(&discovery, optional_str(args, "env").as_deref())
+    ))
 }
 
 /// Renders a resolved value on one line, since the point here is the source.
@@ -473,6 +481,7 @@ fn render_entity_manifest(context: &ServerContext, args: &JsonValue) -> Result<S
     // the library then rightly objects to an app that was never configured
     // because it was never meant to run here.
     let asked_env = optional_str(args, "env");
+    let asked_env_for_notice = asked_env.clone();
     let enabled = asked_env
         .clone()
         .or_else(|| chart_default_env(&source))
@@ -522,18 +531,24 @@ fn render_entity_manifest(context: &ServerContext, args: &JsonValue) -> Result<S
     };
 
     let renderer = renderer.as_deref().unwrap_or("fast");
+    // Every renderer is now handed the same values root; what is left between
+    // them is the engine, and the fast one is helm's own, linked in. Saying it
+    // is "an approximation" sent callers to `helm` for a fidelity they already
+    // had, at several times the cost.
     let fidelity = if renderer == "fast" {
-        "\n# The fast renderer runs in-process and is an approximation; \
-         renderer='helm' is authoritative."
+        "\n# The fast renderer runs helm's own engine in-process, on the same values \
+         renderer='helm' would be given; it needs no helm on PATH."
     } else {
         ""
     };
 
     let incomplete = describe_containers_without_image(manifest);
+    let unknown_env =
+        unknown_env_notice(&rendered["envDiscovery"], asked_env_for_notice.as_deref());
 
     Ok(format!(
         "# {group}.{app} rendered for env '{used_env}' by the {renderer} renderer\
-         {disabled_note}{fidelity}{incomplete}\n{manifest}",
+         {disabled_note}{fidelity}{incomplete}{unknown_env}\n{manifest}",
     ))
 }
 
@@ -828,19 +843,76 @@ fn diff_entity_envs(context: &ServerContext, args: &JsonValue) -> Result<String,
 fn query_values(context: &ServerContext, args: &JsonValue) -> Result<String, String> {
     let source = chart_source(context, args)?;
     let query = required_str(args, "query")?;
-    let (root, used_env) =
-        crate::lsp::analysis_resolved_root(&source, optional_str(args, "env"), None, None)?;
+    let asked_env = optional_str(args, "env");
+    let (root, used_env, discovery) =
+        crate::lsp::analysis_resolved_root(&source, asked_env.clone(), None, None)?;
+    let notice = unknown_env_notice(&discovery, asked_env.as_deref());
 
     let results = crate::query::run_query_stream(&query, vec![root])
-        .map_err(|err| format!("query failed: {err}"))?;
+        .map_err(|err| explain_query_failure(&err.to_string(), &query))?;
     if results.is_empty() {
         return Ok(format!(
-            "Query matched nothing in the values resolved for env '{used_env}'."
+            "Query matched nothing in the values resolved for env '{used_env}'.{notice}"
         ));
     }
 
-    crate::query::format_output_json_lines(&results, false, false)
-        .map_err(|err| format!("format query output: {err}"))
+    let output = crate::query::format_output_json_lines(&results, false, false)
+        .map_err(|err| format!("format query output: {err}"))?;
+    Ok(format!("{output}{notice}"))
+}
+
+/// Warns when the environment asked for is one the chart never mentions.
+///
+/// `global.env` is a free-form string, so a misspelt one is not an error: every
+/// env map simply falls through to `_default` and the answer comes back looking
+/// like a real one. happ knows which names the chart writes down, so it can say
+/// so where Helm cannot.
+fn unknown_env_notice(discovery: &JsonValue, asked: Option<&str>) -> String {
+    let Some(asked) = asked.map(str::trim).filter(|env| !env.is_empty()) else {
+        return String::new();
+    };
+    let literals: Vec<&str> = discovery["literals"]
+        .as_array()
+        .map(|names| names.iter().filter_map(JsonValue::as_str).collect())
+        .unwrap_or_default();
+    if literals.is_empty() || literals.contains(&asked) {
+        return String::new();
+    }
+    // A chart may select `prod` through `^prod.*$` and never write it out, so a
+    // regex key anywhere means happ cannot claim the name is unknown.
+    if discovery["regexes"]
+        .as_array()
+        .is_some_and(|patterns| !patterns.is_empty())
+    {
+        return String::new();
+    }
+    format!(
+        "\n# NOTE: this chart never mentions env '{asked}'. It declares: {}.\n\
+         # Every env map fell through to _default, so these are the fallback values.\n",
+        literals.join(", ")
+    )
+}
+
+/// Explains the one jq mistake this contract guarantees.
+///
+/// Every group in a helm-apps chart is named `apps-something`, and jq reads the
+/// hyphen as subtraction: `.apps-stateless` asks for `.apps` minus a function
+/// called `stateless`, and reports `stateless/0 is not defined`, which says
+/// nothing about the dot the caller actually needs.
+fn explain_query_failure(err: &str, query: &str) -> String {
+    let base = format!("query failed: {err}");
+    let bare_group = query.split(['|', '(', ')', '[', ']', ' ']).any(|token| {
+        token
+            .strip_prefix('.')
+            .is_some_and(|name| name.starts_with("apps-"))
+    });
+    if !bare_group {
+        return base;
+    }
+    format!(
+        "{base}\nGroup names contain '-', which jq reads as subtraction. \
+         Quote the key: .[\"apps-stateless\"] rather than .apps-stateless."
+    )
 }
 
 fn library_reference(args: &JsonValue) -> Result<String, String> {
@@ -1067,7 +1139,10 @@ fn explain_missing_entity(
     group: &str,
     app: &str,
 ) -> String {
-    if !err.contains("not found") {
+    // Only the two errors that really are a name that missed. Matching any
+    // "not found" once decorated a werf failure about a file outside the
+    // project with a list of apps, one of which was the app being rendered.
+    if !(err.starts_with("group not found") || err.starts_with("app not found at")) {
         return err;
     }
     let Ok(entities) = crate::lsp::analysis_list_entities(source, None) else {
@@ -1298,7 +1373,7 @@ fn as_json_text_or_value(value: &JsonValue) -> std::borrow::Cow<'_, JsonValue> {
 
 /// Finds a caller-named values file, preferring one relative to the chart.
 fn resolve_values_file(raw: &str, chart_root: &std::path::Path) -> Result<PathBuf, String> {
-    let given = PathBuf::from(raw);
+    let given = crate::lsp::expand_home_dir(std::path::Path::new(raw));
     if given.is_absolute() {
         return Ok(given);
     }
@@ -2150,6 +2225,78 @@ apps-stateless:
             .err()
             .expect("unknown template must fail");
         assert!(err.contains("fl.value"), "{err}");
+    }
+
+    /// Every group in this contract is named `apps-*`, so the one jq mistake a
+    /// caller is guaranteed to make deserves the one hint that fixes it.
+    #[test]
+    fn a_bare_hyphenated_group_in_a_query_earns_the_quoting_hint() {
+        let explained = explain_query_failure("stateless/0 is not defined", ".apps-stateless|keys");
+        assert!(explained.contains("[\"apps-stateless\"]"), "{explained}");
+
+        let unrelated = explain_query_failure("boom", "[.[\"apps-stateless\"]|keys]");
+        assert_eq!(unrelated, "query failed: boom");
+    }
+
+    /// The decoration used to key off any "not found", which caught a werf
+    /// failure about a file outside the project and answered it with a list of
+    /// apps -- one of which was the app being rendered.
+    #[test]
+    fn only_a_name_that_missed_earns_the_app_suggestions() {
+        let chart = chart_fixture();
+        let source = crate::lsp::locate_chart_values(chart.path()).expect("chart source");
+        let unrelated = "werf render failed: the file \"../x.json\" not found in the project \
+                         directory"
+            .to_string();
+        assert_eq!(
+            explain_missing_entity(unrelated.clone(), &source, "apps-stateless", "api"),
+            unrelated
+        );
+        let missed = explain_missing_entity(
+            "app not found at apps-stateless. api".to_string(),
+            &source,
+            "apps-stateless",
+            "ap",
+        );
+        assert!(missed.contains("This chart has no"), "{missed}");
+    }
+
+    #[test]
+    fn an_env_the_chart_never_writes_down_is_called_out() {
+        let discovery = json!({ "literals": ["dc1", "dev"], "regexes": [] });
+        let notice = unknown_env_notice(&discovery, Some("produciton"));
+        assert!(
+            notice.contains("never mentions env 'produciton'"),
+            "{notice}"
+        );
+        assert!(notice.contains("dc1, dev"), "{notice}");
+
+        assert_eq!(unknown_env_notice(&discovery, Some("dc1")), "");
+        assert_eq!(unknown_env_notice(&discovery, None), "");
+        // A chart selecting `prod` through `^prod.*$` writes the name nowhere,
+        // so a regex key anywhere means happ cannot call a name unknown.
+        let with_regex = json!({ "literals": ["dev"], "regexes": ["^prod.*$"] });
+        assert_eq!(unknown_env_notice(&with_regex, Some("prod-eu")), "");
+    }
+
+    /// A caller with no shell behind it writes the path it read in a README.
+    #[test]
+    fn a_leading_tilde_is_expanded_like_a_shell_would() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        assert_eq!(
+            crate::lsp::expand_home_dir(std::path::Path::new("~/chart")),
+            std::path::PathBuf::from(&home).join("chart")
+        );
+        // `~user` is somebody else's lookup, and a bare path is already fine.
+        for untouched in ["~other/chart", "/abs/chart", "rel/chart"] {
+            assert_eq!(
+                crate::lsp::expand_home_dir(std::path::Path::new(untouched)),
+                std::path::PathBuf::from(untouched)
+            );
+        }
     }
 
     /// helm-apps ranges over `_include`, so the scalar form fails the render
