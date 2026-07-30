@@ -344,6 +344,7 @@ takes the values the deployment layers on top:
 | `values_files` | extra values files, in order, the way `helm -f` does. Relative paths resolve against the chart directory. |
 | `set` | overrides by dotted path, the way `helm --set` does — `global.vars.HOST`, `hosts[0].name`, `config\.yaml` for a dot inside a key. Applied after `values_files`. |
 | `set_string` | the same, but every value stays a string. |
+| `set_file` | values read from files, the way `helm --set-file` does — for anything with newlines in it, such as a CA bundle. |
 
 They are applied before `_include` and `_includeFile` expansion, which is where
 Helm applies them too, so `resolve`, `lint` and `query` describe the same chart
@@ -370,8 +371,13 @@ next call can ask for one instead of buying the whole thing again.
 `op=origin` answers the question `op=resolve` leaves open. On a chart whose
 apps inherit through several `_include` profiles, knowing what a value is
 settles far less than knowing which profile set it: the answer names the
-profile, the chain it was reached through, the file and line it is written on,
-and the env-map key that was selected. Narrow it with `values_path`.
+profile, the chain it was reached through, the env-map key that was selected,
+and — once at the top, for each layer — the file and line it is written on.
+Narrow it with `values_path`.
+
+`op=contract` with `name=functions` takes a `query` that keeps only the
+functions whose name contains it, since the whole list is 14 KB and a question
+is usually about one family.
 
 `op=lint` checks the chart against the library contract, including mistakes that
 otherwise surface only as an unreadable Go template trace:

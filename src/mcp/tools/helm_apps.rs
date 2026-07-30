@@ -65,7 +65,10 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                 "query": {
                     "type": "string",
                     "description": "For op='query': a jq expression over the resolved values root, \
-                                    e.g. '[.[\"apps-stateless\"] | to_entries[] | select(.value.enabled) | .key]'.",
+                                    e.g. '[.[\"apps-stateless\"] | to_entries[] | select(.value.enabled) | .key]'. \
+                                    Group names contain '-', which jq reads as subtraction, so quote \
+                                    them: .[\"apps-stateless\"]. For op='contract' with name='functions': \
+                                    keep only functions whose name contains this.",
                 },
                 "name": {
                     "type": "string",
@@ -97,6 +100,12 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                     "description": "For op='render': 'fast' (default) links helm's own engine and \
                                     needs no tooling on PATH; 'helm' and 'werf' shell out to the \
                                     real binaries. All three are given the same values.",
+                },
+                "set_file": {
+                    "type": "object",
+                    "description": "Values read from files, the way `helm --set-file` does: keys \
+                                    are dotted paths, values are file paths. For anything with \
+                                    newlines in it, such as a CA bundle.",
                 },
                 "kind": {
                     "type": "string",
@@ -270,7 +279,7 @@ fn chart_overview(context: &ServerContext, args: &JsonValue) -> Result<String, S
     let mut out = to_yaml(&report)?;
     out.push_str(&format!(
         "\n# Values are resolved for env '{}'; pass env= to see another.\n\
-         # op='apps' for exact names, op='lint' for the {} violations above.\n",
+         # Every app is listed above; op='lint' explains the {} violations.\n",
         entities["usedEnv"].as_str().unwrap_or_default(),
         diagnostics.len(),
     ));
@@ -1099,14 +1108,33 @@ fn library_reference(args: &JsonValue) -> Result<String, String> {
     }
 
     if matches!(topic.as_str(), "all" | "functions") {
-        let mut lines = vec![
-            "## Template functions the library defines".to_string(),
-            String::new(),
-            "Callable as `{{ include \"<name>\" (list $ ...) }}`.".to_string(),
-            String::new(),
-        ];
-        for (name, origin) in library_defined_templates() {
-            let arity = crate::lsp::library_include_signature(&name)
+        // 135 functions is 14 KB, and a caller after `fl.value` was paying for
+        // all of them. `query` is a plain substring: a reader who knows the
+        // prefix wants that family, and one who knows nothing still gets the
+        // whole list by leaving it out.
+        let wanted = optional_str(args, "query").map(|query| query.to_lowercase());
+        let matching: Vec<(String, String)> = library_defined_templates()
+            .into_iter()
+            .filter(|(name, _)| {
+                wanted
+                    .as_ref()
+                    .is_none_or(|query| name.to_lowercase().contains(query))
+            })
+            .collect();
+
+        let mut lines = vec!["## Template functions the library defines".to_string()];
+        if let Some(query) = &wanted {
+            lines.push(format!(
+                "\n{} of {} match '{query}'.",
+                matching.len(),
+                library_defined_templates().len()
+            ));
+        }
+        lines.push(String::new());
+        lines.push("Callable as `{{ include \"<name>\" (list $ ...) }}`.".to_string());
+        lines.push(String::new());
+        for (name, origin) in &matching {
+            let arity = crate::lsp::library_include_signature(name)
                 .map(|(min, max)| match max {
                     Some(max) if max == min => format!(" -- takes {min} args"),
                     Some(max) => format!(" -- takes {min}..{max} args"),
@@ -1114,6 +1142,9 @@ fn library_reference(args: &JsonValue) -> Result<String, String> {
                 })
                 .unwrap_or_default();
             lines.push(format!("- `{name}`{arity}  (happ://helm-apps/{origin})"));
+        }
+        if matching.is_empty() {
+            lines.push("Nothing matched. Leave 'query' out for the whole list.".to_string());
         }
         sections.push(lines.join("\n"));
     }
@@ -1157,7 +1188,12 @@ fn library_reference(args: &JsonValue) -> Result<String, String> {
 /// The source of one library template, addressed either by the `define` name a
 /// chart calls or by its path in the chart.
 fn library_template(args: &JsonValue) -> Result<String, String> {
-    let name = required_str(args, "name")?;
+    // Every answer here prints the file as `happ://helm-apps/<path>`, and that
+    // is the string a reader copies back. Refusing the identifier the tool
+    // itself hands out is a round trip spent on punctuation.
+    let name = required_str(args, "name")?
+        .trim_start_matches("happ://helm-apps/")
+        .to_string();
 
     if let Some(source) = crate::assets::embedded_helm_apps_file(&name) {
         return Ok(format!("# happ://helm-apps/{name}\n{source}"));
@@ -1563,6 +1599,26 @@ fn value_overrides(
                 };
                 overrides.set.push((path.clone(), typed));
             }
+        }
+    }
+
+    // `--set-file` is how a deployment passes anything with newlines in it --
+    // this chart's CA bundle arrives that way -- and there is no spelling of
+    // `set` that stands in for it: a path written as a value silently becomes
+    // that literal string.
+    if let Some(value) = args.get("set_file") {
+        let value = as_json_text_or_value(value);
+        let map = value
+            .as_object()
+            .ok_or_else(|| "'set_file' must be an object of path -> file".to_string())?;
+        for (path, raw) in map {
+            let file = raw
+                .as_str()
+                .ok_or_else(|| format!("'set_file' value for '{path}' must be a path"))?;
+            let resolved = resolve_values_file(file, chart_root)?;
+            let contents = std::fs::read_to_string(&resolved)
+                .map_err(|err| format!("read set_file '{}': {err}", resolved.display()))?;
+            overrides.set_string.push((path.clone(), contents));
         }
     }
 
@@ -2440,6 +2496,87 @@ apps-stateless:
         )
         .expect("template");
         assert!(text.contains("version"), "{text}");
+    }
+
+    /// Every answer from this op prints `happ://helm-apps/<path>`, and that is
+    /// the string a reader copies back into the next call.
+    #[test]
+    fn the_uri_the_tool_prints_is_one_it_accepts() {
+        let by_path = run(
+            &context(),
+            json!({ "op": "template", "name": "templates/fl-functions/_value.tpl" }),
+        )
+        .expect("by path");
+        let by_uri = run(
+            &context(),
+            json!({ "op": "template",
+                    "name": "happ://helm-apps/templates/fl-functions/_value.tpl" }),
+        )
+        .expect("by uri");
+        assert_eq!(by_path, by_uri);
+    }
+
+    /// 135 functions is 14 KB, and a caller after one family was paying for
+    /// every other.
+    #[test]
+    fn the_function_list_can_be_narrowed() {
+        let all = run(&context(), json!({ "op": "contract", "name": "functions" })).expect("all");
+        let some = run(
+            &context(),
+            json!({ "op": "contract", "name": "functions", "query": "fl.value" }),
+        )
+        .expect("some");
+        assert!(
+            some.len() * 4 < all.len(),
+            "{} vs {}",
+            some.len(),
+            all.len()
+        );
+        assert!(some.contains("fl.value"), "{some}");
+        assert!(!some.contains("apps-utils.init-library"), "{some}");
+
+        let none = run(
+            &context(),
+            json!({ "op": "contract", "name": "functions", "query": "no-such-function" }),
+        )
+        .expect("none");
+        assert!(none.contains("Nothing matched"), "{none}");
+    }
+
+    /// A deployment passes anything with newlines in it this way -- the chart
+    /// measured here sends its CA bundle so -- and no spelling of `set` stands
+    /// in: a path written as a value silently becomes that literal string.
+    #[test]
+    fn set_file_reads_the_file_helm_would_have_read() {
+        let chart = chart_fixture();
+        let bundle = chart.path().join("bundle.pem");
+        std::fs::write(&bundle, "-----BEGIN CERTIFICATE-----\nmulti\nline\n").expect("write");
+
+        let text = run(
+            &context(),
+            json!({
+                "op": "query",
+                "chart": chart.path().to_string_lossy(),
+                "query": ".global.trustedCA.bundle",
+                "set_file": { "global.trustedCA.bundle": "bundle.pem" },
+            }),
+        )
+        .expect("query");
+        assert!(text.contains("BEGIN CERTIFICATE"), "{text}");
+        assert!(text.contains("multi"), "{text}");
+
+        let err = run(
+            &context(),
+            json!({
+                "op": "query",
+                "chart": chart.path().to_string_lossy(),
+                "query": ".global",
+                "set_file": { "global.trustedCA.bundle": "absent.pem" },
+            }),
+        )
+        .err()
+        .expect("missing file must fail");
+        assert!(err.contains("absent.pem"), "{err}");
     }
 
     #[test]
