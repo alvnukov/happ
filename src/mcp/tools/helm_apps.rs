@@ -413,6 +413,26 @@ fn explain_value_origin(context: &ServerContext, args: &JsonValue) -> Result<Str
     let mut lines = vec![format!(
         "# where {group}.{app} gets its values, for env '{used_env}'"
     )];
+
+    // Once each, at the top. A layer is written in one place however many
+    // values it supplies, and repeating its file and line under all 192 of
+    // them was a third of the answer spent saying the same thing.
+    let mut sites: Vec<(&str, &str)> = Vec::new();
+    for origin in &origins {
+        let Some(defined_in) = origin.defined_in.as_deref() else {
+            continue;
+        };
+        if !sites.iter().any(|(layer, _)| *layer == origin.from) {
+            sites.push((&origin.from, defined_in));
+        }
+    }
+    if !sites.is_empty() {
+        lines.push("# layers, and where each is written:".to_string());
+        for (layer, defined_in) in &sites {
+            lines.push(format!("#   {layer} -- {defined_in}"));
+        }
+    }
+
     for origin in &origins {
         let mut source_note = origin.from.clone();
         if !origin.via.is_empty() {
@@ -422,9 +442,6 @@ fn explain_value_origin(context: &ServerContext, args: &JsonValue) -> Result<Str
         }
         if let Some(selector) = &origin.selector {
             source_note.push_str(&format!(", env key '{selector}'"));
-        }
-        if let Some(defined_in) = &origin.defined_in {
-            source_note.push_str(&format!("\n    defined at {defined_in}"));
         }
         lines.push(format!(
             "{}: {}\n    from {source_note}",

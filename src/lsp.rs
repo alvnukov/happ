@@ -482,6 +482,7 @@ fn list_entities_request_with_overrides(
 
 /// A values tree brought to the shape the chart actually renders from: file and
 /// profile includes expanded, env maps collapsed for one `global.env`.
+#[derive(Clone)]
 struct ResolvedValuesRoot {
     root: JsonValue,
     default_env: String,
@@ -491,6 +492,109 @@ struct ResolvedValuesRoot {
 
 /// The one place both entity lookups and whole-tree queries go through, so an
 /// MCP caller and the editor never disagree about what a chart resolves to.
+fn parse_values_root_uncached(
+    request_uri: Option<&Uri>,
+    text: &str,
+    apply_includes: bool,
+    value_overrides: &ValueOverrides,
+) -> Result<JsonMap<String, JsonValue>, String> {
+    if apply_includes {
+        return parse_and_expand_values_root(request_uri, text, value_overrides)
+            .ok_or_else(|| "failed to parse values root with include expansion".to_string());
+    }
+    // `_include_files` and `_include` are two different things, and only the
+    // second is what "do not expand includes" means. A modular chart keeps most
+    // of its apps in the files the first names, so skipping those too answered
+    // "no such app" for an app plainly in the chart. Load the files; leave the
+    // profiles unexpanded, which is what was asked for.
+    let (root_map, _) = parse_values_root_with_file_includes_as(
+        request_uri,
+        text,
+        value_overrides,
+        FileIncludeMode::MergedInPlace,
+    )
+    .ok_or_else(|| "failed to parse values root".to_string())?;
+    Ok(root_map)
+}
+
+/// Everything about a request that can change the tree it resolves to.
+#[derive(PartialEq, Eq, Hash)]
+struct ParsedRootKey {
+    chart_root: PathBuf,
+    uri: String,
+    text_hash: u64,
+    overrides_hash: u64,
+    env: Option<String>,
+    apply_includes: bool,
+    apply_env: bool,
+}
+
+struct ParsedRootEntry {
+    fingerprint: Vec<(PathBuf, u64, u64)>,
+    resolved: ResolvedValuesRoot,
+}
+
+const PARSED_ROOT_CACHE_MAX: usize = 8;
+
+#[allow(clippy::type_complexity)]
+fn parsed_root_cache() -> &'static std::sync::Mutex<HashMap<ParsedRootKey, ParsedRootEntry>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<ParsedRootKey, ParsedRootEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn hash_of<T: std::hash::Hash>(value: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Every YAML file in the chart, with the size and mtime it had.
+///
+/// Cheaper than re-reading them -- forty stats against forty parses -- and it
+/// notices the edits a parse would have seen, including a file appearing or
+/// going away.
+fn chart_yaml_fingerprint(chart_root: &Path) -> Vec<(PathBuf, u64, u64)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64, u64)>, depth: usize) {
+        if depth > 12 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                walk(&path, out, depth + 1);
+                continue;
+            }
+            let is_yaml = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension == "yaml" || extension == "yml");
+            if !is_yaml {
+                continue;
+            }
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_nanos() as u64)
+                .unwrap_or_default();
+            out.push((path, modified, metadata.len()));
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(chart_root, &mut out, 0);
+    out.sort();
+    out
+}
+
 fn resolve_values_root(
     uri: Option<&str>,
     text: &str,
@@ -501,25 +605,38 @@ fn resolve_values_root(
 ) -> Result<ResolvedValuesRoot, String> {
     let request_uri = uri.and_then(|value| value.parse::<Uri>().ok());
 
-    let root_map = if apply_includes {
-        parse_and_expand_values_root(request_uri.as_ref(), text, value_overrides)
-            .ok_or_else(|| "failed to parse values root with include expansion".to_string())?
-    } else {
-        // `_include_files` and `_include` are two different things, and only
-        // the second is what "do not expand includes" means. A modular chart
-        // keeps most of its apps in the files the first names, so skipping
-        // those too answered "no such app" for an app plainly in the chart.
-        // Load the files; leave the profiles unexpanded, which is what was
-        // asked for.
-        let (root_map, _) = parse_values_root_with_file_includes_as(
-            request_uri.as_ref(),
-            text,
-            value_overrides,
-            FileIncludeMode::MergedInPlace,
-        )
-        .ok_or_else(|| "failed to parse values root".to_string())?;
-        root_map
-    };
+    // A chart of forty files costs about 240ms to read, expand and collapse,
+    // and that is nearly all of what an answer costs -- the same chart written
+    // as one file costs 6ms. A session asks a dozen questions about one chart,
+    // and every question after the first was paying again for work whose inputs
+    // had not moved. Kept against the modification times of the chart's own
+    // YAML, so an edit anywhere in it is a miss.
+    let chart_root = uri
+        .and_then(file_path_from_uri_string)
+        .and_then(|path| find_chart_root_from_path(&path));
+    let key = chart_root.as_ref().map(|chart_root| ParsedRootKey {
+        chart_root: chart_root.clone(),
+        uri: uri.unwrap_or_default().to_string(),
+        text_hash: hash_of(&text),
+        overrides_hash: hash_of(&format!("{value_overrides:?}")),
+        env: env.clone(),
+        apply_includes,
+        apply_env,
+    });
+    let fingerprint = chart_root.as_deref().map(chart_yaml_fingerprint);
+
+    if let (Some(key), Some(fingerprint)) = (key.as_ref(), fingerprint.as_ref()) {
+        if let Ok(cache) = parsed_root_cache().lock() {
+            if let Some(entry) = cache.get(key) {
+                if &entry.fingerprint == fingerprint {
+                    return Ok(entry.resolved.clone());
+                }
+            }
+        }
+    }
+
+    let root_map =
+        parse_values_root_uncached(request_uri.as_ref(), text, apply_includes, value_overrides)?;
 
     let expanded = JsonValue::Object(root_map);
     let env_discovery = discover_environments(&expanded);
@@ -531,12 +648,30 @@ fn resolve_values_root(
         expanded
     };
 
-    Ok(ResolvedValuesRoot {
+    let resolved = ResolvedValuesRoot {
         root,
         default_env,
         used_env,
         env_discovery,
-    })
+    };
+
+    if let (Some(key), Some(fingerprint)) = (key, fingerprint) {
+        if let Ok(mut cache) = parsed_root_cache().lock() {
+            // A handful of charts is every chart a session touches; past that,
+            // start over rather than grow without bound.
+            if cache.len() >= PARSED_ROOT_CACHE_MAX {
+                cache.clear();
+            }
+            cache.insert(
+                key,
+                ParsedRootEntry {
+                    fingerprint,
+                    resolved: resolved.clone(),
+                },
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 fn resolve_entity_request(
@@ -7182,6 +7317,65 @@ default-app:
         assert!(diagnostics
             .iter()
             .all(|d| !matches!(d.code, Some(lsp_types::NumberOrString::String(ref c)) if c == "E_TPL_CURRENT_APP_SCOPE")));
+    }
+
+    /// The cache is keyed on the request and validated against the chart's
+    /// files, so an edit to a file the request never names still has to be a
+    /// miss -- otherwise a session goes on answering from a chart that moved.
+    #[test]
+    fn a_cached_root_is_dropped_when_an_included_file_changes() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: test-chart\nversion: 0.1.0\n",
+        )
+        .expect("write chart");
+        let values_path = td.path().join("values.yaml");
+        let values_text = "global:\n  env: dev\n  _includes: {}\n_include_files:\n  - apps.yaml\n";
+        fs::write(&values_path, values_text).expect("write values");
+        let apps_path = td.path().join("apps.yaml");
+        fs::write(
+            &apps_path,
+            "apps-stateless:\n  api:\n    enabled: true\n    replicas: 1\n",
+        )
+        .expect("write apps");
+
+        let uri = format!("file://{}", values_path.to_string_lossy());
+        let replicas = || -> JsonValue {
+            resolve_values_root(
+                Some(&uri),
+                values_text,
+                None,
+                true,
+                true,
+                &ValueOverrides::default(),
+            )
+            .expect("resolve")
+            .root["apps-stateless"]["api"]["replicas"]
+                .clone()
+        };
+
+        assert_eq!(replicas(), json!(1));
+        assert_eq!(replicas(), json!(1), "the second call is the cached one");
+
+        fs::write(
+            &apps_path,
+            "apps-stateless:\n  api:\n    enabled: true\n    replicas: 4\n",
+        )
+        .expect("rewrite apps");
+        // Same size, so only the modification time tells the two apart; give
+        // the clock somewhere to move on filesystems with coarse timestamps.
+        let touched = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+        let _ = filetime_set(&apps_path, touched);
+
+        assert_eq!(replicas(), json!(4));
+    }
+
+    /// Sets a modification time far enough ahead that a coarse filesystem clock
+    /// still reports it as different.
+    fn filetime_set(path: &Path, when: std::time::SystemTime) -> std::io::Result<()> {
+        let file = fs::OpenOptions::new().write(true).open(path)?;
+        file.set_modified(when)
     }
 
     #[test]
