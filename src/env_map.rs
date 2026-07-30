@@ -10,12 +10,22 @@
 //! 2. a regex key, anchored to the whole env name;
 //! 3. `_default`.
 //!
-//! Two responsibilities are deliberately kept apart. *Detecting* that a map is
-//! an env map at all is happ-specific guesswork — the chart knows it from the
-//! call site, happ has to infer it from the key shapes, which is what
-//! [`looks_like_regex_pattern`] is for. *Selecting* inside a map that already
-//! looks like an env map follows the chart literally: every key is a regex
-//! there, so `a.c` matches env `abc` the same way it does under Helm.
+//! Two responsibilities are deliberately kept apart.
+//!
+//! *Detecting* that a map is an env map follows the chart wherever the chart
+//! states it. The library decides by call site, not by shape: every map handed
+//! to "fl.value" is resolved by environment, and one that names no value for
+//! the current env renders as empty. [`env_selected_value_keys`] reads those
+//! call sites out of the embedded chart, so an app value such as
+//! `priorityClassName: {dc1: ...}` resolves even though it carries neither
+//! `_default` nor a regex key. Outside an app the library reads values
+//! directly — `global.labels.addEnv` is not a "fl.value" site — so there happ
+//! falls back to inferring from key shapes, which is what
+//! [`looks_like_regex_pattern`] is for.
+//!
+//! *Selecting* inside a map that is an env map follows the chart literally:
+//! every key is a regex there, so `a.c` matches env `abc` the same way it does
+//! under Helm.
 
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -117,33 +127,134 @@ pub(crate) fn global_env(values: &JsonValue) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// Replaces every env map in the tree with the value selected for `env`.
-pub(crate) fn resolve_env_maps(value: &JsonValue, env: &str) -> JsonValue {
-    match value {
-        JsonValue::Array(items) => JsonValue::Array(
-            items
-                .iter()
-                .map(|item| resolve_env_maps(item, env))
-                .collect(),
-        ),
-        JsonValue::Object(map) => {
-            if looks_like_env_map(map) {
-                let selected = select_env_value(map, env);
-                // `select_env_value` hands the map back untouched when nothing
-                // matched and there is no `_default`; recursing on that would
-                // never terminate, so descend into its entries instead.
-                if selected != JsonValue::Object(map.clone()) {
-                    return resolve_env_maps(&selected, env);
+/// Where in the values tree a value sits, which decides whether the `fl.value`
+/// contract applies to it or whether happ has to fall back on key shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Chart-level keys such as `global`, which the library reads directly.
+    Outside,
+    /// A top-level `apps-*` group; its children are app names.
+    Group,
+    /// One app; its children are the app's value keys.
+    AppRoot,
+    /// An app value, where the key names a `fl.value` site.
+    AppValue,
+}
+
+impl Scope {
+    /// The scope a child key falls into.
+    ///
+    /// An app's own name is not a value key -- a chart may well have an app
+    /// called `labels` -- so a group's children step through [`Scope::AppRoot`]
+    /// before anything counts as a value.
+    fn enter(self, key: &str) -> Self {
+        match self {
+            Scope::Outside if key.starts_with("apps-") => Scope::Group,
+            Scope::Outside => Scope::Outside,
+            Scope::Group => Scope::AppRoot,
+            Scope::AppRoot | Scope::AppValue => Scope::AppValue,
+        }
+    }
+}
+
+/// Value keys the library hands to `fl.value`, so that whatever sits there is
+/// resolved by environment no matter how its keys are written.
+///
+/// Read out of the embedded chart rather than listed here, so the set always
+/// describes the library version this binary ships. A plain map at one of these
+/// keys renders as nothing under Helm -- `fl._renderValue` emits only scalars --
+/// which is why every map at such a key can be read as an env map.
+fn env_selected_value_keys() -> &'static HashSet<String> {
+    static KEYS: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let Ok(call) = regex::Regex::new(
+            r#"include\s+"fl\.value(?:Quoted|SingleQuoted)?"\s+\(list\s+\$\s+\S+\s+\.([A-Za-z0-9_.]+)\)"#,
+        ) else {
+            return HashSet::new();
+        };
+        let mut keys = HashSet::new();
+        for path in crate::assets::embedded_helm_apps_paths() {
+            if !path.ends_with(".tpl") {
+                continue;
+            }
+            let Some(source) = crate::assets::embedded_helm_apps_file(&path) else {
+                continue;
+            };
+            for captures in call.captures_iter(source) {
+                // `.storage.size` puts the env map at `size`, so only the last
+                // segment names the key an env map can be found under.
+                let Some(last) = captures[1].rsplit('.').next() else {
+                    continue;
+                };
+                if !last.is_empty() {
+                    keys.insert(last.to_string());
                 }
             }
-            let mut out = JsonMap::new();
-            for (key, child) in map {
-                out.insert(key.clone(), resolve_env_maps(child, env));
-            }
-            JsonValue::Object(out)
         }
-        _ => value.clone(),
+        keys
+    })
+}
+
+/// Replaces every env map in the tree with the value selected for `env`.
+pub(crate) fn resolve_env_maps(value: &JsonValue, env: &str) -> JsonValue {
+    resolve_env_maps_at(value, env, None, Scope::Outside).unwrap_or(JsonValue::Null)
+}
+
+/// Resolves one value, knowing the key it sits under and where it sits.
+///
+/// `None` means the library renders nothing here, so the caller drops the key
+/// entirely -- an app that names no value for the current env has no such
+/// field, rather than a field holding the unresolved branches.
+fn resolve_env_maps_at(
+    value: &JsonValue,
+    env: &str,
+    key: Option<&str>,
+    scope: Scope,
+) -> Option<JsonValue> {
+    match value {
+        JsonValue::Array(items) => Some(JsonValue::Array(
+            items
+                .iter()
+                .filter_map(|item| resolve_env_maps_at(item, env, key, scope))
+                .collect(),
+        )),
+        JsonValue::Object(map) => {
+            if is_env_map(map, key, scope) {
+                return match select_env_value(map, env) {
+                    Some(selected) => resolve_env_maps_at(&selected, env, key, scope),
+                    // A `fl.value` site that matches nothing and has no
+                    // `_default` renders empty, and the field disappears.
+                    None if is_contract_env_site(key, scope) => None,
+                    // Everywhere else happ inferred the env map from key
+                    // shapes alone, so it keeps what it cannot resolve rather
+                    // than delete values it may have misread.
+                    None => Some(value.clone()),
+                };
+            }
+            let mut out = JsonMap::new();
+            for (child_key, child) in map {
+                if let Some(resolved) =
+                    resolve_env_maps_at(child, env, Some(child_key), scope.enter(child_key))
+                {
+                    out.insert(child_key.clone(), resolved);
+                }
+            }
+            Some(JsonValue::Object(out))
+        }
+        _ => Some(value.clone()),
     }
+}
+
+/// Whether `key` names a value the library resolves by environment, at a place
+/// in the tree where the library is the one reading it.
+fn is_contract_env_site(key: Option<&str>, scope: Scope) -> bool {
+    scope == Scope::AppValue && key.is_some_and(|key| env_selected_value_keys().contains(key))
+}
+
+/// Whether a map should be read as an env map, by contract where the library
+/// states one and by key shapes everywhere else.
+fn is_env_map(map: &JsonMap<String, JsonValue>, key: Option<&str>, scope: Scope) -> bool {
+    is_contract_env_site(key, scope) || looks_like_env_map(map)
 }
 
 /// Reports every env map the resolver would traverse whose regex keys are
@@ -154,13 +265,22 @@ pub(crate) fn resolve_env_maps(value: &JsonValue, env: &str) -> JsonValue {
 /// either.
 pub(crate) fn find_ambiguous_env_regexes(value: &JsonValue, env: &str) -> Vec<AmbiguousEnvRegex> {
     let mut found = Vec::new();
-    collect_ambiguous_env_regexes(value, env, &mut Vec::new(), &mut found);
+    collect_ambiguous_env_regexes(
+        value,
+        env,
+        None,
+        Scope::Outside,
+        &mut Vec::new(),
+        &mut found,
+    );
     found
 }
 
 fn collect_ambiguous_env_regexes(
     value: &JsonValue,
     env: &str,
+    key: Option<&str>,
+    scope: Scope,
     path: &mut Vec<String>,
     found: &mut Vec<AmbiguousEnvRegex>,
 ) {
@@ -168,12 +288,12 @@ fn collect_ambiguous_env_regexes(
         JsonValue::Array(items) => {
             for (index, item) in items.iter().enumerate() {
                 path.push(index.to_string());
-                collect_ambiguous_env_regexes(item, env, path, found);
+                collect_ambiguous_env_regexes(item, env, key, scope, path, found);
                 path.pop();
             }
         }
         JsonValue::Object(map) => {
-            if looks_like_env_map(map) {
+            if is_env_map(map, key, scope) {
                 let patterns = matching_env_regexes(map, env);
                 if patterns.len() > 1 {
                     found.push(AmbiguousEnvRegex {
@@ -181,15 +301,26 @@ fn collect_ambiguous_env_regexes(
                         patterns,
                     });
                 }
-                let selected = select_env_value(map, env);
-                if selected != JsonValue::Object(map.clone()) {
-                    collect_ambiguous_env_regexes(&selected, env, path, found);
+                if let Some(selected) = select_env_value(map, env) {
+                    collect_ambiguous_env_regexes(&selected, env, key, scope, path, found);
+                    return;
+                }
+                if is_contract_env_site(key, scope) {
+                    // The library renders nothing here, so nothing below can
+                    // reach Helm either.
                     return;
                 }
             }
-            for (key, child) in map {
-                path.push(key.clone());
-                collect_ambiguous_env_regexes(child, env, path, found);
+            for (child_key, child) in map {
+                path.push(child_key.clone());
+                collect_ambiguous_env_regexes(
+                    child,
+                    env,
+                    Some(child_key),
+                    scope.enter(child_key),
+                    path,
+                    found,
+                );
                 path.pop();
             }
         }
@@ -253,11 +384,12 @@ pub(crate) fn matching_env_regexes(map: &JsonMap<String, JsonValue>, env: &str) 
 
 /// Selects the value an env map yields for `env`.
 ///
-/// Returns the map itself when it turned out to hold no value for `env` and no
-/// `_default` — the caller decides whether to treat it as plain values.
-pub(crate) fn select_env_value(map: &JsonMap<String, JsonValue>, env: &str) -> JsonValue {
+/// `None` when the map holds no value for `env` and no `_default`, which under
+/// Helm renders as empty — the caller decides whether that means "drop this
+/// field" or "happ misread a plain map, keep it".
+pub(crate) fn select_env_value(map: &JsonMap<String, JsonValue>, env: &str) -> Option<JsonValue> {
     if let Some(value) = map.get(env) {
-        return value.clone();
+        return Some(value.clone());
     }
     // Several matches are an error under Helm; happ picks the first anchored
     // pattern so callers that only report (the LSP) keep working, while callers
@@ -268,13 +400,10 @@ pub(crate) fn select_env_value(map: &JsonMap<String, JsonValue>, env: &str) -> J
             .find(|(key, _)| anchor_env_regex(key) == *pattern)
             .map(|(_, value)| value)
         {
-            return value.clone();
+            return Some(value.clone());
         }
     }
-    if let Some(value) = map.get(DEFAULT_ENV_KEY) {
-        return value.clone();
-    }
-    JsonValue::Object(map.clone())
+    map.get(DEFAULT_ENV_KEY).cloned()
 }
 
 fn walk_maps(value: &JsonValue, on_map: &mut dyn FnMut(&JsonMap<String, JsonValue>)) {
@@ -316,27 +445,27 @@ mod tests {
         // Verified against helm-apps 1.9.0: `helm template` renders 1 here,
         // because `(dev|stage)` is anchored to `^(dev|stage)$`.
         let map = map_of(json!({"_default": 1, "(dev|stage)": 7}));
-        assert_eq!(select_env_value(&map, "stage-eu"), json!(1));
-        assert_eq!(select_env_value(&map, "stage"), json!(7));
+        assert_eq!(select_env_value(&map, "stage-eu"), Some(json!(1)));
+        assert_eq!(select_env_value(&map, "stage"), Some(json!(7)));
     }
 
     #[test]
     fn exact_key_wins_over_a_matching_regex() {
         let map = map_of(json!({"_default": 1, "^prod.*$": 2, "prod": 3}));
-        assert_eq!(select_env_value(&map, "prod"), json!(3));
-        assert_eq!(select_env_value(&map, "prod-eu"), json!(2));
+        assert_eq!(select_env_value(&map, "prod"), Some(json!(3)));
+        assert_eq!(select_env_value(&map, "prod-eu"), Some(json!(2)));
     }
 
     #[test]
     fn default_is_the_last_resort() {
         let map = map_of(json!({"_default": 1, "^prod.*$": 2}));
-        assert_eq!(select_env_value(&map, "dev"), json!(1));
+        assert_eq!(select_env_value(&map, "dev"), Some(json!(1)));
     }
 
     #[test]
-    fn map_without_any_match_is_returned_untouched() {
+    fn map_without_any_match_selects_nothing() {
         let map = map_of(json!({"^prod.*$": 2}));
-        assert_eq!(select_env_value(&map, "dev"), json!({"^prod.*$": 2}));
+        assert_eq!(select_env_value(&map, "dev"), None);
     }
 
     #[test]
@@ -344,7 +473,7 @@ mod tests {
         // The chart treats every key of an env map as a regex; the shape
         // heuristic only decides whether the map is an env map at all.
         let map = map_of(json!({"_default": 1, "a.c": 2}));
-        assert_eq!(select_env_value(&map, "abc"), json!(2));
+        assert_eq!(select_env_value(&map, "abc"), Some(json!(2)));
     }
 
     #[test]
@@ -360,14 +489,14 @@ mod tests {
     fn exact_key_suppresses_the_ambiguity_report() {
         let map = map_of(json!({"stage-eu": 9, "^stage-.*$": 2, ".*-eu": 3}));
         assert!(matching_env_regexes(&map, "stage-eu").is_empty());
-        assert_eq!(select_env_value(&map, "stage-eu"), json!(9));
+        assert_eq!(select_env_value(&map, "stage-eu"), Some(json!(9)));
     }
 
     #[test]
     fn empty_env_never_matches_a_regex() {
         let map = map_of(json!({"_default": 1, "^.*$": 2}));
         assert!(matching_env_regexes(&map, "").is_empty());
-        assert_eq!(select_env_value(&map, ""), json!(1));
+        assert_eq!(select_env_value(&map, ""), Some(json!(1)));
     }
 
     #[test]
@@ -440,6 +569,61 @@ mod tests {
         assert_eq!(
             resolve_env_maps(&values, "dev"),
             json!({"ports": {"^prod.*$": 8080}}),
+        );
+    }
+
+    /// The library derives this set from its own templates, so at minimum the
+    /// keys the reported chart tripped over have to be in it.
+    #[test]
+    fn env_selected_keys_come_from_the_embedded_chart() {
+        let keys = env_selected_value_keys();
+        for key in ["priorityClassName", "replicas", "annotations", "labels"] {
+            assert!(keys.contains(key), "{key} missing from {keys:?}");
+        }
+        // `.storage.size` names its env map `size`, not `storage.size`.
+        assert!(keys.contains("size"), "{keys:?}");
+        assert!(!keys.contains("storage.size"), "{keys:?}");
+    }
+
+    /// `priorityClassName: {dc1: ...}` has neither `_default` nor a
+    /// regex-shaped key, so the shape heuristic read it as plain values while
+    /// both renderers resolved it. The library decides by call site, not shape.
+    #[test]
+    fn a_literal_only_env_map_resolves_at_a_library_value_site() {
+        let values = json!({
+            "apps-stateless": {"api": {"priorityClassName": {"dc1": "production-medium"}}},
+        });
+        assert_eq!(
+            resolve_env_maps(&values, "dc1"),
+            json!({"apps-stateless": {"api": {"priorityClassName": "production-medium"}}}),
+        );
+        // No key for `dev` and no `_default`: `fl.value` renders empty, so the
+        // field is simply absent -- which is what `helm template` produces.
+        assert_eq!(
+            resolve_env_maps(&values, "dev"),
+            json!({"apps-stateless": {"api": {}}}),
+        );
+    }
+
+    /// The same key outside an app is read by the library directly, never
+    /// through `fl.value`: `global.labels.addEnv` must survive intact.
+    #[test]
+    fn a_library_value_key_outside_an_app_is_left_alone() {
+        let values = json!({"global": {"labels": {"addEnv": "true"}}});
+        assert_eq!(
+            resolve_env_maps(&values, "dc1"),
+            json!({"global": {"labels": {"addEnv": "true"}}}),
+        );
+    }
+
+    /// Only the app's own values are contract sites; the group map holding
+    /// them is not one, whatever the apps are called.
+    #[test]
+    fn an_app_named_like_a_library_value_key_is_not_collapsed() {
+        let values = json!({"apps-stateless": {"labels": {"replicas": 2}}});
+        assert_eq!(
+            resolve_env_maps(&values, "dc1"),
+            json!({"apps-stateless": {"labels": {"replicas": 2}}}),
         );
     }
 
