@@ -369,7 +369,10 @@ otherwise surface only as an unreadable Go template trace:
 rendering, because happ resolves values more leniently than the library renders
 them. `op=render` leads with the cause of a failure rather than the template
 trace, says when an app is disabled for the environment it was asked about, and
-notes that the default `fast` renderer is an in-process approximation.
+notes that the default `fast` renderer is an in-process approximation. It also
+names any container it rendered without an image: helm-apps takes the image from
+werf metadata or from values the deployment supplies, so a render that succeeds
+without them still produces a workload Kubernetes rejects.
 
 `code` — code intelligence backed by real language servers:
 

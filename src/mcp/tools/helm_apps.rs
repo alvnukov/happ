@@ -457,10 +457,95 @@ fn render_entity_manifest(context: &ServerContext, args: &JsonValue) -> Result<S
         ""
     };
 
+    let incomplete = describe_containers_without_image(manifest);
+
     Ok(format!(
         "# {group}.{app} rendered for env '{used_env}' by the {renderer} renderer\
-         {disabled_note}{fidelity}\n{manifest}",
+         {disabled_note}{fidelity}{incomplete}\n{manifest}",
     ))
+}
+
+/// Warns about containers the render left with no image.
+///
+/// A render that succeeds is not the same as a render that deploys: helm-apps
+/// takes the image from werf metadata or from values the deployment supplies,
+/// so asking about a chart without them produces a workload the API server
+/// rejects outright. Saying so beats letting `image:` pass for a value.
+fn describe_containers_without_image(manifest: &str) -> String {
+    let missing = containers_without_image(manifest);
+    if missing.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n# INCOMPLETE: no image on {}. Kubernetes rejects such a workload. \
+         helm-apps takes the image from werf metadata or from values the deployment \
+         supplies -- pass them with values_files or set.",
+        missing.join(", ")
+    )
+}
+
+/// Every container in the manifest with no usable image, as `Kind/name: container`.
+fn containers_without_image(manifest: &str) -> Vec<String> {
+    use serde::Deserialize;
+
+    let mut missing = Vec::new();
+    for document in serde_yaml::Deserializer::from_str(manifest) {
+        let Ok(doc) = serde_yaml::Value::deserialize(document) else {
+            continue;
+        };
+        let kind = doc
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("resource");
+        let name = doc
+            .get("metadata")
+            .and_then(|meta| meta.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unnamed>");
+        let Some(pod_spec) = pod_spec_of(&doc) else {
+            continue;
+        };
+        for field in ["initContainers", "containers"] {
+            let Some(containers) = pod_spec.get(field).and_then(|v| v.as_sequence()) else {
+                continue;
+            };
+            for container in containers {
+                if has_image(container) {
+                    continue;
+                }
+                let container_name = container
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unnamed>");
+                missing.push(format!("{kind}/{name}: container {container_name}"));
+            }
+        }
+    }
+    missing
+}
+
+/// The pod spec a workload carries, wherever its kind keeps one.
+fn pod_spec_of(doc: &serde_yaml::Value) -> Option<&serde_yaml::Value> {
+    let spec = doc.get("spec")?;
+    // Pod itself, then the one template every controller wraps it in, then the
+    // extra job layer a CronJob adds.
+    if spec.get("containers").is_some() {
+        return Some(spec);
+    }
+    if let Some(template) = spec.get("template").and_then(|t| t.get("spec")) {
+        return Some(template);
+    }
+    spec.get("jobTemplate")?
+        .get("spec")?
+        .get("template")?
+        .get("spec")
+}
+
+fn has_image(container: &serde_yaml::Value) -> bool {
+    container
+        .get("image")
+        .and_then(|v| v.as_str())
+        .is_some_and(|image| !image.trim().is_empty())
 }
 
 /// Puts the cause of a failed render first.
@@ -1601,6 +1686,90 @@ mod tests {
         .err()
         .expect("a malformed --set path must fail");
         assert!(err.contains("global..vars"), "{err}");
+    }
+
+    /// The render succeeded and the workload is still undeployable -- the exact
+    /// shape a chart takes when its image comes from werf metadata nobody
+    /// supplied.
+    #[test]
+    fn a_container_without_an_image_is_named() {
+        let manifest = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iam2-identity
+spec:
+  template:
+    spec:
+      initContainers:
+      - name: wait-db
+        image: busybox:1.36
+      containers:
+      - name: main
+        image:
+";
+        assert_eq!(
+            containers_without_image(manifest),
+            vec!["Deployment/iam2-identity: container main".to_string()],
+        );
+        let note = describe_containers_without_image(manifest);
+        assert!(note.contains("INCOMPLETE"), "{note}");
+        assert!(note.contains("container main"), "{note}");
+    }
+
+    /// werf writes the same absence as an explicit null.
+    #[test]
+    fn an_explicitly_null_image_counts_as_missing() {
+        let manifest = "kind: Pod\nmetadata:\n  name: p\nspec:\n  containers:\n  - name: main\n    image: null\n";
+        assert_eq!(
+            containers_without_image(manifest),
+            vec!["Pod/p: container main".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_cronjobs_containers_are_reached_through_its_job_template() {
+        let manifest = "\
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: run
+";
+        assert_eq!(
+            containers_without_image(manifest),
+            vec!["CronJob/nightly: container run".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_complete_manifest_gets_no_warning() {
+        let manifest = "\
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: registry.example/api:1.2.3
+---
+kind: Service
+metadata:
+  name: api
+spec:
+  ports:
+  - port: 80
+";
+        assert!(containers_without_image(manifest).is_empty());
+        assert!(describe_containers_without_image(manifest).is_empty());
     }
 
     #[test]
