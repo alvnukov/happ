@@ -2123,13 +2123,81 @@ fn template_assist_request(
     })
 }
 
+/// Byte ranges of `text` that YAML reads as comments.
+///
+/// Found line by line rather than from a parsed document: the diagnostics this
+/// feeds report a line and a column, and neither the YAML parser happ uses nor
+/// the Go template scanner carries spans back to the source. Two cases decide
+/// correctness for helm-apps values, and both are handled -- a `#` inside a
+/// quoted scalar is content, and a `#` anywhere inside a block scalar (`|`,
+/// `>`) is content too, because those blocks routinely hold commented-out
+/// manifest lines that Helm really does hand to `tpl`.
+fn yaml_comment_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let block_scalar_content = block_scalar_content_lines(&lines);
+    let mut ranges = Vec::new();
+    let mut offset = 0usize;
+
+    for (index, line) in lines.iter().enumerate() {
+        let body = line.trim_end_matches('\r');
+        if !block_scalar_content[index] {
+            if let Some(start) = yaml_line_comment_start(body) {
+                ranges.push(offset + start..offset + body.len());
+            }
+        }
+        offset += line.len() + 1;
+    }
+    ranges
+}
+
+/// Where a comment starts on one YAML line, ignoring `#` inside quotes.
+///
+/// YAML only opens a comment on a `#` that begins the line or follows
+/// whitespace, so `http://host/#frag` stays a value.
+fn yaml_line_comment_start(body: &str) -> Option<usize> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut after_space = true;
+
+    for (index, ch) in body.char_indices() {
+        if escaped {
+            escaped = false;
+            after_space = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double && after_space => return Some(index),
+            _ => {}
+        }
+        after_space = ch == ' ' || ch == '\t';
+    }
+    None
+}
+
 fn build_template_diagnostics(_uri: &Uri, text: &str, lines: &[&str]) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let line_index = TextLineIndex::new(text);
     let expanded_values = parse_and_expand_values_root(Some(_uri), text).map(JsonValue::Object);
 
     let (spans, scan_errors) = scan_template_actions(text);
+    // A commented-out template is not a template. Helm never parses it, so
+    // reporting an unknown values path inside one is a pure false positive.
+    let commented = yaml_comment_ranges(text);
+    let is_commented =
+        |offset: usize| -> bool { commented.iter().any(|range| range.contains(&offset)) };
+    let spans: Vec<_> = spans
+        .into_iter()
+        .filter(|span| !is_commented(span.start))
+        .collect();
+
     for err in scan_errors {
+        if is_commented(err.offset) {
+            continue;
+        }
         let line = line_index.line_for_offset(err.offset);
         diagnostics.push(make_diagnostic(
             line,
@@ -2142,6 +2210,9 @@ fn build_template_diagnostics(_uri: &Uri, text: &str, lines: &[&str]) -> Vec<Dia
     }
 
     for typo in collect_single_left_delim_typos(text, &spans) {
+        if is_commented(typo.offset) {
+            continue;
+        }
         diagnostics.push(make_diagnostic_at_offset(
             &line_index,
             lines,
@@ -6808,6 +6879,76 @@ apps-stateless:
             &diagnostics,
             "E_TPL_UNKNOWN_VALUES_PATH"
         ));
+    }
+
+    /// The chart in the report carried the live `host:` one line below a
+    /// commented-out draft of it, and lint flagged the draft's values path.
+    #[test]
+    fn a_commented_out_template_action_is_not_diagnosed() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    # name: '{{ $.Values.global.missing }}'
+    name: 'fixed'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(
+            !has_diagnostic_code(&diagnostics, "E_TPL_UNKNOWN_VALUES_PATH"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    /// A `#` does not open a comment inside a block scalar, and helm-apps
+    /// values pass those blocks to `tpl` -- so the action is live and a wrong
+    /// values path in it is a real finding.
+    #[test]
+    fn a_template_action_inside_a_block_scalar_is_still_diagnosed() {
+        let uri = "file:///tmp/values.yaml".parse::<Uri>().expect("uri");
+        let src = r#"
+global:
+  env: dev
+apps-stateless:
+  app-1:
+    enabled: true
+    strategy: |
+      # rollingUpdate keeps one spare
+      maxSurge: '{{ $.Values.global.missing }}'
+"#;
+        let diagnostics = build_diagnostics(&uri, src);
+        assert!(
+            has_diagnostic_code(&diagnostics, "E_TPL_UNKNOWN_VALUES_PATH"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn yaml_comments_are_found_but_quoted_hashes_are_not() {
+        let text = "a: 1 # tail\nb: 'has # inside'\nc: \"also # inside\"\n#whole line\n";
+        let ranges = yaml_comment_ranges(text);
+        let found: Vec<&str> = ranges.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(found, vec!["# tail", "#whole line"], "{ranges:?}");
+    }
+
+    #[test]
+    fn a_block_scalar_hides_its_hashes_until_the_indentation_drops() {
+        let text = "key: |-\n  # content, not a comment\n  more\nnext: 1 # real\n";
+        let ranges = yaml_comment_ranges(text);
+        let found: Vec<&str> = ranges.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(found, vec!["# real"], "{ranges:?}");
+    }
+
+    /// A plain scalar that merely contains `>` must not be read as a block
+    /// header, or the comments below it would stop being found.
+    #[test]
+    fn a_value_containing_an_angle_bracket_does_not_open_a_block() {
+        let text = "key: echo >\nnext: 1 # real\n";
+        let ranges = yaml_comment_ranges(text);
+        let found: Vec<&str> = ranges.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(found, vec!["# real"], "{ranges:?}");
     }
 
     #[test]
