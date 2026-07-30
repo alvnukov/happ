@@ -54,9 +54,11 @@ fragments of an answer rather than the answer.
 2. `helm_apps op='apps'` -- the apps in one group, when the overview is large.
 3. `helm_apps op='resolve'` -- one app's values after everything has resolved.
    This is the answer to "what is actually set", and it is not the file.
-4. `helm_apps op='render'` -- the Kubernetes manifests. Use when the question is
-   about the object rather than the values that produced it.
-5. `helm_apps op='diff'` with `from_env` and `to_env` -- what differs between two
+4. `helm_apps op='render'` -- one app's Kubernetes manifests. Use when the
+   question is about the object rather than the values that produced it.
+5. `helm_apps op='query_manifests'` -- jq over manifests from every enabled app.
+   Use `kind` or `resource` to discard unrelated objects before the query runs.
+6. `helm_apps op='diff'` with `from_env` and `to_env` -- what differs between two
    environments. Better than resolving both and comparing by eye.
 
 ## The rest of the surface
@@ -185,7 +187,15 @@ mod tests {
         // A skill that promises an op that does not exist sends the model into
         // an error it cannot recover from, so the two lists are pinned together.
         let charts = [
-            "overview", "apps", "resolve", "render", "lint", "diff", "query", "contract",
+            "overview",
+            "apps",
+            "resolve",
+            "render",
+            "query_manifests",
+            "lint",
+            "diff",
+            "query",
+            "contract",
             "template",
         ];
         let code = [

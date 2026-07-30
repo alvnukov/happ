@@ -32,6 +32,7 @@ pub(crate) fn tool() -> JsonValue {
   resolve   group+app                   the app's values as the library actually sees them
   origin    group+app                   where each of those values came from
   render    group+app                   the Kubernetes manifests the app produces
+  query_manifests query                 jq over manifests from every enabled app
   lint                                  violations of the helm-apps contract
   diff      group+app+from_env+to_env    how the app differs between two environments
   query     query                       jq over the whole resolved values tree
@@ -45,7 +46,7 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                 "op": {
                     "type": "string",
                     "enum": [
-                        "overview", "apps", "resolve", "render", "origin",
+                        "overview", "apps", "resolve", "render", "query_manifests", "origin",
                         "lint", "diff", "query", "contract", "template",
                     ],
                     "description": "Operation to run.",
@@ -67,8 +68,10 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                     "description": "For op='query': a jq expression over the resolved values root, \
                                     e.g. '[.[\"apps-stateless\"] | to_entries[] | select(.value.enabled) | .key]'. \
                                     Group names contain '-', which jq reads as subtraction, so quote \
-                                    them: .[\"apps-stateless\"]. For op='contract' with name='functions': \
-                                    keep only functions whose name contains this.",
+                                    them: .[\"apps-stateless\"]. For op='query_manifests': jq over an array \
+                                    of {group, app, manifest} records from every enabled app. For \
+                                    op='contract' with name='functions': keep only functions whose name \
+                                    contains this.",
                 },
                 "name": {
                     "type": "string",
@@ -109,14 +112,14 @@ Start with overview. `chart` may be omitted when happ was started with --chart."
                 },
                 "kind": {
                     "type": "string",
-                    "description": "For op='render': keep only this Kubernetes kind, e.g. \
-                                    'Deployment'. An app renders several resources and a question \
-                                    is usually about one.",
+                    "description": "For op='render' or op='query_manifests': keep only this Kubernetes \
+                                    kind, e.g. 'Deployment'. The manifest query applies this filter \
+                                    before jq so unrelated documents never enter the query input.",
                 },
                 "resource": {
                     "type": "string",
-                    "description": "For op='render': keep only the resource with this \
-                                    metadata.name. Combines with kind.",
+                    "description": "For op='render' or op='query_manifests': keep only the resource \
+                                    with this metadata.name. Combines with kind and is applied before jq.",
                 },
                 "values_files": {
                     "type": "array",
@@ -164,6 +167,7 @@ pub(crate) fn call(context: &ServerContext, args: &JsonValue) -> Result<String, 
         // Capped by the op itself: it knows the answer is a list of named
         // resources, so it can say what a cap left out.
         "render" => return render_entity_manifest(context, args),
+        "query_manifests" => query_manifests(context, args)?,
         "origin" => explain_value_origin(context, args)?,
         "lint" => lint_values(context, args)?,
         "diff" => diff_entity_envs(context, args)?,
@@ -173,7 +177,7 @@ pub(crate) fn call(context: &ServerContext, args: &JsonValue) -> Result<String, 
         other => {
             return Err(format!(
                 "unknown op '{other}' -- expected one of: overview, apps, resolve, render, \
-                 origin, lint, diff, query, contract, template"
+                 query_manifests, origin, lint, diff, query, contract, template"
             ))
         }
     };
@@ -1009,6 +1013,86 @@ fn diff_entity_envs(context: &ServerContext, args: &JsonValue) -> Result<String,
     }
     lines.push(format!("\n{} differences.", changes.len()));
     Ok(lines.join("\n"))
+}
+
+/// Runs one jq expression over Kubernetes objects from every enabled app.
+///
+/// The render stays server-side: callers pay for the query result rather than
+/// concatenated YAML from the whole fleet. Provenance is kept beside each
+/// object because Kubernetes metadata alone cannot identify its values entry.
+fn query_manifests(context: &ServerContext, args: &JsonValue) -> Result<String, String> {
+    let source = chart_source(context, args)?;
+    let query = required_str(args, "query")?;
+    let asked_env = optional_str(args, "env");
+    let renderer = optional_str(args, "renderer");
+    let kind = optional_str(args, "kind");
+    let resource = optional_str(args, "resource");
+    let entities = crate::lsp::analysis_list_entities(&source, asked_env.clone())?;
+    let used_env = entities["usedEnv"].as_str().unwrap_or_default();
+    let enabled = entities["enabledEntities"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    let mut records = Vec::new();
+    for entity in enabled {
+        let Some(group) = entity["group"].as_str() else {
+            continue;
+        };
+        let Some(app) = entity["app"].as_str() else {
+            continue;
+        };
+        let rendered = crate::lsp::analysis_render_entity_manifest(
+            &source,
+            group.to_string(),
+            app.to_string(),
+            asked_env.clone(),
+            renderer.clone(),
+        )
+        .map_err(|err| format!("{group}.{app}: {}", summarize_render_failure(&err)))?;
+        let manifest = rendered["manifest"].as_str().unwrap_or_default();
+        if manifest.trim().is_empty() {
+            continue;
+        }
+        let documents = crate::query::parse_input_docs_prefer_yaml(manifest)
+            .map_err(|err| format!("{group}.{app}: parse rendered manifests: {err}"))?;
+        for manifest in documents {
+            if !manifest_matches(&manifest, kind.as_deref(), resource.as_deref()) {
+                continue;
+            }
+            records.push(json!({
+                "group": group,
+                "app": app,
+                "manifest": manifest,
+            }));
+        }
+    }
+
+    let manifest_count = records.len();
+    let results = crate::query::run_query_stream(&query, vec![JsonValue::Array(records)])
+        .map_err(|err| explain_query_failure(&err.to_string(), &query))?;
+    let notice = unknown_env_notice(&entities["envDiscovery"], asked_env.as_deref());
+    if results.is_empty() {
+        return Ok(format!(
+            "Query matched nothing in {manifest_count} manifests from {} enabled apps for env \
+             '{used_env}'.{notice}",
+            enabled.len(),
+        ));
+    }
+
+    let output = crate::query::format_output_json_lines(&results, false, false)
+        .map_err(|err| format!("format query output: {err}"))?;
+    Ok(format!("{output}{notice}"))
+}
+
+fn manifest_matches(manifest: &JsonValue, kind: Option<&str>, resource: Option<&str>) -> bool {
+    let actual_kind = manifest.get("kind").and_then(JsonValue::as_str);
+    let actual_name = manifest
+        .get("metadata")
+        .and_then(|metadata| metadata.get("name"))
+        .and_then(JsonValue::as_str);
+    kind.is_none_or(|wanted| actual_kind.is_some_and(|actual| actual.eq_ignore_ascii_case(wanted)))
+        && resource.is_none_or(|wanted| actual_name == Some(wanted))
 }
 
 fn query_values(context: &ServerContext, args: &JsonValue) -> Result<String, String> {
@@ -1963,6 +2047,54 @@ mod tests {
         )
         .expect("query");
         assert_eq!(text.trim(), "4");
+    }
+
+    #[test]
+    fn query_manifests_runs_across_enabled_apps_and_keeps_provenance() {
+        let chart = chart_fixture();
+        std::fs::write(
+            chart.path().join("values.yaml"),
+            "global:\n  env: dev\napps-stateless:\n  api:\n    enabled: true\n    containers:\n      app:\n        image:\n          name: nginx\n  worker:\n    enabled: true\n    containers:\n      app:\n        image:\n          name: busybox\n  off:\n    enabled: false\n    containers:\n      app:\n        image:\n          name: ignored\n",
+        )
+        .expect("rewrite values");
+
+        let text = run(
+            &context(),
+            json!({
+                "op": "query_manifests",
+                "chart": chart_arg(&chart),
+                "kind": "Deployment",
+                "query": "map({group, app, kind: .manifest.kind})",
+            }),
+        )
+        .expect("query manifests");
+        assert!(text.contains("apps-stateless"), "{text}");
+        assert!(text.contains("api"), "{text}");
+        assert!(text.contains("worker"), "{text}");
+        assert!(
+            !text.contains("off"),
+            "disabled apps must be absent: {text}"
+        );
+        assert!(text.contains("Deployment"), "{text}");
+    }
+
+    #[test]
+    fn query_manifests_filters_kind_and_resource_before_jq() {
+        let deployment = json!({
+            "kind": "Deployment",
+            "metadata": { "name": "api" },
+        });
+        assert!(manifest_matches(
+            &deployment,
+            Some("deployment"),
+            Some("api")
+        ));
+        assert!(!manifest_matches(&deployment, Some("Service"), Some("api")));
+        assert!(!manifest_matches(
+            &deployment,
+            Some("Deployment"),
+            Some("worker")
+        ));
     }
 
     #[test]

@@ -330,6 +330,7 @@ description sits in the model's context on every request.
 | `resolve` | `group`, `app` | the app's values after include expansion and env selection |
 | `origin` | `group`, `app` | which profile set each value, through which `_include` chain, and by which env key |
 | `render` | `group`, `app` | the Kubernetes manifests the app produces |
+| `query_manifests` | `query` | jq over manifests from every enabled app |
 | `lint` | — | violations of the helm-apps contract |
 | `diff` | `group`, `app`, `from_env`, `to_env` | how the app differs between two environments |
 | `query` | `query` | jq over the whole resolved values tree |
@@ -367,6 +368,11 @@ An app renders several resources and a question is usually about one, so
 the `Service` alone costs 881 bytes against 12.9 KB for everything the app
 produces. A render too long for `limit` says which resources it holds, so the
 next call can ask for one instead of buying the whole thing again.
+
+`op=query_manifests` answers fleet-wide questions without returning every render.
+It renders only apps enabled for the selected environment, applies `kind` and
+`resource` before jq, then queries an array of `{group, app, manifest}` records.
+The result therefore keeps values provenance while avoiding the full fleet YAML.
 
 `op=origin` answers the question `op=resolve` leaves open. On a chart whose
 apps inherit through several `_include` profiles, knowing what a value is
