@@ -1025,10 +1025,66 @@ fn explain_missing_entity(
     if known.is_empty() {
         return format!("{err} -- this chart declares no apps at all");
     }
+    // A chart of 86 apps used to answer a one-character typo with every one of
+    // them on a single line. What the caller needs is the name they meant.
+    if known.len() <= NEAR_MISS_LIMIT {
+        return format!(
+            "{err}\nThis chart has no '{group}.{app}'. It contains: {}",
+            known.join(", ")
+        );
+    }
     format!(
-        "{err}\nThis chart has no '{group}.{app}'. It contains: {}",
-        known.join(", ")
+        "{err}\nThis chart has no '{group}.{app}'. Closest: {}.\nop='apps' lists all {}.",
+        nearest_entities(&known, group, app).join(", "),
+        known.len()
     )
+}
+
+/// How many apps are worth naming before a list stops being an answer.
+const NEAR_MISS_LIMIT: usize = 8;
+
+/// The apps closest to the one that was asked for.
+///
+/// Ranked by edit distance on the app name, with apps outside the requested
+/// group pushed down -- a typo in the app name is the common case, and a right
+/// name in the wrong group is the next one.
+fn nearest_entities(known: &[String], group: &str, app: &str) -> Vec<String> {
+    let mut scored: Vec<(usize, &String)> = known
+        .iter()
+        .map(|entity| {
+            let (entity_group, entity_app) = entity
+                .split_once('.')
+                .unwrap_or((entity.as_str(), entity.as_str()));
+            let mut score = edit_distance(entity_app, app);
+            if entity_group != group {
+                score += 1 + app.len() / 4;
+            }
+            (score, entity)
+        })
+        .collect();
+    scored.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+    scored
+        .into_iter()
+        .take(NEAR_MISS_LIMIT)
+        .map(|(_, entity)| entity.clone())
+        .collect()
+}
+
+/// Levenshtein distance, over chars so a multi-byte name cannot panic.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current = vec![0usize; right_chars.len() + 1];
+
+    for (i, left_char) in left.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right_chars.iter().enumerate() {
+            let substitute = previous[j] + usize::from(left_char != *right_char);
+            current[j + 1] = substitute.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right_chars.len()]
 }
 
 fn diagnostic_counts(diagnostics: &[JsonValue]) -> JsonValue {
@@ -1808,6 +1864,52 @@ spec:
         // Not expanding profiles is still what was asked for: the `_include`
         // reference stays, and what it would have brought in does not appear.
         assert!(literal.contains("shared"), "{literal}");
+    }
+
+    #[test]
+    fn edit_distance_counts_single_edits() {
+        assert_eq!(edit_distance("iam2-identity", "iam2-identit"), 1);
+        assert_eq!(edit_distance("api", "api"), 0);
+        assert_eq!(edit_distance("api", "pai"), 2);
+        // Multi-byte names must not panic or count bytes.
+        assert_eq!(edit_distance("привет", "привет"), 0);
+        assert_eq!(edit_distance("привет", "приве"), 1);
+    }
+
+    /// A one-character typo used to be answered with every app in the chart on
+    /// one line -- about 2.5 KB for the reported chart.
+    #[test]
+    fn a_near_miss_is_ranked_above_the_rest() {
+        let known: Vec<String> = (0..40)
+            .map(|n| format!("apps-stateless.filler-{n}"))
+            .chain([
+                "apps-stateless.iam2-identity".to_string(),
+                "apps-jobs.iam2-identity-migrate".to_string(),
+            ])
+            .collect();
+
+        let nearest = nearest_entities(&known, "apps-stateless", "iam2-identit");
+        assert_eq!(
+            nearest.first().map(String::as_str),
+            Some("apps-stateless.iam2-identity"),
+            "{nearest:?}"
+        );
+        assert!(nearest.len() <= NEAR_MISS_LIMIT, "{nearest:?}");
+    }
+
+    /// The right name in the wrong group is the other common mistake.
+    #[test]
+    fn an_app_in_another_group_is_still_offered() {
+        let known: Vec<String> = (0..40)
+            .map(|n| format!("apps-stateless.filler-{n}"))
+            .chain(["apps-jobs.vega-bootstrap-db".to_string()])
+            .collect();
+        let nearest = nearest_entities(&known, "apps-stateless", "vega-bootstrap-db");
+        assert_eq!(
+            nearest.first().map(String::as_str),
+            Some("apps-jobs.vega-bootstrap-db"),
+            "{nearest:?}"
+        );
     }
 
     #[test]
