@@ -1003,6 +1003,7 @@ fn value_overrides(
     let mut overrides = ValueOverrides::default();
 
     if let Some(entries) = args.get("values_files") {
+        let entries = as_json_text_or_value(entries);
         let entries = entries
             .as_array()
             .ok_or_else(|| "'values_files' must be a list of paths".to_string())?;
@@ -1018,6 +1019,7 @@ fn value_overrides(
         let Some(value) = args.get(field) else {
             continue;
         };
+        let value = as_json_text_or_value(value);
         let map = value
             .as_object()
             .ok_or_else(|| format!("'{field}' must be an object of path -> value"))?;
@@ -1048,6 +1050,22 @@ fn value_overrides(
     }
 
     Ok(overrides)
+}
+
+/// Reads an argument that should be a list or an object, accepting the JSON
+/// text of one as well.
+///
+/// Clients routinely send a structured argument as a string -- the schema says
+/// array, the call carries `"[\"ci.yaml\"]"`. Rejecting that teaches the model
+/// nothing it can act on, while the intent is unambiguous.
+fn as_json_text_or_value(value: &JsonValue) -> std::borrow::Cow<'_, JsonValue> {
+    let Some(text) = value.as_str() else {
+        return std::borrow::Cow::Borrowed(value);
+    };
+    match serde_json::from_str::<JsonValue>(text) {
+        Ok(parsed) if parsed.is_array() || parsed.is_object() => std::borrow::Cow::Owned(parsed),
+        _ => std::borrow::Cow::Borrowed(value),
+    }
 }
 
 /// Finds a caller-named values file, preferring one relative to the chart.
@@ -1527,6 +1545,33 @@ mod tests {
 
     /// A bad `--set` path is applied far inside the values pipeline, where the
     /// only error the caller could see is a generic parse failure.
+    /// Clients send structured arguments as JSON text often enough that
+    /// refusing them just costs the model a round trip.
+    #[test]
+    fn structured_arguments_are_accepted_as_json_text() {
+        let chart = chart_fixture();
+        let extra = chart.path().join("ci-values.yaml");
+        std::fs::write(
+            &extra,
+            "global:\n  env: dev\n  vars:\n    HOST: from-file\n",
+        )
+        .expect("write extra values");
+
+        let queried = run(
+            &context(),
+            json!({
+                "op": "query",
+                "chart": chart_arg(&chart),
+                "query": ".global.vars",
+                "values_files": "[\"ci-values.yaml\"]",
+                "set": "{\"global.vars.PORT\": 8080}",
+            }),
+        )
+        .expect("query");
+        assert!(queried.contains("from-file"), "{queried}");
+        assert!(queried.contains("8080"), "{queried}");
+    }
+
     #[test]
     fn a_malformed_set_path_reports_the_path_itself() {
         let chart = chart_fixture();
