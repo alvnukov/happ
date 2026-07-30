@@ -588,7 +588,6 @@ fn render_entity_manifest_request_with_overrides(
         .uri
         .as_ref()
         .and_then(|value| value.parse::<Uri>().ok());
-    let current_path = params.uri.as_deref().and_then(file_path_from_uri_string);
     let renderer = ManifestPreviewRenderer::parse(params.renderer.as_deref())?;
     let request_text = resolve_request_text(state, params.uri.as_deref(), params.text.clone())?;
     let context = resolve_entity_context(
@@ -605,23 +604,18 @@ fn render_entity_manifest_request_with_overrides(
     let parsed_source_root =
         parse_source_values_root(request_uri.as_ref(), &request_text, value_overrides)
             .ok_or_else(|| "failed to parse values root for manifest preview".to_string())?;
-    let fast_source_root = if renderer == ManifestPreviewRenderer::Fast {
-        Some(build_fast_manifest_source_root(&parsed_source_root)?)
-    } else {
-        None
-    };
-    let parsed_source_root_json = JsonValue::Object(parsed_source_root.root_map.clone());
+    // Assembled once, for whichever renderer runs: the layering that turns the
+    // parsed document into the root helm-apps expects is the same question no
+    // matter who answers it.
+    let manifest_source_root = build_manifest_source_root(&parsed_source_root)?;
     let chart_root = parsed_source_root
         .chart_root
         .ok_or_else(|| "chart root not found for manifest preview".to_string())?;
     let manifest = render_manifest_for_entity(
         &chart_root,
-        current_path.as_deref(),
         &params.group,
         &params.app,
-        fast_source_root
-            .as_ref()
-            .unwrap_or(&parsed_source_root_json),
+        &manifest_source_root,
         &context.root,
         &context.used_env,
         renderer,
@@ -814,9 +808,17 @@ fn collect_enabled_entities(values: &JsonValue) -> Vec<EnabledEntityRef> {
 /// got a different answer depending on which renderer was asked.
 const HELM_PREVIEW_RELEASE: &str = "helm-apps-preview";
 
+/// Renders one app, by whichever backend was asked for.
+///
+/// Every backend is handed the same file: the values root happ assembled, with
+/// the app isolated. `helm` and `werf` used to be given the chart's own values
+/// files instead, plus a `--set` per app to switch the others off, which meant
+/// the caller's `values_files` and `set` reached the fast renderer and nothing
+/// else. The app's own keys still looked right -- isolation carried those --
+/// so the divergence showed up only under `global`, as a value that was merely
+/// stale rather than obviously absent.
 fn render_manifest_for_entity(
     chart_root: &Path,
-    current_path: Option<&Path>,
     group: &str,
     app: &str,
     source_root: &JsonValue,
@@ -825,32 +827,29 @@ fn render_manifest_for_entity(
     renderer: ManifestPreviewRenderer,
     release: &ReleaseIdentity,
 ) -> Result<String, String> {
-    if renderer != ManifestPreviewRenderer::Fast {
-        return render_manifest_for_entity_via_cli(
-            chart_root,
-            current_path,
-            group,
-            app,
-            resolved_root,
-            env,
-            renderer,
-            release,
-        );
-    }
-
     let values_json =
         build_manifest_render_values_root(source_root, resolved_root, group, app, env)?;
-    let temp_dir = tempfile::Builder::new()
-        .prefix("happ-lsp-preview-values-")
-        .tempdir()
-        .map_err(|e| format!("create temp dir for preview values: {e}"))?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("happ-lsp-preview-values-");
+    // werf reads a `--values` file only from inside the project directory --
+    // giterminism holds even under `--loose-giterminism` -- so the file it is
+    // handed has to live there. It is still a temp dir, removed on the way out.
+    let temp_dir = match renderer {
+        ManifestPreviewRenderer::Werf => builder.tempdir_in(resolve_werf_project_dir(chart_root)),
+        _ => builder.tempdir(),
+    }
+    .map_err(|e| format!("create temp dir for preview values: {e}"))?;
     let values_path = temp_dir.path().join("values.preview.json");
     let values_text = serde_json::to_string_pretty(&values_json)
         .map_err(|e| format!("encode preview values json: {e}"))?;
     std::fs::write(&values_path, values_text.as_bytes())
         .map_err(|e| format!("write preview values json: {e}"))?;
-    let chart_dir_text = chart_root.to_string_lossy().to_string();
 
+    if renderer != ManifestPreviewRenderer::Fast {
+        return render_manifest_via_cli(chart_root, &values_path, env, renderer, release);
+    }
+
+    let chart_dir_text = chart_root.to_string_lossy().to_string();
     let import_args = crate::cli::ImportArgs {
         path: chart_dir_text.clone(),
         env: env.to_string(),
@@ -887,38 +886,19 @@ fn render_manifest_for_entity(
     Ok(rendered)
 }
 
-fn render_manifest_for_entity_via_cli(
+fn render_manifest_via_cli(
     chart_root: &Path,
-    current_path: Option<&Path>,
-    group: &str,
-    app: &str,
-    resolved_root: &JsonValue,
+    preview_values: &Path,
     env: &str,
     renderer: ManifestPreviewRenderer,
     release: &ReleaseIdentity,
 ) -> Result<String, String> {
-    let current_path = current_path.ok_or_else(|| {
-        format!(
-            "file-backed document is required for {} manifest preview",
-            manifest_renderer_label(renderer)
-        )
-    })?;
-    let values_files = resolve_manifest_values_files(chart_root, current_path)?;
-    let set_values =
-        build_manifest_entity_isolation_set_values_from_resolved_root(resolved_root, group, app)?;
     let work_dir = match renderer {
         ManifestPreviewRenderer::Werf => resolve_werf_project_dir(chart_root),
         _ => chart_root.to_path_buf(),
     };
     let command = manifest_renderer_command(renderer);
-    let args = build_manifest_backend_args(
-        renderer,
-        &work_dir,
-        &values_files,
-        &set_values,
-        env,
-        release,
-    );
+    let args = build_manifest_backend_args(renderer, &work_dir, preview_values, env, release);
     let output = Command::new(command)
         .args(&args)
         .current_dir(&work_dir)
@@ -1017,7 +997,7 @@ fn build_manifest_render_values_root(
         ));
     }
 
-    ensure_fast_preview_werf_context(&mut values, env);
+    ensure_preview_werf_context(&mut values, env);
 
     Ok(values)
 }
@@ -1056,7 +1036,7 @@ fn materialize_root_level_include_profiles(source_root: &JsonValue) -> JsonValue
     JsonValue::Object(current)
 }
 
-fn build_fast_manifest_source_root(parsed: &ParsedSourceValuesRoot) -> Result<JsonValue, String> {
+fn build_manifest_source_root(parsed: &ParsedSourceValuesRoot) -> Result<JsonValue, String> {
     let assembled = assemble_root_level_values_layers(
         &parsed.root_map,
         parsed.include_base_dir.as_deref(),
@@ -1148,7 +1128,7 @@ fn assemble_root_level_values_layers(
 /// made every preview carry a `repo: ""` that `helm template` never produces --
 /// on the chart this was measured against, the only difference between the two
 /// renderers across 84 apps.
-fn ensure_fast_preview_werf_context(values: &mut JsonValue, env: &str) {
+fn ensure_preview_werf_context(values: &mut JsonValue, env: &str) {
     if env.trim().is_empty() {
         return;
     }
@@ -1160,75 +1140,6 @@ fn ensure_fast_preview_werf_context(values: &mut JsonValue, env: &str) {
         return;
     };
     werf.insert("env".to_string(), JsonValue::String(env.to_string()));
-}
-
-fn build_manifest_entity_isolation_set_values_from_resolved_root(
-    resolved_root: &JsonValue,
-    group: &str,
-    app: &str,
-) -> Result<Vec<String>, String> {
-    let mut out = vec![build_enabled_set_value(group, app, true)];
-    let groups = as_obj(resolved_root)
-        .ok_or_else(|| "resolved manifest preview values root must be a YAML map".to_string())?;
-    let mut target_found = false;
-
-    let mut group_names: Vec<&String> = groups.keys().collect();
-    group_names.sort();
-    for group_name in group_names {
-        if group_name == "global" {
-            continue;
-        }
-        let Some(group_obj) = groups.get(group_name).and_then(as_obj) else {
-            continue;
-        };
-        let mut app_names: Vec<&String> = group_obj.keys().collect();
-        app_names.sort();
-        for app_name in app_names {
-            if app_name == "__GroupVars__" {
-                continue;
-            }
-            let Some(app_value) = group_obj.get(app_name) else {
-                continue;
-            };
-            if !app_value.is_object() {
-                continue;
-            }
-            if group_name == group && app_name == app {
-                target_found = true;
-                continue;
-            }
-            if entity_enabled_in_resolved_root(app_value) {
-                out.push(build_enabled_set_value(group_name, app_name, false));
-            }
-        }
-    }
-
-    if !target_found {
-        return Err(format!(
-            "unable to isolate entity {}.{} for manifest render",
-            group, app
-        ));
-    }
-    Ok(out)
-}
-
-fn build_enabled_set_value(group: &str, app: &str, enabled: bool) -> String {
-    format!(
-        "{}.{}.enabled={}",
-        escape_helm_set_path_segment(group),
-        escape_helm_set_path_segment(app),
-        if enabled { "true" } else { "false" }
-    )
-}
-
-fn escape_helm_set_path_segment(segment: &str) -> String {
-    segment
-        .replace('\\', "\\\\")
-        .replace('.', "\\.")
-        .replace(',', "\\,")
-        .replace('=', "\\=")
-        .replace('[', "\\[")
-        .replace(']', "\\]")
 }
 
 fn manifest_renderer_command(renderer: ManifestPreviewRenderer) -> &'static str {
@@ -1249,25 +1160,18 @@ fn manifest_renderer_label(renderer: ManifestPreviewRenderer) -> &'static str {
 fn build_manifest_backend_args(
     renderer: ManifestPreviewRenderer,
     chart_dir: &Path,
-    values_files: &[PathBuf],
-    set_values: &[String],
+    preview_values: &Path,
     env: &str,
     release: &ReleaseIdentity,
 ) -> Vec<String> {
-    let mut value_args: Vec<String> = Vec::new();
-    for value_file in values_files {
-        value_args.push("--values".to_string());
-        value_args.push(value_file.to_string_lossy().to_string());
-    }
-
-    let mut set_args: Vec<String> = Vec::new();
-    for current in set_values {
-        if current.trim().is_empty() {
-            continue;
-        }
-        set_args.push("--set".to_string());
-        set_args.push(current.trim().to_string());
-    }
+    // The one file happ wrote, and nothing else. It is a whole values root
+    // rather than a patch, so the backend needs no `--set` to reach the state
+    // happ resolved -- including the caller's own `-f` files and overrides,
+    // which are already merged into it.
+    let value_args = vec![
+        "--values".to_string(),
+        preview_values.to_string_lossy().to_string(),
+    ];
 
     let normalized_env = env.trim();
     let mut with_env = |mut args: Vec<String>| {
@@ -1292,7 +1196,6 @@ fn build_manifest_backend_args(
                 chart_dir.to_string_lossy().to_string(),
             ];
             args.extend(value_args);
-            args.extend(set_args);
             args
         }),
         ManifestPreviewRenderer::Werf => with_env({
@@ -1305,7 +1208,6 @@ fn build_manifest_backend_args(
                 "--loose-giterminism".to_string(),
             ];
             args.extend(value_args);
-            args.extend(set_args);
             if !normalized_env.is_empty() {
                 args.push("--env".to_string());
                 args.push(normalized_env.to_string());
@@ -1325,174 +1227,6 @@ fn resolve_werf_project_dir(chart_root: &Path) -> PathBuf {
             return chart_root.to_path_buf();
         }
     }
-}
-
-fn resolve_manifest_values_files(
-    chart_root: &Path,
-    current_path: &Path,
-) -> Result<Vec<PathBuf>, String> {
-    let current_path = normalize_fs_path(current_path);
-    let root_documents = find_helm_apps_root_documents(chart_root)?;
-    let primary_values = find_primary_values_file(chart_root).map(|path| normalize_fs_path(&path));
-    let include_owners = collect_include_owners_for_chart(chart_root)?;
-    Ok(select_manifest_values_files(
-        &current_path,
-        &root_documents,
-        primary_values.as_ref(),
-        include_owners.get(&current_path),
-    ))
-}
-
-fn select_manifest_values_files(
-    current_path: &Path,
-    root_documents: &[PathBuf],
-    primary_values: Option<&PathBuf>,
-    include_owners: Option<&BTreeSet<PathBuf>>,
-) -> Vec<PathBuf> {
-    let mut owner_candidates: Vec<PathBuf> = include_owners
-        .map(|owners| owners.iter().cloned().collect())
-        .unwrap_or_default();
-    owner_candidates.sort();
-
-    if !owner_candidates.is_empty() {
-        if let Some(primary) = primary_values {
-            if owner_candidates
-                .iter()
-                .any(|candidate| candidate == primary)
-            {
-                return vec![primary.clone()];
-            }
-        }
-        return vec![owner_candidates[0].clone()];
-    }
-
-    if root_documents.iter().any(|root| root == current_path) {
-        if let Some(primary) = primary_values {
-            if primary != current_path {
-                return vec![primary.clone()];
-            }
-        }
-        return vec![current_path.to_path_buf()];
-    }
-
-    if let Some(primary) = primary_values {
-        return vec![primary.clone()];
-    }
-
-    vec![current_path.to_path_buf()]
-}
-
-fn find_helm_apps_root_documents(chart_root: &Path) -> Result<Vec<PathBuf>, String> {
-    let yaml_files = collect_yaml_files(chart_root)?;
-    let mut candidate_roots: Vec<PathBuf> = Vec::new();
-    let mut included_by_other_documents: HashSet<PathBuf> = HashSet::new();
-
-    for file_path in yaml_files {
-        let text = std::fs::read_to_string(&file_path)
-            .map_err(|err| format!("read chart yaml '{}': {err}", file_path.display()))?;
-        if looks_like_helm_apps_values_text(&text) {
-            candidate_roots.push(file_path.clone());
-        }
-        let lines: Vec<&str> = text.lines().collect();
-        let base_dir = file_path.parent();
-        for file_ref in collect_include_file_refs(&lines) {
-            if is_templated_include_path(&file_ref.path) {
-                continue;
-            }
-            for candidate in build_include_candidates(&file_ref.path, base_dir) {
-                let normalized = normalize_fs_path(&candidate);
-                if normalized != file_path {
-                    included_by_other_documents.insert(normalized);
-                }
-            }
-        }
-    }
-
-    candidate_roots.sort();
-    candidate_roots.dedup();
-    Ok(candidate_roots
-        .into_iter()
-        .filter(|path| !included_by_other_documents.contains(path))
-        .collect())
-}
-
-fn collect_include_owners_for_chart(
-    chart_root: &Path,
-) -> Result<HashMap<PathBuf, BTreeSet<PathBuf>>, String> {
-    let mut owners: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
-    for root in find_helm_apps_root_documents(chart_root)? {
-        let mut visited: HashSet<PathBuf> = HashSet::new();
-        let mut queue = vec![root.clone()];
-        while let Some(current) = queue.pop() {
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-            let text = match std::fs::read_to_string(&current) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let lines: Vec<&str> = text.lines().collect();
-            let base_dir = current.parent();
-            for file_ref in collect_include_file_refs(&lines) {
-                if is_templated_include_path(&file_ref.path) {
-                    continue;
-                }
-                for candidate in build_include_candidates(&file_ref.path, base_dir) {
-                    let normalized = normalize_fs_path(&candidate);
-                    if !normalized.exists() {
-                        continue;
-                    }
-                    owners
-                        .entry(normalized.clone())
-                        .or_default()
-                        .insert(root.clone());
-                    if !visited.contains(&normalized) {
-                        queue.push(normalized.clone());
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    Ok(owners)
-}
-
-fn collect_yaml_files(chart_root: &Path) -> Result<Vec<PathBuf>, String> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-        for entry in std::fs::read_dir(dir)
-            .map_err(|err| format!("read chart dir '{}': {err}", dir.display()))?
-        {
-            let entry = entry.map_err(|err| format!("read chart dir entry: {err}"))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|err| format!("read file type '{}': {err}", entry.path().display()))?;
-            let file_name = entry.file_name();
-            let file_name = file_name.to_string_lossy();
-            if file_type.is_dir() {
-                if matches!(
-                    file_name.as_ref(),
-                    ".git" | "node_modules" | "vendor" | "tmp" | ".werf" | "templates"
-                ) {
-                    continue;
-                }
-                walk(&entry.path(), out)?;
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            let lower = file_name.to_ascii_lowercase();
-            if lower.ends_with(".yaml") || lower.ends_with(".yml") {
-                out.push(normalize_fs_path(&entry.path()));
-            }
-        }
-        Ok(())
-    }
-
-    let mut out = Vec::new();
-    walk(chart_root, &mut out)?;
-    out.sort();
-    Ok(out)
 }
 
 fn entity_enabled_in_resolved_root(entity: &JsonValue) -> bool {
@@ -1547,43 +1281,6 @@ fn upsert_entity_enabled_flag(
     true
 }
 
-fn json_to_yaml_value(value: &JsonValue) -> Result<YamlValue, String> {
-    match value {
-        JsonValue::Null => Ok(YamlValue::Null),
-        JsonValue::Bool(v) => Ok(YamlValue::Bool(*v)),
-        JsonValue::Number(n) => {
-            if let Some(v) = n.as_i64() {
-                return Ok(YamlValue::Number(YamlNumber::from(v)));
-            }
-            if let Some(v) = n.as_u64() {
-                return Ok(YamlValue::Number(YamlNumber::from(v)));
-            }
-            if let Some(v) = n.as_f64() {
-                if !v.is_finite() {
-                    return Err("non-finite float is not supported in preview values".to_string());
-                }
-                return Ok(YamlValue::Number(YamlNumber::from(v)));
-            }
-            Err(format!("unsupported json number: {n}"))
-        }
-        JsonValue::String(v) => Ok(YamlValue::String(v.clone())),
-        JsonValue::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(json_to_yaml_value(item)?);
-            }
-            Ok(YamlValue::Sequence(out))
-        }
-        JsonValue::Object(map) => {
-            let mut out = YamlMapping::new();
-            for (k, v) in map {
-                out.insert(YamlValue::String(k.clone()), json_to_yaml_value(v)?);
-            }
-            Ok(YamlValue::Mapping(out))
-        }
-    }
-}
-
 fn read_entity(values: &JsonValue, group: &str, app: &str) -> Result<JsonValue, String> {
     let root = as_obj(values).ok_or_else(|| "values must be map".to_string())?;
     let group_map = root
@@ -1606,170 +1303,6 @@ fn read_global(values: &JsonValue) -> JsonValue {
         .and_then(as_obj)
         .map(|m| JsonValue::Object(m.clone()))
         .unwrap_or_else(|| JsonValue::Object(JsonMap::new()))
-}
-
-fn build_manifest_preview_values(
-    group: &str,
-    app: &str,
-    entity: &JsonValue,
-    global: &JsonValue,
-    _apply_includes: bool,
-    env: &str,
-) -> JsonValue {
-    let mut root = JsonMap::new();
-    root.insert("global".to_string(), global.clone());
-    build_manifest_preview_values_with_root(
-        group,
-        app,
-        entity,
-        global,
-        &JsonValue::Object(root),
-        _apply_includes,
-        env,
-    )
-}
-
-fn build_manifest_preview_values_with_root(
-    group: &str,
-    app: &str,
-    entity: &JsonValue,
-    global: &JsonValue,
-    root: &JsonValue,
-    _apply_includes: bool,
-    env: &str,
-) -> JsonValue {
-    let required_keys = required_preview_global_keys(entity);
-    let global_map = build_preview_global_map(global, env, &required_keys);
-    let mut required_root_keys = required_preview_root_keys(entity);
-    required_root_keys.insert(group.to_string());
-    let preview_entity = force_entity_enabled_for_preview(entity);
-    let mut out = build_preview_values_tree(group, app, &preview_entity, global_map);
-    inject_preview_root_keys(
-        &mut out,
-        root,
-        &required_root_keys,
-        group,
-        app,
-        &preview_entity,
-    );
-    normalize_include_fields_for_render(&mut out);
-    out
-}
-
-fn force_entity_enabled_for_preview(entity: &JsonValue) -> JsonValue {
-    let Some(entity_map) = entity.as_object() else {
-        return entity.clone();
-    };
-    let mut next = entity_map.clone();
-    next.insert("enabled".to_string(), JsonValue::Bool(true));
-    JsonValue::Object(next)
-}
-
-fn required_preview_global_keys(entity: &JsonValue) -> BTreeSet<String> {
-    let mut required_keys = BTreeSet::from([
-        "env".to_string(),
-        "validation".to_string(),
-        "labels".to_string(),
-        "deploy".to_string(),
-        "releases".to_string(),
-    ]);
-    collect_global_keys_referenced(entity, &mut required_keys);
-    required_keys
-}
-
-fn required_preview_root_keys(entity: &JsonValue) -> BTreeSet<String> {
-    let mut required_keys = BTreeSet::new();
-    collect_root_keys_referenced(entity, &mut required_keys);
-    required_keys.remove("global");
-    required_keys
-}
-
-fn build_preview_global_map(
-    global: &JsonValue,
-    env: &str,
-    required_keys: &BTreeSet<String>,
-) -> JsonMap<String, JsonValue> {
-    let source_global = as_obj(global).cloned().unwrap_or_default();
-    let mut global_map = JsonMap::new();
-    for key in required_keys {
-        if let Some(value) = source_global.get(key) {
-            global_map.insert(key.clone(), value.clone());
-        }
-    }
-    // Manifest preview receives already-resolved entity; keep include storage minimal
-    // to avoid unrelated include payload validation side-effects.
-    global_map.insert("_includes".to_string(), JsonValue::Object(JsonMap::new()));
-    global_map.insert("env".to_string(), JsonValue::String(env.to_string()));
-    global_map
-}
-
-fn build_preview_values_tree(
-    group: &str,
-    app: &str,
-    entity: &JsonValue,
-    global_map: JsonMap<String, JsonValue>,
-) -> JsonValue {
-    let mut app_map = JsonMap::new();
-    app_map.insert(app.to_string(), entity.clone());
-
-    let mut values_map = JsonMap::new();
-    values_map.insert("global".to_string(), JsonValue::Object(global_map));
-    values_map.insert(group.to_string(), JsonValue::Object(app_map));
-    JsonValue::Object(values_map)
-}
-
-fn inject_preview_root_keys(
-    values: &mut JsonValue,
-    root: &JsonValue,
-    required_root_keys: &BTreeSet<String>,
-    group: &str,
-    app: &str,
-    entity: &JsonValue,
-) {
-    let Some(values_map) = as_obj(values).cloned() else {
-        return;
-    };
-    let Some(root_map) = as_obj(root) else {
-        return;
-    };
-    let mut next_values = values_map;
-    for key in required_root_keys {
-        let Some(source_value) = root_map.get(key) else {
-            continue;
-        };
-        if key == group {
-            let Some(source_group) = as_obj(source_value) else {
-                continue;
-            };
-            let mut merged_group = source_group.clone();
-            merged_group.insert(app.to_string(), entity.clone());
-            next_values.insert(key.clone(), JsonValue::Object(merged_group));
-            continue;
-        }
-        next_values.insert(key.clone(), source_value.clone());
-    }
-    *values = JsonValue::Object(next_values);
-}
-
-fn normalize_include_fields_for_render(value: &mut JsonValue) {
-    match value {
-        JsonValue::Array(items) => {
-            for item in items {
-                normalize_include_fields_for_render(item);
-            }
-        }
-        JsonValue::Object(map) => {
-            for (key, nested) in map.iter_mut() {
-                if include_key_requires_list(key.as_str()) && matches!(nested, JsonValue::String(_))
-                {
-                    let values = normalized_include_entries(nested.as_str().unwrap_or_default());
-                    *nested = JsonValue::Array(values.into_iter().map(JsonValue::String).collect());
-                }
-                normalize_include_fields_for_render(nested);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn normalize_include_fields_yaml(value: &mut YamlValue) {
@@ -1805,74 +1338,6 @@ fn normalized_include_entries(raw: &str) -> Vec<String> {
         Vec::new()
     } else {
         vec![trimmed.to_string()]
-    }
-}
-
-fn collect_global_keys_referenced(value: &JsonValue, out: &mut BTreeSet<String>) {
-    match value {
-        JsonValue::Array(items) => {
-            for item in items {
-                collect_global_keys_referenced(item, out);
-            }
-        }
-        JsonValue::Object(map) => {
-            for item in map.values() {
-                collect_global_keys_referenced(item, out);
-            }
-        }
-        JsonValue::String(text) => collect_global_keys_from_template_string(text, out),
-        _ => {}
-    }
-}
-
-fn collect_root_keys_referenced(value: &JsonValue, out: &mut BTreeSet<String>) {
-    match value {
-        JsonValue::Array(items) => {
-            for item in items {
-                collect_root_keys_referenced(item, out);
-            }
-        }
-        JsonValue::Object(map) => {
-            for item in map.values() {
-                collect_root_keys_referenced(item, out);
-            }
-        }
-        JsonValue::String(text) => collect_root_keys_from_template_string(text, out),
-        _ => {}
-    }
-}
-
-fn collect_global_keys_from_template_string(text: &str, out: &mut BTreeSet<String>) {
-    static GLOBAL_KEY_RE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
-    let Some(re) = GLOBAL_KEY_RE
-        .get_or_init(|| regex::Regex::new(r"(?:\$?\s*\.)?Values\.global\.([A-Za-z0-9_-]+)").ok())
-    else {
-        return;
-    };
-    for captures in re.captures_iter(text) {
-        if let Some(m) = captures.get(1) {
-            let key = m.as_str().trim();
-            if !key.is_empty() {
-                out.insert(key.to_string());
-            }
-        }
-    }
-}
-
-fn collect_root_keys_from_template_string(text: &str, out: &mut BTreeSet<String>) {
-    static ROOT_KEY_RE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
-    let Some(re) = ROOT_KEY_RE
-        .get_or_init(|| regex::Regex::new(r"(?:\$?\s*\.)?Values\.([A-Za-z0-9_-]+)").ok())
-    else {
-        return;
-    };
-    for captures in re.captures_iter(text) {
-        if let Some(m) = captures.get(1) {
-            let key = m.as_str().trim();
-            if !key.is_empty() {
-                out.insert(key.to_string());
-            }
-        }
     }
 }
 
@@ -6099,135 +5564,8 @@ apps-stateless:
     }
 
     #[test]
-    fn manifest_preview_values_do_not_encode_json_number_internal_representation() {
-        let entity = json!({
-            "containers": {
-                "app-1": {
-                    "ports": [
-                        { "name": "http", "containerPort": 8080 }
-                    ]
-                }
-            }
-        });
-        let global = json!({
-            "validation": {
-                "allowNativeListsInBuiltInListFields": true
-            }
-        });
-        let values = build_manifest_preview_values(
-            "apps-stateless",
-            "app-1",
-            &entity,
-            &global,
-            true,
-            "prod",
-        );
-        let yaml_value = json_to_yaml_value(&values).expect("json->yaml");
-        let yaml_text = serde_yaml::to_string(&yaml_value).expect("yaml");
-        assert!(
-            !yaml_text.contains("$serde_json::private::Number"),
-            "must not leak serde_json::Number internals into YAML: {yaml_text}"
-        );
-    }
-
     #[test]
-    fn manifest_preview_values_normalize_include_fields_and_skip_global_include_files() {
-        let entity = json!({
-            "containers": {
-                "main": {
-                    "_include_files": "configs/resource-assignment-kafka-consumer/ra_config.yaml"
-                }
-            }
-        });
-        let global = json!({
-            "_include_files": "must-not-be-forwarded",
-            "_includes": {},
-            "validation": {
-                "allowNativeListsInBuiltInListFields": true
-            }
-        });
-        let values = build_manifest_preview_values(
-            "apps-stateless",
-            "app-1",
-            &entity,
-            &global,
-            true,
-            "prod",
-        );
-        let include_files = values
-            .get("apps-stateless")
-            .and_then(as_obj)
-            .and_then(|group| group.get("app-1"))
-            .and_then(as_obj)
-            .and_then(|app| app.get("containers"))
-            .and_then(as_obj)
-            .and_then(|containers| containers.get("main"))
-            .and_then(as_obj)
-            .and_then(|main| main.get("_include_files"))
-            .and_then(JsonValue::as_array)
-            .expect("_include_files array");
-        assert_eq!(include_files.len(), 1);
-        assert_eq!(
-            include_files.first().and_then(JsonValue::as_str),
-            Some("configs/resource-assignment-kafka-consumer/ra_config.yaml")
-        );
-
-        let has_global_include_files = values
-            .get("global")
-            .and_then(as_obj)
-            .is_some_and(|global_map| global_map.contains_key("_include_files"));
-        assert!(!has_global_include_files);
-    }
-
     #[test]
-    fn manifest_preview_values_normalize_include_strings_including_empty_values() {
-        let entity = json!({
-            "containers": {
-                "main": {
-                    "_include": "   ",
-                    "_include_files": " configs/a.yaml "
-                }
-            }
-        });
-        let global = json!({
-            "validation": {
-                "allowNativeListsInBuiltInListFields": true
-            }
-        });
-        let values = build_manifest_preview_values(
-            "apps-stateless",
-            "app-1",
-            &entity,
-            &global,
-            true,
-            "prod",
-        );
-        let main = values
-            .get("apps-stateless")
-            .and_then(as_obj)
-            .and_then(|group| group.get("app-1"))
-            .and_then(as_obj)
-            .and_then(|app| app.get("containers"))
-            .and_then(as_obj)
-            .and_then(|containers| containers.get("main"))
-            .and_then(as_obj)
-            .expect("main app");
-        let include_refs = main
-            .get("_include")
-            .and_then(JsonValue::as_array)
-            .expect("_include array");
-        assert!(include_refs.is_empty());
-        let include_files = main
-            .get("_include_files")
-            .and_then(JsonValue::as_array)
-            .expect("_include_files array");
-        assert_eq!(include_files.len(), 1);
-        assert_eq!(
-            include_files.first().and_then(JsonValue::as_str),
-            Some("configs/a.yaml")
-        );
-    }
-
     #[test]
     fn optimize_values_includes_request_normalizes_scalar_include_fields_to_arrays() {
         let src = r#"
@@ -6273,30 +5611,6 @@ apps-stateless:
     }
 
     #[test]
-    fn manifest_preview_values_force_requested_env() {
-        let entity = json!({});
-        let global = json!({
-            "env": "dev",
-            "validation": {
-                "allowNativeListsInBuiltInListFields": true
-            }
-        });
-        let values = build_manifest_preview_values(
-            "apps-stateless",
-            "app-1",
-            &entity,
-            &global,
-            true,
-            "prod",
-        );
-        let env_value = values
-            .get("global")
-            .and_then(as_obj)
-            .and_then(|g| g.get("env"))
-            .and_then(JsonValue::as_str);
-        assert_eq!(env_value, Some("prod"));
-    }
-
     /// The library prints its `repo` label from inside
     /// `{{- with $.Values.werf }}`, so inventing that context made every fast
     /// preview carry a `repo: ""` no `helm template` produces. Measured across
@@ -6304,7 +5618,7 @@ apps-stateless:
     #[test]
     fn a_fast_preview_does_not_invent_a_werf_context() {
         let mut values = json!({"global": {"env": "dc1"}});
-        ensure_fast_preview_werf_context(&mut values, "dc1");
+        ensure_preview_werf_context(&mut values, "dc1");
         assert_eq!(values.get("werf"), None, "{values}");
     }
 
@@ -6314,157 +5628,15 @@ apps-stateless:
     #[test]
     fn a_fast_preview_repoints_a_werf_context_it_was_given() {
         let mut values = json!({"werf": {"env": "stale", "repo": "reg/app"}});
-        ensure_fast_preview_werf_context(&mut values, "dc1");
+        ensure_preview_werf_context(&mut values, "dc1");
         assert_eq!(values["werf"]["env"], json!("dc1"));
         // Whatever else the chart supplies is left as the chart wrote it.
         assert_eq!(values["werf"]["repo"], json!("reg/app"));
     }
 
     #[test]
-    fn manifest_preview_values_keep_referenced_global_keys() {
-        let entity = json!({
-            "data": {
-                "token": "{{ .Values.global.authToken }}",
-                "region": "{{ $.Values.global.region }}"
-            }
-        });
-        let global = json!({
-            "authToken": "secret",
-            "region": "eu-west-1",
-            "unused": "x",
-            "validation": {
-                "allowNativeListsInBuiltInListFields": true
-            }
-        });
-        let values = build_manifest_preview_values(
-            "apps-stateless",
-            "app-1",
-            &entity,
-            &global,
-            true,
-            "prod",
-        );
-        let global_map = values.get("global").and_then(as_obj).expect("global map");
-        assert_eq!(
-            global_map.get("authToken").and_then(JsonValue::as_str),
-            Some("secret")
-        );
-        assert_eq!(
-            global_map.get("region").and_then(JsonValue::as_str),
-            Some("eu-west-1")
-        );
-        assert!(!global_map.contains_key("unused"));
-    }
-
     #[test]
-    fn manifest_preview_values_keep_referenced_top_level_keys() {
-        let entity = json!({
-            "enabled": "{{ $.Values.deploy.enabled }}",
-            "werfEnv": "{{ $.Values.werf.env }}"
-        });
-        let root = json!({
-            "global": {
-                "validation": {
-                    "allowNativeListsInBuiltInListFields": true
-                }
-            },
-            "deploy": {
-                "enabled": true
-            },
-            "werf": {
-                "env": "prod"
-            },
-            "unusedTopLevel": {
-                "x": 1
-            }
-        });
-        let global = root.get("global").cloned().expect("global");
-        let values = build_manifest_preview_values_with_root(
-            "apps-certificates",
-            "apps-common",
-            &entity,
-            &global,
-            &root,
-            true,
-            "prod",
-        );
-
-        assert_eq!(
-            values
-                .get("deploy")
-                .and_then(as_obj)
-                .and_then(|deploy| deploy.get("enabled"))
-                .and_then(JsonValue::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            values
-                .get("werf")
-                .and_then(as_obj)
-                .and_then(|werf| werf.get("env"))
-                .and_then(JsonValue::as_str),
-            Some("prod")
-        );
-        assert!(!values
-            .as_object()
-            .is_some_and(|map| map.contains_key("unusedTopLevel")));
-    }
-
     #[test]
-    fn manifest_preview_values_force_selected_entity_enabled() {
-        let entity = json!({
-            "enabled": false,
-            "image": { "name": "nginx" }
-        });
-        let root = json!({
-            "global": {
-                "validation": {
-                    "allowNativeListsInBuiltInListFields": true
-                }
-            },
-            "apps-stateless": {
-                "target": {
-                    "enabled": false,
-                    "image": { "name": "nginx" }
-                },
-                "other": {
-                    "enabled": true
-                }
-            }
-        });
-        let global = root.get("global").cloned().expect("global");
-        let values = build_manifest_preview_values_with_root(
-            "apps-stateless",
-            "target",
-            &entity,
-            &global,
-            &root,
-            true,
-            "demo",
-        );
-
-        assert_eq!(
-            values
-                .get("apps-stateless")
-                .and_then(as_obj)
-                .and_then(|group| group.get("target"))
-                .and_then(as_obj)
-                .and_then(|app| app.get("enabled"))
-                .and_then(JsonValue::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            values
-                .get("apps-stateless")
-                .and_then(as_obj)
-                .and_then(|group| group.get("other"))
-                .and_then(as_obj)
-                .and_then(|app| app.get("enabled"))
-                .and_then(JsonValue::as_bool),
-            Some(true)
-        );
-    }
-
     #[test]
     fn parse_key_and_include_list_tokens_validate_shape() {
         assert_eq!(
@@ -8934,8 +8106,76 @@ apps-stateless:
         );
     }
 
+    /// Every renderer is handed this root and nothing else, so whatever the
+    /// caller layered on -- a `-f` file, a `--set` -- has to survive into it.
+    /// It used to reach only the fast path, because `helm` was given the
+    /// chart's own values files instead.
     #[test]
-    fn build_fast_manifest_source_root_materializes_root_include_profiles() {
+    fn the_shared_render_root_carries_overrides_env_and_isolation() {
+        // as an overridden source document would arrive: helm merged it already
+        let source_root = json!({
+            "global": { "env": "dev", "vars": { "KAFKA": "from-override" } },
+            "apps-stateless": {
+                "api": { "enabled": false },
+                "worker": { "enabled": true }
+            }
+        });
+        let resolved_root = json!({
+            "global": { "env": "dev", "vars": { "KAFKA": "from-override" } },
+            "apps-stateless": {
+                "api": { "enabled": false },
+                "worker": { "enabled": true }
+            }
+        });
+
+        let out = build_manifest_render_values_root(
+            &source_root,
+            &resolved_root,
+            "apps-stateless",
+            "api",
+            "dc1",
+        )
+        .expect("build manifest render values");
+        let root = as_obj(&out).expect("root map");
+
+        assert_eq!(
+            root.get("global")
+                .and_then(as_obj)
+                .and_then(|global| global.get("vars"))
+                .and_then(as_obj)
+                .and_then(|vars| vars.get("KAFKA"))
+                .and_then(JsonValue::as_str),
+            Some("from-override"),
+            "an override under global must reach the backend"
+        );
+        assert_eq!(
+            root.get("global")
+                .and_then(as_obj)
+                .and_then(|global| global.get("env"))
+                .and_then(JsonValue::as_str),
+            Some("dc1"),
+            "the env asked for wins over the one written in the document"
+        );
+
+        let group = root
+            .get("apps-stateless")
+            .and_then(as_obj)
+            .expect("apps-stateless");
+        for (app, enabled) in [("api", true), ("worker", false)] {
+            assert_eq!(
+                group
+                    .get(app)
+                    .and_then(as_obj)
+                    .and_then(|app| app.get("enabled"))
+                    .and_then(JsonValue::as_bool),
+                Some(enabled),
+                "{app}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_manifest_source_root_materializes_root_include_profiles() {
         let source_root = json!({
             "global": {
                 "env": "dev",
@@ -8968,7 +8208,7 @@ apps-stateless:
             overrides: HashMap::new(),
         };
 
-        let out = build_fast_manifest_source_root(&parsed).expect("build fast manifest source");
+        let out = build_manifest_source_root(&parsed).expect("build fast manifest source");
 
         let out_root = as_obj(&out).expect("root map");
         let out_group = out_root
@@ -8997,61 +8237,7 @@ apps-stateless:
     }
 
     #[test]
-    fn build_manifest_entity_isolation_set_values_from_resolved_root_disables_only_active_siblings()
-    {
-        let resolved_root = json!({
-            "global": { "env": "demo" },
-            "apps-stateless": {
-                "target": { "enabled": false },
-                "enabled-a": { "enabled": true },
-                "disabled-a": { "enabled": false }
-            },
-            "apps-cronjobs": {
-                "enabled-b": { "enabled": true },
-                "disabled-b": { "enabled": false }
-            }
-        });
-
-        let set_values = build_manifest_entity_isolation_set_values_from_resolved_root(
-            &resolved_root,
-            "apps-stateless",
-            "target",
-        )
-        .expect("build isolation set values");
-
-        assert_eq!(
-            set_values,
-            vec![
-                "apps-stateless.target.enabled=true".to_string(),
-                "apps-cronjobs.enabled-b.enabled=false".to_string(),
-                "apps-stateless.enabled-a.enabled=false".to_string(),
-            ]
-        );
-    }
-
     #[test]
-    fn select_manifest_values_files_prefers_primary_root_for_included_file_owned_by_primary() {
-        let current_path = PathBuf::from("/tmp/chart/configs/application.yaml");
-        let primary_values = PathBuf::from("/tmp/chart/values.yaml");
-        let root_documents = vec![
-            primary_values.clone(),
-            PathBuf::from("/tmp/chart/deployments-values.yaml"),
-        ];
-        let include_owners = BTreeSet::from([
-            primary_values.clone(),
-            PathBuf::from("/tmp/chart/deployments-values.yaml"),
-        ]);
-
-        let selected = select_manifest_values_files(
-            &current_path,
-            &root_documents,
-            Some(&primary_values),
-            Some(&include_owners),
-        );
-
-        assert_eq!(selected, vec![primary_values]);
-    }
-
     /// helm-apps stamps `$.Release.Namespace` onto the bindings it generates,
     /// so a render placed in the wrong namespace answers about a different
     /// deployment.
@@ -9060,8 +8246,7 @@ apps-stateless:
         let args = build_manifest_backend_args(
             ManifestPreviewRenderer::Helm,
             Path::new("/tmp/chart"),
-            &[],
-            &[],
+            Path::new("/tmp/preview/values.preview.json"),
             "demo",
             &ReleaseIdentity {
                 name: Some("vega".to_string()),
@@ -9088,8 +8273,7 @@ apps-stateless:
             let args = build_manifest_backend_args(
                 renderer,
                 Path::new("/tmp/chart"),
-                &[],
-                &[],
+                Path::new("/tmp/preview/values.preview.json"),
                 "demo",
                 &ReleaseIdentity {
                     name: None,
@@ -9111,27 +8295,22 @@ apps-stateless:
         let args = build_manifest_backend_args(
             ManifestPreviewRenderer::Fast,
             Path::new("/tmp/chart"),
-            &[],
-            &[],
+            Path::new("/tmp/preview/values.preview.json"),
             "demo",
             &ReleaseIdentity::default(),
         );
         assert_eq!(args.get(1).map(String::as_str), Some(HELM_PREVIEW_RELEASE));
     }
 
+    /// The backend is given one whole values root, not the chart's own files
+    /// plus a patch. Anything else lets the caller's `-f` and `--set` reach one
+    /// renderer and not another.
     #[test]
-    fn build_manifest_backend_args_for_helm_uses_values_sets_and_global_env() {
+    fn build_manifest_backend_args_for_helm_passes_only_the_preview_values() {
         let args = build_manifest_backend_args(
             ManifestPreviewRenderer::Helm,
             Path::new("/tmp/chart"),
-            &[
-                PathBuf::from("/tmp/chart/values.yaml"),
-                PathBuf::from("/tmp/chart/deployments-values.yaml"),
-            ],
-            &[
-                "apps-stateless.app-1.enabled=true".to_string(),
-                "apps-stateless.app-2.enabled=false".to_string(),
-            ],
+            Path::new("/tmp/preview/values.preview.json"),
             "demo",
             &ReleaseIdentity::default(),
         );
@@ -9143,13 +8322,7 @@ apps-stateless:
                 "helm-apps-preview".to_string(),
                 "/tmp/chart".to_string(),
                 "--values".to_string(),
-                "/tmp/chart/values.yaml".to_string(),
-                "--values".to_string(),
-                "/tmp/chart/deployments-values.yaml".to_string(),
-                "--set".to_string(),
-                "apps-stateless.app-1.enabled=true".to_string(),
-                "--set".to_string(),
-                "apps-stateless.app-2.enabled=false".to_string(),
+                "/tmp/preview/values.preview.json".to_string(),
                 "--set-string".to_string(),
                 "global.env=demo".to_string(),
             ]
@@ -9161,8 +8334,7 @@ apps-stateless:
         let args = build_manifest_backend_args(
             ManifestPreviewRenderer::Werf,
             Path::new("/tmp/project"),
-            &[PathBuf::from("/tmp/project/.helm/values.yaml")],
-            &["apps-stateless.app-1.enabled=true".to_string()],
+            Path::new("/tmp/preview/values.preview.json"),
             "demo",
             &ReleaseIdentity::default(),
         );
@@ -9177,14 +8349,38 @@ apps-stateless:
                 "--ignore-secret-key".to_string(),
                 "--loose-giterminism".to_string(),
                 "--values".to_string(),
-                "/tmp/project/.helm/values.yaml".to_string(),
-                "--set".to_string(),
-                "apps-stateless.app-1.enabled=true".to_string(),
+                "/tmp/preview/values.preview.json".to_string(),
                 "--env".to_string(),
                 "demo".to_string(),
                 "--set-string".to_string(),
                 "global.env=demo".to_string(),
             ]
         );
+    }
+
+    /// No renderer may reach the backend without the file happ wrote: that file
+    /// is the only place the caller's overrides live.
+    #[test]
+    fn every_backend_is_handed_the_preview_values_file() {
+        for renderer in [
+            ManifestPreviewRenderer::Fast,
+            ManifestPreviewRenderer::Helm,
+            ManifestPreviewRenderer::Werf,
+        ] {
+            let args = build_manifest_backend_args(
+                renderer,
+                Path::new("/tmp/chart"),
+                Path::new("/tmp/preview/values.preview.json"),
+                "demo",
+                &ReleaseIdentity::default(),
+            );
+            let at = args.iter().position(|arg| arg == "--values");
+            assert_eq!(
+                at.and_then(|at| args.get(at + 1)).map(String::as_str),
+                Some("/tmp/preview/values.preview.json"),
+                "{renderer:?}: {args:?}"
+            );
+            assert!(!args.iter().any(|arg| arg == "--set"), "{renderer:?}");
+        }
     }
 }
