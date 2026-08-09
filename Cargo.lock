@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "happ"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "base64",
  "clap",
@@ -1830,8 +1830,8 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zq"
-version = "1.5.1"
-source = "git+https://github.com/alvnukov/zq?tag=v1.5.1#c735e5dc235d4d8bd643f8f25607cb92de07055a"
+version = "1.5.4"
+source = "git+https://github.com/alvnukov/zq?tag=v1.5.4#8299047e2ecab013bc0e2bffc96c0593336ed85c"
 dependencies = [
  "base64",
  "clap",

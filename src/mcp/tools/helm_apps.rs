@@ -2050,6 +2050,24 @@ mod tests {
     }
 
     #[test]
+    fn query_error_identifies_the_failing_resolved_value() {
+        let chart = chart_fixture();
+        let err = run(
+            &context(),
+            json!({
+                "op": "query", "chart": chart_arg(&chart),
+                "query": ".[\"apps-stateless\"].api.replicas.value",
+            }),
+        )
+        .expect_err("indexing through the resolved replica count must fail");
+
+        assert!(
+            err.contains("at input[0] path $[\"apps-stateless\"][\"api\"][\"replicas\"]"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn query_manifests_runs_across_enabled_apps_and_keeps_provenance() {
         let chart = chart_fixture();
         std::fs::write(

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.2] - 2026-08-09
+
+### Fixed
+
+- jq runtime errors from values and manifest queries now identify the failing input number and resolved JSON path.
+
 ## [1.2.1] - 2026-07-30
 
 ### Added
