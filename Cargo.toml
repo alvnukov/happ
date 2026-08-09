@@ -13,7 +13,7 @@ clap_complete = "4.6.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { package = "serde_norway", version = "0.9.42" }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
-thiserror = "1.0.69"
+thiserror = "2.0.18"
 indexmap = { version = "2.13.0", features = ["serde"] }
 regex = "1.12.3"
 unsafe-libyaml = "0.2.11"
