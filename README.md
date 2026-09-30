@@ -553,7 +553,7 @@ cargo test --test parity_cli
 During build, `happ` fetches `helm-apps` chart from GitHub and embeds it into binary.
 
 - default repo: `https://github.com/alvnukov/helm-apps.git`
-- default ref: `helm-apps-1.10.0`
+- default ref: `helm-apps-1.10.1`
 - override repo: `HELM_APPS_GITHUB_REPO`
 - override ref: `HELM_APPS_GITHUB_REF`
 - force local chart path: `HELM_APPS_CHART_PATH=/abs/path/to/charts/helm-apps`

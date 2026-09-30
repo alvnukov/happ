@@ -78,7 +78,8 @@ pub(crate) fn discover_environments(values: &JsonValue) -> EnvironmentDiscovery 
         literals.insert(global_env);
     }
 
-    walk_maps(values, &mut |map| {
+    let current_env = global_env(values).unwrap_or_else(|| "dev".into());
+    walk_maps(values, Scope::Outside, &current_env, &mut |map| {
         if !looks_like_env_map(map) {
             return;
         }
@@ -135,10 +136,15 @@ enum Scope {
     Outside,
     /// A top-level `apps-*` group; its children are app names.
     Group,
+    NetworkPolicyGroup,
     /// One app; its children are the app's value keys.
     AppRoot,
+    NetworkPolicyRoot,
     /// An app value, where the key names a `fl.value` site.
     AppValue,
+    /// NetworkPolicy selects an environment once, then serializes the spec as data.
+    NativeSpec,
+    NativeData,
 }
 
 impl Scope {
@@ -149,12 +155,72 @@ impl Scope {
     /// before anything counts as a value.
     fn enter(self, key: &str) -> Self {
         match self {
+            Scope::Outside if key == "apps-network-policies" => Scope::NetworkPolicyGroup,
             Scope::Outside if key.starts_with("apps-") => Scope::Group,
             Scope::Outside => Scope::Outside,
             Scope::Group => Scope::AppRoot,
-            Scope::AppRoot | Scope::AppValue => Scope::AppValue,
+            Scope::NetworkPolicyGroup => Scope::NetworkPolicyRoot,
+            Scope::NetworkPolicyRoot if key == "spec" => Scope::NativeSpec,
+            Scope::AppRoot | Scope::NetworkPolicyRoot if key == "childApps" => Scope::Outside,
+            Scope::AppRoot | Scope::NetworkPolicyRoot | Scope::AppValue => Scope::AppValue,
+            Scope::NativeSpec | Scope::NativeData => Scope::NativeData,
         }
     }
+
+    fn app_path(group: &str, path: &[String]) -> Self {
+        path.iter()
+            .fold(Self::Outside.enter(group).enter("app"), |scope, key| {
+                scope.enter(key)
+            })
+    }
+
+    fn for_value(self, value: &JsonValue, env: &str) -> Self {
+        let declared = match self {
+            Self::Group | Self::NetworkPolicyGroup => selected_group_type(value, env),
+            Self::AppRoot | Self::NetworkPolicyRoot => value
+                .get("__AppType__")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            _ => None,
+        };
+        match (self, declared.as_deref()) {
+            (Self::Group | Self::NetworkPolicyGroup, Some("apps-network-policies")) => {
+                Self::NetworkPolicyGroup
+            }
+            (Self::Group | Self::NetworkPolicyGroup, Some(_)) => Self::Group,
+            (Self::AppRoot | Self::NetworkPolicyRoot, Some("apps-network-policies")) => {
+                Self::NetworkPolicyRoot
+            }
+            (Self::AppRoot | Self::NetworkPolicyRoot, Some(_)) => Self::AppRoot,
+            _ => self,
+        }
+    }
+}
+
+pub(crate) fn app_type(
+    group: &str,
+    group_value: &JsonValue,
+    app_value: &JsonValue,
+    env: &str,
+) -> String {
+    app_value
+        .get("__AppType__")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .or_else(|| selected_group_type(group_value, env))
+        .unwrap_or_else(|| group.into())
+}
+
+fn selected_group_type(value: &JsonValue, env: &str) -> Option<String> {
+    let declared = value.pointer("/__GroupVars__/type")?;
+    let selected = declared
+        .as_object()
+        .and_then(|map| select_env_value(map, env));
+    selected
+        .as_ref()
+        .unwrap_or(declared)
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Value keys the library hands to `fl.value`, so that whatever sits there is
@@ -211,6 +277,18 @@ fn resolve_env_maps_at(
     key: Option<&str>,
     scope: Scope,
 ) -> Option<JsonValue> {
+    let scope = scope.for_value(value, env);
+    if scope == Scope::NativeSpec {
+        return Some(
+            value
+                .as_object()
+                .and_then(|map| select_env_value(map, env))
+                .unwrap_or_else(|| value.clone()),
+        );
+    }
+    if scope == Scope::NativeData {
+        return Some(value.clone());
+    }
     match value {
         JsonValue::Array(items) => Some(JsonValue::Array(
             items
@@ -284,6 +362,10 @@ fn collect_ambiguous_env_regexes(
     path: &mut Vec<String>,
     found: &mut Vec<AmbiguousEnvRegex>,
 ) {
+    let scope = scope.for_value(value, env);
+    if scope == Scope::NativeData {
+        return;
+    }
     match value {
         JsonValue::Array(items) => {
             for (index, item) in items.iter().enumerate() {
@@ -293,13 +375,16 @@ fn collect_ambiguous_env_regexes(
             }
         }
         JsonValue::Object(map) => {
-            if is_env_map(map, key, scope) {
+            if scope == Scope::NativeSpec || is_env_map(map, key, scope) {
                 let patterns = matching_env_regexes(map, env);
                 if patterns.len() > 1 {
                     found.push(AmbiguousEnvRegex {
                         path: path.join("."),
                         patterns,
                     });
+                }
+                if scope == Scope::NativeSpec {
+                    return;
                 }
                 if let Some(selected) = select_env_value(map, env) {
                     collect_ambiguous_env_regexes(&selected, env, key, scope, path, found);
@@ -385,12 +470,17 @@ pub(crate) fn matching_env_regexes(map: &JsonMap<String, JsonValue>, env: &str) 
 /// Which key of an env map the chart picks, for reporting rather than
 /// resolving.
 ///
-/// `None` when the value at `key` is not an env map at all, or is one that
+/// `None` when the value at the app-relative `path` is not an env map, or is one that
 /// names nothing for `env` — the two cases a reader has to tell apart when a
 /// field turns out to be absent.
-pub(crate) fn app_env_selection(value: &JsonValue, env: &str, key: &str) -> Option<String> {
+pub(crate) fn app_env_selection(
+    value: &JsonValue,
+    env: &str,
+    group: &str,
+    path: &[String],
+) -> Option<String> {
     let map = value.as_object()?;
-    if !is_env_map(map, Some(key), Scope::AppValue) {
+    if !is_app_env_map(value, env, group, path) {
         return None;
     }
     if map.contains_key(env) {
@@ -403,11 +493,17 @@ pub(crate) fn app_env_selection(value: &JsonValue, env: &str, key: &str) -> Opti
         .then(|| DEFAULT_ENV_KEY.to_string())
 }
 
-/// Whether the value at `key` inside an app is read as an env map at all.
-pub(crate) fn is_app_env_map(value: &JsonValue, key: &str) -> bool {
-    value
-        .as_object()
-        .is_some_and(|map| is_env_map(map, Some(key), Scope::AppValue))
+/// Whether an app-relative value is an env map, respecting native data boundaries.
+pub(crate) fn is_app_env_map(value: &JsonValue, env: &str, group: &str, path: &[String]) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    let scope = Scope::app_path(group, path);
+    match scope {
+        Scope::NativeData => false,
+        Scope::NativeSpec => select_env_value(map, env).is_some(),
+        _ => is_env_map(map, path.last().map(String::as_str), scope),
+    }
 }
 
 /// Selects the value an env map yields for `env`.
@@ -434,17 +530,26 @@ pub(crate) fn select_env_value(map: &JsonMap<String, JsonValue>, env: &str) -> O
     map.get(DEFAULT_ENV_KEY).cloned()
 }
 
-fn walk_maps(value: &JsonValue, on_map: &mut dyn FnMut(&JsonMap<String, JsonValue>)) {
+fn walk_maps(
+    value: &JsonValue,
+    scope: Scope,
+    env: &str,
+    on_map: &mut dyn FnMut(&JsonMap<String, JsonValue>),
+) {
+    let scope = scope.for_value(value, env);
     match value {
         JsonValue::Array(items) => {
             for item in items {
-                walk_maps(item, on_map);
+                walk_maps(item, scope, env, on_map);
             }
         }
         JsonValue::Object(map) => {
             on_map(map);
-            for child in map.values() {
-                walk_maps(child, on_map);
+            if scope == Scope::NativeSpec {
+                return;
+            }
+            for (key, child) in map {
+                walk_maps(child, scope.enter(key), env, on_map);
             }
         }
         _ => {}
@@ -458,6 +563,96 @@ mod tests {
 
     fn map_of(value: JsonValue) -> JsonMap<String, JsonValue> {
         value.as_object().expect("object").clone()
+    }
+
+    #[test]
+    fn native_network_policy_specs_select_only_the_outer_environment() {
+        let spec = json!({"podSelector": {"matchLabels": {
+            "prod": "yes", "app.kubernetes.io/name": "api", "_default": "literal",
+        }}});
+        for source in [
+            spec.clone(),
+            json!({"_default": spec}),
+            json!({"prod": spec}),
+            json!({"^prod$": spec}),
+        ] {
+            let values = json!({"global": {"env": "prod"}, "apps-network-policies": {
+                "policy": {"spec": source, "podSelector": {"_default": "matchLabels: {app: fallback}"}},
+            }});
+            let resolved = resolve_env_maps(&values, "prod");
+            assert_eq!(resolved["apps-network-policies"]["policy"]["spec"], spec);
+            assert_eq!(
+                resolved["apps-network-policies"]["policy"]["podSelector"],
+                json!("matchLabels: {app: fallback}")
+            );
+            assert!(find_ambiguous_env_regexes(&values, "prod").is_empty());
+            assert_eq!(
+                discover_environments(&values).regexes,
+                if source == spec {
+                    Vec::<String>::new()
+                } else if source.get("^prod$").is_some() {
+                    vec!["^prod$".into()]
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn child_network_policy_specs_preserve_raw_data_and_report_outer_ambiguity() {
+        let spec =
+            json!({"podSelector": {"matchLabels": {"^prod.*$": "literal", ".*eu": "literal"}}});
+        let mut values = json!({"apps-stateless": {"parent": {"childApps": {"apps-network-policies": {
+            "policy": {"spec": spec},
+        }}}}});
+        let resolved = resolve_env_maps(&values, "prod-eu");
+        assert_eq!(
+            resolved["apps-stateless"]["parent"]["childApps"]["apps-network-policies"]["policy"]
+                ["spec"],
+            spec
+        );
+        assert!(find_ambiguous_env_regexes(&values, "prod-eu").is_empty());
+        values["apps-stateless"]["parent"]["childApps"]["apps-network-policies"]["policy"]
+            ["spec"] = json!({"^prod.*$": spec, ".*eu": spec});
+        let found = find_ambiguous_env_regexes(&values, "prod-eu");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].path.ends_with("policy.spec"));
+    }
+
+    #[test]
+    fn native_spec_boundaries_follow_custom_group_and_app_types() {
+        let spec = json!({"podSelector": {"matchLabels": {"prod": "yes"}}});
+        let values = json!({
+            "apps-custom": {"__GroupVars__": {"type": "apps-network-policies"}, "policy": {"spec": spec}},
+            "apps-stateless": {"policy": {"__AppType__": "apps-network-policies", "spec": {"prod": spec}}},
+        });
+        let resolved = resolve_env_maps(&values, "prod");
+        for group in ["apps-custom", "apps-stateless"] {
+            assert_eq!(resolved[group]["policy"]["spec"], spec);
+            assert_eq!(
+                app_type(group, &values[group], &values[group]["policy"], "prod"),
+                "apps-network-policies"
+            );
+        }
+    }
+
+    #[test]
+    fn native_spec_boundaries_follow_env_selected_and_declared_group_types() {
+        let spec = json!({"podSelector": {"matchLabels": {"prod": "yes"}}});
+        let values = json!({
+            "global": {"env": "prod"},
+            "apps-custom": {"__GroupVars__": {"type": {"_default": "apps-network-policies"}}, "policy": {"spec": spec}},
+            "apps-stateless": {"__GroupVars__": {"type": "apps-network-policies"}, "policy": {"spec": spec}},
+        });
+        let resolved = resolve_env_maps(&values, "prod");
+        for group in ["apps-custom", "apps-stateless"] {
+            assert_eq!(resolved[group]["policy"]["spec"], spec);
+            assert_eq!(
+                app_type(group, &values[group], &values[group]["policy"], "prod"),
+                "apps-network-policies"
+            );
+        }
     }
 
     #[test]

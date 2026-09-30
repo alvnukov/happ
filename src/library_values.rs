@@ -485,7 +485,11 @@ fn load_yaml_map_from_file(
                 return Err(message);
             }
         };
-        let parsed = parse_yaml_map_to_json_map(&text)?;
+        let parsed = if text.trim().is_empty() {
+            JsonMap::new()
+        } else {
+            parse_yaml_map_to_json_map(&text)?
+        };
         return Ok(Some((candidate, parsed)));
     }
     Ok(None)
@@ -709,6 +713,99 @@ fn json_value_to_yaml_value(value: &JsonValue) -> Result<Value, String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn optional_file_includes_accept_only_blank_or_mapping_documents() {
+        let td = TempDir::new().expect("tmp");
+        let path = td.path().join("optional.yaml");
+        for text in ["", " \n\t\r\n", "{}"] {
+            fs::write(&path, text).expect("include");
+            let (_, map) = load_yaml_map_from_file(
+                "optional.yaml",
+                Some(td.path()),
+                &HashMap::new(),
+                &mut HashSet::new(),
+            )
+            .expect("blank optional include")
+            .expect("existing include");
+            assert!(map.is_empty(), "{text:?}: {map:?}");
+        }
+        for text in [
+            "# comment\n",
+            "---\n",
+            "null\n",
+            "~\n",
+            "- item\n",
+            "scalar\n",
+            "[invalid",
+        ] {
+            fs::write(&path, text).expect("include");
+            assert!(
+                load_yaml_map_from_file(
+                    "optional.yaml",
+                    Some(td.path()),
+                    &HashMap::new(),
+                    &mut HashSet::new(),
+                )
+                .is_err(),
+                "invalid include {text:?}"
+            );
+        }
+        fs::write(&path, "Error: user-data\n").expect("include");
+        let (_, map) = load_yaml_map_from_file(
+            "optional.yaml",
+            Some(td.path()),
+            &HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("mapping")
+        .expect("existing include");
+        assert_eq!(map["Error"], JsonValue::String("user-data".into()));
+        assert!(
+            parse_yaml_map_to_json_map("").is_err(),
+            "primary values stay strict"
+        );
+        assert!(parse_yaml_map_to_json_map("null").is_err());
+    }
+
+    #[test]
+    fn empty_file_includes_register_an_empty_profile_for_export() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(td.path().join("optional.yaml"), " \n").expect("include");
+        let root = parse_yaml_map_to_json_map("_include_files: [optional.yaml]\n").expect("values");
+        let expanded = expand_values_with_file_includes(&root, Some(td.path()), &HashMap::new())
+            .expect("expand file includes");
+        let profile = include_name_from_path("optional.yaml");
+        assert_eq!(
+            expanded["global"]["_includes"][&profile],
+            serde_json::json!({})
+        );
+        assert_eq!(expanded["_include"], serde_json::json!([profile]));
+    }
+
+    #[test]
+    fn export_preserves_native_network_policy_specs_after_outer_env_selection() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(
+            td.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: demo\nversion: 0.1.0\n",
+        )
+        .expect("chart");
+        let spec = serde_json::json!({"podSelector": {"matchLabels": {"prod": "yes", "app.kubernetes.io/name": "api"}}});
+        let values = serde_json::json!({"global": {"env": "prod"}, "apps-network-policies": {
+            "native": {"enabled": true, "spec": spec},
+            "default": {"enabled": true, "spec": {"_default": spec}},
+            "exact": {"enabled": true, "spec": {"prod": spec}},
+        }});
+        fs::write(td.path().join("values.yaml"), values.to_string()).expect("values");
+        let loaded =
+            load_library_chart_values_for_export(td.path().to_str().expect("chart path"), None)
+                .expect("export values");
+        let values = serde_json::to_value(loaded.values).expect("exported JSON");
+        for app in ["native", "default", "exact"] {
+            assert_eq!(values["apps-network-policies"][app]["spec"], spec);
+        }
+    }
 
     #[test]
     fn load_library_chart_values_expands_includes_files_and_env() {

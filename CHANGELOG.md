@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.3.1] - 2026-10-01
+
+### Changed
+
+- Updated the embedded helm-apps library to 1.10.1, including renderer corrections for child apps, RBAC, NetworkPolicy, container volumes and managed secret checksums.
+
+### Fixed
+
+- MCP and LSP rendering now accept empty optional `_include_files` and `_include_from_file` documents, matching helm-apps. Non-empty invalid documents remain errors.
+- MCP queries, value origins and ordinary-chart export preserve native NetworkPolicy specs while selecting only their outer environment branch.
+
+### Upgrade notes
+
+- The corrected `secretEnvVars` checksum can trigger an initial workload rollout after upgrading.
+- Conflicting pod volume names are now rejected with `E_VOLUME_NAME_CONFLICT` instead of producing an invalid manifest.
+
 ## [1.3.0] - 2026-09-30
 
 ### Added
