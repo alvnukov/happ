@@ -1,0 +1,39 @@
+global:
+  env: dev
+  validation:
+    strict: true
+  compat:
+    kubeVersion: "1.25"
+apps-daemonsets:
+  node-agent:
+    _include: [apps-daemonsets-defaultDaemonSet]
+    enabled: true
+    hostNetwork: false
+    hostUsers: false
+    verticalPodAutoscaler:
+      enabled: false
+    initContainers:
+      setup:
+        _include: [apps-daemonsets-defaultDaemonSetInitContainer]
+        image:
+          name: busybox
+          staticTag: "1.36"
+    containers:
+      main:
+        _include: [apps-daemonsets-defaultDaemonSetContainer]
+        image:
+          name: nginx
+          staticTag: "1.27"
+apps-cronjobs:
+  cleanup:
+    enabled: true
+    schedule: "0 * * * *"
+    timeZone: Etc/UTC
+    suspend: false
+    restartPolicy: Never
+    containers:
+      main:
+        enabled: true
+        image:
+          name: busybox
+          staticTag: "1.36"

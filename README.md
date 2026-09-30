@@ -553,10 +553,14 @@ cargo test --test parity_cli
 During build, `happ` fetches `helm-apps` chart from GitHub and embeds it into binary.
 
 - default repo: `https://github.com/alvnukov/helm-apps.git`
-- default ref: `helm-apps-1.9.0`
+- default ref: `helm-apps-1.10.0`
 - override repo: `HELM_APPS_GITHUB_REPO`
 - override ref: `HELM_APPS_GITHUB_REF`
 - force local chart path: `HELM_APPS_CHART_PATH=/abs/path/to/charts/helm-apps`
+
+MCP and LSP recognize the library's `apps-daemonsets` group and its default
+profiles. Manifest previews preserve boolean `false` values and honor
+`global.compat.kubeVersion`, including when supplied through MCP `set` overrides.
 
 ## Test coverage
 

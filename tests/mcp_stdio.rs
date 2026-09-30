@@ -178,6 +178,170 @@ fn the_default_chart_from_the_command_line_is_used() {
 }
 
 #[test]
+fn external_code_operations_and_changed_diagnostics_work_over_the_wire() {
+    let project = tempfile::tempdir().expect("tempdir");
+    let file = project.path().join("agent.go");
+    std::fs::write(&file, "func Agent() {}\n").expect("source");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-lsp.mjs");
+    let command = format!("go=node {}", fixture.display());
+    let mut client = Client::start(&["--language-server", &command]);
+    let file_arg = file.to_string_lossy();
+
+    let (first, failed) =
+        client.call_tool("code", json!({ "op": "diagnostics", "file": file_arg }));
+    assert!(!failed && first.contains("first version error"), "{first}");
+    std::fs::write(&file, "func Agent() { /* changed */ }\n").expect("changed source");
+    let (second, failed) =
+        client.call_tool("code", json!({ "op": "diagnostics", "file": file_arg }));
+    assert!(!failed && second.contains("No diagnostics"), "{second}");
+
+    for op in ["definition", "references", "hover", "symbols", "calls"] {
+        let (text, failed) = client.call_tool(
+            "code",
+            json!({ "op": op, "file": file_arg, "symbol": "Agent" }),
+        );
+        assert!(!failed && text.contains("Agent"), "{op}: {text}");
+        assert!(!text.starts_with("No "), "{op}: {text}");
+    }
+    let (outgoing, failed) = client.call_tool(
+        "code",
+        json!({
+            "op": "calls", "file": file_arg, "symbol": "Agent", "direction": "outgoing",
+        }),
+    );
+    assert!(!failed && outgoing.contains("Agent"), "{outgoing}");
+    let (workspace, failed) = client.call_tool(
+        "code",
+        json!({
+            "op": "symbols", "file": file_arg, "query": "Agent",
+        }),
+    );
+    assert!(!failed && workspace.contains("Agent"), "{workspace}");
+    let (languages, failed) = client.call_tool("code", json!({ "op": "languages" }));
+    assert!(!failed, "{languages}");
+    assert!(
+        languages.contains("textDocument/documentSymbol"),
+        "{languages}"
+    );
+    assert!(
+        !languages.contains("textDocument/typeDefinition"),
+        "{languages}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn helm_apps_110_operations_work_over_the_wire() {
+    let chart = chart_fixture();
+    let extracted = Command::new(bin())
+        .args(["library", "extract", "--out-dir"])
+        .arg(chart.path().join("charts/helm-apps"))
+        .output()
+        .expect("extract library");
+    assert!(
+        extracted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    std::fs::write(chart.path().join("Chart.yaml"),
+        "apiVersion: v2\nname: demo\nversion: 0.1.0\ndependencies:\n  - name: helm-apps\n    version: 1.10.0\n")
+        .expect("chart dependency");
+    std::fs::create_dir(chart.path().join("templates")).expect("templates");
+    std::fs::write(
+        chart.path().join("templates/init.yaml"),
+        "{{- include \"apps-utils.init-library\" $ }}\n",
+    )
+    .expect("library wiring");
+    std::fs::write(
+        chart.path().join("values.yaml"),
+        include_str!("fixtures/helm-apps-1.10-values.yaml"),
+    )
+    .expect("values");
+    let mut client = Client::start(&["--chart", &chart.path().to_string_lossy()]);
+    for op in [
+        "overview",
+        "apps",
+        "lint",
+        "contract",
+        "template",
+        "origin",
+        "resolve",
+        "diff",
+        "query",
+        "query_manifests",
+    ] {
+        let (text, failed) = client.call_tool("helm_apps", json!({
+            "op": op, "group": "apps-daemonsets", "app": "node-agent",
+            "name": if op == "template" { "apps-daemonsets" } else { "groups" },
+            "from_env": "dev", "to_env": "prod",
+            "query": if op == "query_manifests" { ".[] | select(.manifest.kind == \"DaemonSet\") | .manifest.kind" } else { ".[\"apps-daemonsets\"][\"node-agent\"].hostNetwork" },
+        }));
+        assert!(!failed, "{op}: {text}");
+        if matches!(op, "overview" | "apps" | "contract" | "template") {
+            assert!(text.contains("daemonsets"), "{op}: {text}");
+        }
+        if op == "query" {
+            assert_eq!(text.trim(), "false");
+        }
+        if op == "query_manifests" {
+            assert_eq!(text.trim(), "\"DaemonSet\"");
+        }
+    }
+
+    let (text, failed) = client.call_tool(
+        "helm_apps",
+        json!({
+            "op": "render", "group": "apps-daemonsets", "app": "node-agent",
+            "renderer": "fast", "kind": "DaemonSet",
+        }),
+    );
+    assert!(!failed, "{text}");
+    let daemon: serde_json::Value = serde_yaml::from_str(&text).expect("DaemonSet YAML");
+    assert_eq!(daemon["kind"], "DaemonSet");
+    assert_eq!(
+        daemon.pointer("/spec/template/spec/hostNetwork"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        daemon.pointer("/spec/template/spec/hostUsers"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        daemon.pointer("/spec/template/spec/containers/0/image"),
+        Some(&json!("nginx:1.27"))
+    );
+    assert_eq!(
+        daemon.pointer("/spec/template/spec/initContainers/0/image"),
+        Some(&json!("busybox:1.36"))
+    );
+
+    for (version, expected_time_zone) in [("1.23", None), ("1.24", Some(json!("Etc/UTC")))] {
+        let (text, failed) = client.call_tool(
+            "helm_apps",
+            json!({
+            "op": "render", "group": "apps-cronjobs", "app": "cleanup",
+            "kind": "CronJob",
+            "set": { "global.compat.kubeVersion": version },
+            }),
+        );
+        assert!(!failed, "{version}: {text}");
+        let cron: serde_json::Value = serde_yaml::from_str(&text).expect("CronJob YAML");
+        assert_eq!(cron["kind"], "CronJob");
+        assert_eq!(cron.pointer("/spec/timeZone"), expected_time_zone.as_ref());
+        assert_eq!(cron.pointer("/spec/suspend"), Some(&json!(false)));
+    }
+    let (text, failed) = client.call_tool(
+        "helm_apps",
+        json!({
+            "op": "render", "group": "apps-daemonsets", "app": "node-agent",
+            "set": { "apps-daemonsets.node-agent.replicas": 1 },
+        }),
+    );
+    assert!(failed && text.contains("E_STRICT_UNKNOWN_KEY"), "{text}");
+    client.shutdown();
+}
+
+#[test]
 fn a_tool_error_is_content_rather_than_a_protocol_error() {
     let mut client = Client::start(&[]);
     let (message, failed) = client.call_tool(
