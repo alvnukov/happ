@@ -4072,6 +4072,7 @@ const BUILTIN_APP_GROUPS: &[&str] = &[
     "apps-configmaps",
     "apps-cronjobs",
     "apps-custom-prometheus-rules",
+    "apps-daemonsets",
     "apps-dex-authenticators",
     "apps-dex-clients",
     "apps-grafana-dashboards",
@@ -5618,6 +5619,68 @@ fn as_obj(value: &JsonValue) -> Option<&JsonMap<String, JsonValue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemonset_documents_follow_open_change_close_lifecycle() {
+        let chart = tempfile::tempdir().expect("chart");
+        std::fs::write(
+            chart.path().join("Chart.yaml"),
+            "apiVersion: v2\nname: demo\nversion: 0.1.0\n",
+        )
+        .expect("chart metadata");
+        let path = chart.path().join("values.yaml");
+        let uri = url::Url::from_file_path(&path).expect("uri").to_string();
+        let (server, client) = Connection::memory();
+        let mut state = ServerState::default();
+        let enabled = "global:\n  env: dev\napps-daemonsets:\n  node-agent:\n    enabled: true\n";
+        handle_notification(&server, &mut state, &Notification::new("textDocument/didOpen".into(), json!({
+            "textDocument": { "uri": uri, "languageId": "yaml", "version": 1, "text": enabled },
+        }))).expect("open");
+        let listed = dispatch_request(&state, "happ/listEntities", &json!({ "uri": uri }))
+            .ok()
+            .expect("list");
+        assert_eq!(listed["enabledEntities"][0]["group"], "apps-daemonsets");
+        let resolved = dispatch_request(
+            &state,
+            "happ/resolveEntity",
+            &json!({
+                "uri": uri, "group": "apps-daemonsets", "app": "node-agent",
+            }),
+        )
+        .ok()
+        .expect("resolve");
+        assert_eq!(resolved["entity"]["enabled"], true);
+        let preview = dispatch_request(&state, "happ/getPreviewTheme", &json!({}))
+            .ok()
+            .expect("theme");
+        assert!(preview["ui"]["bg"].is_string());
+        handle_notification(&server, &mut state, &Notification::new("textDocument/didChange".into(), json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": enabled.replace("enabled: true", "enabled: false") }],
+        }))).expect("change");
+        let listed = dispatch_request(&state, "happ/listEntities", &json!({ "uri": uri }))
+            .ok()
+            .expect("changed list");
+        assert_eq!(listed["enabledEntities"], json!([]));
+        handle_notification(
+            &server,
+            &mut state,
+            &Notification::new(
+                "textDocument/didClose".into(),
+                json!({
+                    "textDocument": { "uri": uri },
+                }),
+            ),
+        )
+        .expect("close");
+        assert!(!state.documents.contains_key(&uri));
+        let notifications: Vec<Message> = client.receiver.try_iter().collect();
+        assert_eq!(notifications.len(), 3);
+        let Message::Notification(closed) = &notifications[2] else {
+            panic!("diagnostics notification")
+        };
+        assert_eq!(closed.params["diagnostics"], json!([]));
+    }
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -5981,8 +6044,8 @@ apps-stateless:
         let mut from_chart = library_groups_from_embedded_chart();
         assert_eq!(
             from_chart.len(),
-            20,
-            "expected 20 built-in groups, parsed {from_chart:?}"
+            21,
+            "expected 21 built-in groups, parsed {from_chart:?}"
         );
         from_chart.sort();
         let known: Vec<String> = BUILTIN_APP_GROUPS

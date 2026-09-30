@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.3.0] - 2026-09-30
+
+### Added
+
+- Added helm-apps 1.10.0 support, including DaemonSet groups and default profiles in MCP and LSP analysis.
+- Added end-to-end MCP coverage for every tool operation, external language servers, Kubernetes version gates and boolean `false` rendering.
+
+### Changed
+
+- Updated Rust, Helm/Go and web dependencies; regenerated vendored Go sources and the CodeMirror bundle.
+- Updated CI and CodeQL to Go 1.26.8 and CI to Node.js 24 LTS.
+
+### Fixed
+
+- LSP diagnostics no longer reuse cached results after document changes or accept publications for an older document version.
+- The LSP bridge now respects disabled capabilities, answers each workspace configuration item and tracks servers becoming busy again.
+- Isolated language-server discovery tests from the environment of parallel Go tests.
+- Updated flatted to address its prototype pollution advisory.
+
 ## [1.2.2] - 2026-08-09
 
 ### Fixed

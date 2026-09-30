@@ -343,22 +343,30 @@ mod tests {
     /// would be wrong, and refusing to start it worse.
     #[test]
     fn a_server_in_its_toolchains_default_location_is_found_off_path() {
+        if let Some(expected) = std::env::var_os("HAPP_TEST_GOPLS_PATH") {
+            assert_eq!(
+                resolve_program("go", "gopls"),
+                Some(PathBuf::from(expected))
+            );
+            return;
+        }
         let gopath = tempfile::tempdir().expect("tempdir");
         let bin = gopath.path().join("bin");
         std::fs::create_dir_all(&bin).expect("bin dir");
         let gopls = bin.join("gopls");
         std::fs::write(&gopls, "#!/bin/sh\n").expect("write");
 
-        let restore = std::env::var_os("GOPATH");
-        // SAFETY: single-threaded test, restored before returning.
-        unsafe { std::env::set_var("GOPATH", gopath.path()) };
-        let found = resolve_program("go", "gopls");
-        match restore {
-            Some(value) => unsafe { std::env::set_var("GOPATH", value) },
-            None => unsafe { std::env::remove_var("GOPATH") },
-        }
-
-        assert_eq!(found.as_deref(), Some(gopls.as_path()));
+        // Scope environment changes to a child: other tests may invoke Go
+        // concurrently, and a temporary GOPATH would hide their toolchains.
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "mcp::bridge::registry::tests::a_server_in_its_toolchains_default_location_is_found_off_path"])
+            .env("HAPP_TEST_GOPLS_PATH", &gopls)
+            .env("GOPATH", gopath.path())
+            .env("PATH", "")
+            .env_remove("GOBIN")
+            .status()
+            .expect("isolated test");
+        assert!(status.success());
     }
 
     #[test]

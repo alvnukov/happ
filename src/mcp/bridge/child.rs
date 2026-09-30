@@ -420,6 +420,15 @@ impl ChildProvider {
         else {
             return;
         };
+        if notification
+            .params
+            .get("version")
+            .and_then(JsonValue::as_i64)
+            .zip(self.opened.get(&uri))
+            .is_some_and(|(published, current)| published != i64::from(*current))
+        {
+            return;
+        }
         let diagnostics = notification
             .params
             .get("diagnostics")
@@ -448,13 +457,10 @@ impl ChildProvider {
     /// symbols or none depending on which indexing phase it lands between.
     fn track_server_status(&mut self, params: &JsonValue) {
         self.reports_status = true;
-        if params
+        self.quiescent = params
             .get("quiescent")
             .and_then(JsonValue::as_bool)
-            .unwrap_or(false)
-        {
-            self.quiescent = true;
-        }
+            .unwrap_or(false);
         let health = params.get("health").and_then(JsonValue::as_str);
         if matches!(health, Some("error") | Some("warning")) {
             let message = params
@@ -569,7 +575,14 @@ impl ChildProvider {
     /// capabilities, so the honest answer to most of these is an empty result.
     fn decline(&mut self, request: Request) -> Result<(), String> {
         let result = match request.method.as_str() {
-            "workspace/configuration" => json!([JsonValue::Null]),
+            "workspace/configuration" => JsonValue::Array(vec![
+                JsonValue::Null;
+                request
+                    .params
+                    .get("items")
+                    .and_then(JsonValue::as_array)
+                    .map_or(0, Vec::len)
+            ]),
             "client/registerCapability" | "client/unregisterCapability" => JsonValue::Null,
             "window/workDoneProgress/create" => JsonValue::Null,
             "workspace/workspaceFolders" => JsonValue::Null,
@@ -613,6 +626,9 @@ impl LspProvider for ChildProvider {
             .map_err(|err| format!("read {}: {err}", path.display()))?;
         let uri = path_to_uri(path)?;
 
+        self.published.remove(path);
+        self.quiescent = false;
+
         // Reopening a file the server already knows would be a protocol error;
         // a version bump through didChange is the way to refresh it.
         if let Some(version) = self.opened.get_mut(path) {
@@ -650,7 +666,11 @@ impl LspProvider for ChildProvider {
 
         // Prefer a pull request when the server supports one: it answers
         // immediately instead of leaving us guessing how long to listen.
-        if self.capabilities.get("diagnosticProvider").is_some() {
+        if self
+            .capabilities
+            .get("diagnosticProvider")
+            .is_some_and(|v| !v.is_null() && v != &JsonValue::Bool(false))
+        {
             let uri = path_to_uri(path)?;
             let result = self.request(
                 "textDocument/diagnostic",
@@ -689,7 +709,11 @@ impl LspProvider for ChildProvider {
     }
 
     fn supported_methods(&self) -> Vec<String> {
-        let has = |key: &str| self.capabilities.get(key).is_some_and(|v| !v.is_null());
+        let has = |key: &str| {
+            self.capabilities
+                .get(key)
+                .is_some_and(|v| v == &JsonValue::Bool(true) || v.is_object())
+        };
         let mut methods = Vec::new();
         for (capability, method) in [
             ("definitionProvider", "textDocument/definition"),
@@ -766,6 +790,24 @@ fn decode_diagnostic(raw: &JsonValue) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_status_tracks_busy_after_quiescence() {
+        let spec = super::super::registry::spec_for_language("go").expect("go spec");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-lsp.mjs");
+        let mut provider = ChildProvider::start(
+            spec,
+            &["node".to_string(), fixture.to_string_lossy().into_owned()],
+            Path::new("."),
+        )
+        .expect("fixture server");
+        provider.ensure_warm();
+        provider.proven = true;
+        provider.track_server_status(&json!({ "quiescent": true }));
+        assert!(provider.quiescent);
+        provider.track_server_status(&json!({ "quiescent": false }));
+        assert!(!provider.quiescent);
+    }
 
     #[test]
     fn diagnostics_decode_to_one_based_positions() {
