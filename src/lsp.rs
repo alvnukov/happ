@@ -2697,7 +2697,11 @@ fn load_yaml_map_from_file(
                 return Err(message);
             }
         };
-        let parsed = parse_yaml_map_to_json_map(&text)?;
+        let parsed = if text.trim().is_empty() {
+            JsonMap::new()
+        } else {
+            parse_yaml_map_to_json_map(&text)?
+        };
         return Ok(Some((candidate, parsed)));
     }
     Ok(None)
@@ -4886,6 +4890,9 @@ pub(crate) fn analysis_value_origins(
         values: own,
     });
 
+    let layered_app = JsonValue::Object(app_layered(&layers));
+    let env_group = crate::env_map::app_type(group, &literal.root[group], &layered_app, &used_env);
+
     // Later layers win, exactly as `merge_maps` has them win.
     let mut attributed: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
     for layer in &layers {
@@ -4894,6 +4901,8 @@ pub(crate) fn analysis_value_origins(
             &mut Vec::new(),
             layer,
             &mut attributed,
+            &env_group,
+            &used_env,
         );
     }
 
@@ -4916,11 +4925,11 @@ pub(crate) fn analysis_value_origins(
                 continue;
             }
         }
-        let key = path.rsplit('.').next().unwrap_or(&path);
-        let literal_value = value_at_path(&JsonValue::Object(app_layered(&layers)), &path);
-        let selector = literal_value
-            .as_ref()
-            .and_then(|value| crate::env_map::app_env_selection(value, &used_env, key));
+        let segments: Vec<_> = path.split('.').map(str::to_string).collect();
+        let literal_value = value_at_path(&layered_app, &path);
+        let selector = literal_value.as_ref().and_then(|value| {
+            crate::env_map::app_env_selection(value, &used_env, &env_group, &segments)
+        });
         // The app's own layer carries the app's name, which a profile may share.
         let defined_in = if from == app {
             definition_sites.get(&entity_site_key(app)).cloned()
@@ -5040,14 +5049,15 @@ fn record_layer_paths(
     path: &mut Vec<String>,
     layer: &ValueLayer,
     out: &mut BTreeMap<String, (String, Vec<String>)>,
+    group: &str,
+    env: &str,
 ) {
-    let key = path.last().cloned().unwrap_or_default();
-    let is_env_map = !path.is_empty() && crate::env_map::is_app_env_map(value, &key);
+    let is_env_map = !path.is_empty() && crate::env_map::is_app_env_map(value, env, group, path);
     match value {
         JsonValue::Object(map) if !is_env_map && !map.is_empty() => {
             for (child_key, child) in map {
                 path.push(child_key.clone());
-                record_layer_paths(child, path, layer, out);
+                record_layer_paths(child, path, layer, out, group, env);
                 path.pop();
             }
         }
@@ -5619,6 +5629,117 @@ fn as_obj(value: &JsonValue) -> Option<&JsonMap<String, JsonValue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_file_includes_accept_only_blank_or_mapping_documents() {
+        let td = TempDir::new().expect("tmp");
+        let path = td.path().join("optional.yaml");
+        for text in ["", " \n\t\r\n", "{}"] {
+            fs::write(&path, text).expect("include");
+            let (_, map) = load_yaml_map_from_file(
+                "optional.yaml",
+                Some(td.path()),
+                &HashMap::new(),
+                &mut HashSet::new(),
+            )
+            .expect("blank optional include")
+            .expect("existing include");
+            assert!(map.is_empty(), "{text:?}: {map:?}");
+        }
+        for text in [
+            "# comment\n",
+            "---\n",
+            "null\n",
+            "~\n",
+            "- item\n",
+            "scalar\n",
+            "[invalid",
+        ] {
+            fs::write(&path, text).expect("include");
+            assert!(
+                load_yaml_map_from_file(
+                    "optional.yaml",
+                    Some(td.path()),
+                    &HashMap::new(),
+                    &mut HashSet::new(),
+                )
+                .is_err(),
+                "invalid include {text:?}"
+            );
+        }
+        fs::write(&path, "Error: user-data\n").expect("include");
+        let (_, map) = load_yaml_map_from_file(
+            "optional.yaml",
+            Some(td.path()),
+            &HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("mapping")
+        .expect("existing include");
+        assert_eq!(map["Error"], JsonValue::String("user-data".into()));
+        assert!(
+            parse_yaml_map_to_json_map("").is_err(),
+            "primary values stay strict"
+        );
+        assert!(parse_yaml_map_to_json_map("null").is_err());
+    }
+
+    #[test]
+    fn optional_file_includes_use_open_document_overrides() {
+        let td = TempDir::new().expect("tmp");
+        let path = td.path().join("optional.yaml");
+        fs::write(&path, "source: disk\n").expect("include");
+        let overrides = HashMap::from([(normalize_fs_path(&path), " \n".into())]);
+        let (_, map) = load_yaml_map_from_file(
+            "optional.yaml",
+            Some(td.path()),
+            &overrides,
+            &mut HashSet::new(),
+        )
+        .expect("open empty include")
+        .expect("existing include");
+        assert!(map.is_empty());
+
+        fs::write(&path, "").expect("include");
+        let overrides = HashMap::from([(normalize_fs_path(&path), "source: editor\n".into())]);
+        let (_, map) = load_yaml_map_from_file(
+            "optional.yaml",
+            Some(td.path()),
+            &overrides,
+            &mut HashSet::new(),
+        )
+        .expect("open edited include")
+        .expect("existing include");
+        assert_eq!(map["source"], JsonValue::String("editor".into()));
+    }
+
+    #[test]
+    fn manifest_root_layers_skip_blank_optional_files_and_keep_precedence() {
+        let td = TempDir::new().expect("tmp");
+        fs::write(td.path().join("optional.yaml"), " \n").expect("include");
+        fs::write(
+            td.path().join("defaults.yaml"),
+            "source: file\nkeep: true\n",
+        )
+        .expect("defaults");
+        let root = serde_json::json!({
+            "global": {"_includes": {"_include_from_file": "optional.yaml"}},
+            "_include_from_file": "optional.yaml",
+            "_include_files": ["optional.yaml", "defaults.yaml", "missing.yaml"],
+            "source": "local",
+        });
+        let layers = assemble_root_level_values_layers(
+            root.as_object().expect("root"),
+            Some(td.path()),
+            &HashMap::new(),
+        )
+        .expect("assemble optional includes");
+        assert_eq!(layers["source"], serde_json::json!("local"));
+        assert_eq!(layers["keep"], serde_json::json!(true));
+        assert!(!layers.contains_key("_include_files"));
+        assert!(!layers.contains_key("_include_from_file"));
+        assert_eq!(layers["global"]["_includes"], serde_json::json!({}));
+    }
 
     #[test]
     fn daemonset_documents_follow_open_change_close_lifecycle() {

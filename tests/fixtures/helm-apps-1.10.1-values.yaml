@@ -1,0 +1,133 @@
+global:
+  env: prod
+apps-custom:
+  __GroupVars__:
+    type:
+      _default: apps-network-policies
+  policy:
+    enabled: true
+    spec:
+      podSelector:
+        matchLabels:
+          prod: "yes"
+          app: api
+apps-network-policies:
+  native:
+    enabled: true
+    spec:
+      podSelector:
+        matchLabels:
+          prod: "yes"
+          app: api
+  default:
+    enabled: true
+    spec:
+      _default:
+        podSelector:
+          matchLabels:
+            prod: "yes"
+            app: api
+  exact:
+    enabled: true
+    spec:
+      prod:
+        podSelector:
+          matchLabels:
+            prod: "yes"
+            app: api
+apps-stateless:
+  policy:
+    __AppType__: apps-network-policies
+    enabled: true
+    spec:
+      podSelector:
+        matchLabels:
+          prod: "yes"
+          app: api
+  volumes:
+    enabled: true
+    volumes: |
+      - name: app-data
+        emptyDir: {}
+    containers:
+      main:
+        image:
+          name: alpine
+          staticTag: "3"
+        volumes:
+          _default: |
+            - name: {{ $.CurrentApp.name }}-data
+              emptyDir: {}
+        volumeMounts: |
+          - name: volumes-data
+            mountPath: /data
+        secretEnvVars:
+          TOKEN: old
+    initContainers:
+      prepare:
+        image:
+          name: alpine
+          staticTag: "3"
+        volumes: |
+          - name: init-data
+            emptyDir: {}
+      disabled:
+        enabled: false
+        image:
+          name: alpine
+          staticTag: "3"
+        volumes: |
+          - name: disabled-data
+            emptyDir: {}
+  parent:
+    enabled: true
+    containers:
+      main:
+        image:
+          name: nginx
+          staticTag: "1"
+    childApps:
+      apps-configmaps:
+        config:
+          enabled: true
+          name: "{{ $.ParentApp.name }}-config"
+          data: |
+            parent: {{ $.ParentApp.name | quote }}
+  sibling:
+    enabled: true
+    annotations: |
+      context-group: {{ $.CurrentGroupVars.name | quote }}
+      context-type: {{ $.CurrentGroup.__GroupVars__.type | quote }}
+      context-parent: {{ hasKey $ "ParentApp" | quote }}
+    containers:
+      main:
+        image:
+          name: nginx
+          staticTag: "1"
+apps-jobs:
+  job:
+    enabled: true
+    restartPolicy: Never
+    serviceAccount:
+      enabled: true
+      name:
+        _default: reviewer
+    containers:
+      main:
+        image:
+          name: alpine
+          staticTag: "3"
+apps-cronjobs:
+  cron:
+    enabled: true
+    schedule: "*/5 * * * *"
+    restartPolicy: Never
+    serviceAccount:
+      enabled: true
+      name:
+        _default: reviewer
+    containers:
+      main:
+        image:
+          name: alpine
+          staticTag: "3"

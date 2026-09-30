@@ -244,7 +244,7 @@ fn helm_apps_110_operations_work_over_the_wire() {
         String::from_utf8_lossy(&extracted.stderr)
     );
     std::fs::write(chart.path().join("Chart.yaml"),
-        "apiVersion: v2\nname: demo\nversion: 0.1.0\ndependencies:\n  - name: helm-apps\n    version: 1.10.0\n")
+        "apiVersion: v2\nname: demo\nversion: 0.1.0\ndependencies:\n  - name: helm-apps\n    version: 1.10.1\n")
         .expect("chart dependency");
     std::fs::create_dir(chart.path().join("templates")).expect("templates");
     std::fs::write(
@@ -338,6 +338,271 @@ fn helm_apps_110_operations_work_over_the_wire() {
         }),
     );
     assert!(failed && text.contains("E_STRICT_UNKNOWN_KEY"), "{text}");
+    client.shutdown();
+}
+
+fn library_chart_fixture(values: &str) -> tempfile::TempDir {
+    let chart = chart_fixture();
+    let library = chart.path().join("charts/helm-apps");
+    let extracted = Command::new(bin())
+        .args(["library", "extract", "--out-dir"])
+        .arg(&library)
+        .output()
+        .expect("extract library");
+    assert!(
+        extracted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    let metadata: Value = serde_yaml::from_str(
+        &std::fs::read_to_string(library.join("Chart.yaml")).expect("embedded chart metadata"),
+    )
+    .expect("chart metadata");
+    assert_eq!(metadata["version"], json!("1.10.1"));
+    std::fs::write(chart.path().join("Chart.yaml"),
+        "apiVersion: v2\nname: demo\nversion: 0.1.0\ndependencies:\n  - name: helm-apps\n    version: 1.10.1\n")
+        .expect("chart dependency");
+    std::fs::create_dir(chart.path().join("templates")).expect("templates");
+    std::fs::write(
+        chart.path().join("templates/init.yaml"),
+        "{{- include \"apps-utils.init-library\" $ }}\n",
+    )
+    .expect("library wiring");
+    std::fs::write(chart.path().join("values.yaml"), values).expect("values");
+    chart
+}
+
+fn render_resource(client: &mut Client, group: &str, app: &str, kind: &str, set: Value) -> Value {
+    let (text, failed) = client.call_tool(
+        "helm_apps",
+        json!({
+            "op": "render", "group": group, "app": app, "kind": kind,
+            "renderer": "fast", "set": set,
+        }),
+    );
+    assert!(!failed, "{group}.{app}: {text}");
+    let resource: Value = serde_yaml::from_str(&text).expect("rendered resource");
+    assert_eq!(resource["kind"], json!(kind));
+    resource
+}
+
+#[test]
+fn helm_apps_1101_renderer_corrections_work_over_the_wire() {
+    let chart = library_chart_fixture(include_str!("fixtures/helm-apps-1.10.1-values.yaml"));
+    let mut client = Client::start(&["--chart", &chart.path().to_string_lossy()]);
+    let expected_spec = json!({"podSelector": {"matchLabels": {"prod": "yes", "app": "api"}}});
+    for app in ["native", "default", "exact"] {
+        let policy = render_resource(
+            &mut client,
+            "apps-network-policies",
+            app,
+            "NetworkPolicy",
+            json!({}),
+        );
+        assert_eq!(policy["spec"], expected_spec);
+        let (resolved, failed) = client.call_tool(
+            "helm_apps",
+            json!({
+                "op": "query", "query": format!(".[\"apps-network-policies\"][\"{app}\"].spec"),
+            }),
+        );
+        assert!(!failed, "{resolved}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&resolved).expect("resolved spec"),
+            expected_spec
+        );
+    }
+    let (origin, failed) = client.call_tool(
+        "helm_apps",
+        json!({
+            "op": "origin", "group": "apps-network-policies", "app": "native",
+            "values_path": "spec.podSelector.matchLabels.prod",
+        }),
+    );
+    assert!(
+        !failed && origin.contains("spec.podSelector.matchLabels.prod: yes"),
+        "{origin}"
+    );
+    assert!(!origin.contains("env key"), "{origin}");
+    for group in ["apps-custom", "apps-stateless"] {
+        let (resolved, failed) = client.call_tool(
+            "helm_apps",
+            json!({
+                "op": "resolve", "group": group, "app": "policy", "values_path": "spec",
+            }),
+        );
+        assert!(
+            !failed && resolved.contains("podSelector") && resolved.contains("prod"),
+            "{resolved}"
+        );
+        let (origin, failed) = client.call_tool("helm_apps", json!({
+            "op": "origin", "group": group, "app": "policy", "values_path": "spec.podSelector.matchLabels.prod",
+        }));
+        assert!(
+            !failed && origin.contains("spec.podSelector.matchLabels.prod: yes"),
+            "{origin}"
+        );
+        assert!(!origin.contains("env key"), "{origin}");
+        let policy = render_resource(&mut client, group, "policy", "NetworkPolicy", json!({}));
+        assert_eq!(policy["spec"], expected_spec);
+    }
+    let policy = render_resource(
+        &mut client,
+        "apps-stateless",
+        "volumes",
+        "NetworkPolicy",
+        json!({
+            "apps-stateless.__GroupVars__.type": "apps-network-policies",
+            "apps-stateless.volumes.spec": expected_spec,
+        }),
+    );
+    assert_eq!(policy["spec"], expected_spec);
+    let deployment = render_resource(
+        &mut client,
+        "apps-network-policies",
+        "native",
+        "Deployment",
+        json!({
+            "apps-network-policies.__GroupVars__.type": "apps-stateless",
+            "apps-network-policies.native.containers.main.image": {"name": "alpine", "staticTag": "3"},
+        }),
+    );
+    assert_eq!(
+        deployment["spec"]["template"]["spec"]["containers"][0]["image"],
+        json!("alpine:3")
+    );
+    for (app, selector) in [("default", "_default"), ("exact", "prod")] {
+        let (origin, failed) = client.call_tool(
+            "helm_apps",
+            json!({
+                "op": "origin", "group": "apps-network-policies", "app": app,
+                "values_path": "spec",
+            }),
+        );
+        assert!(
+            !failed && origin.contains(&format!("env key '{selector}'")),
+            "{origin}"
+        );
+        assert!(origin.contains("podSelector"), "{origin}");
+    }
+    let workload = render_resource(
+        &mut client,
+        "apps-stateless",
+        "volumes",
+        "Deployment",
+        json!({}),
+    );
+    let mut names: Vec<_> = workload["spec"]["template"]["spec"]["volumes"]
+        .as_array()
+        .expect("volumes")
+        .iter()
+        .map(|volume| volume["name"].as_str().expect("volume name"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["app-data", "init-data", "volumes-data"]);
+    let changed = render_resource(
+        &mut client,
+        "apps-stateless",
+        "volumes",
+        "Deployment",
+        json!({"apps-stateless.volumes.containers.main.secretEnvVars.TOKEN": "new"}),
+    );
+    let checksum = "/spec/template/metadata/annotations/checksum~1config";
+    assert!(workload.pointer(checksum).is_some(), "{workload}");
+    assert_ne!(workload.pointer(checksum), changed.pointer(checksum));
+
+    let (conflict, failed) = client.call_tool("helm_apps", json!({
+        "op": "render", "group": "apps-stateless", "app": "volumes",
+        "set": {"apps-stateless.volumes.containers.main.volumes": "- name: app-data\n  emptyDir: {}\n"},
+    }));
+    assert!(
+        failed && conflict.contains("E_VOLUME_NAME_CONFLICT"),
+        "{conflict}"
+    );
+
+    for (group, app, kind, pod_path) in [
+        ("apps-jobs", "job", "Job", "/spec/template/spec"),
+        (
+            "apps-cronjobs",
+            "cron",
+            "CronJob",
+            "/spec/jobTemplate/spec/template/spec",
+        ),
+    ] {
+        let resource = render_resource(&mut client, group, app, kind, json!({}));
+        assert_eq!(
+            resource.pointer(&format!("{pod_path}/serviceAccountName")),
+            Some(&json!("reviewer"))
+        );
+        let account = render_resource(&mut client, group, app, "ServiceAccount", json!({}));
+        assert_eq!(account["metadata"]["name"], json!("reviewer"));
+    }
+    let child = render_resource(
+        &mut client,
+        "apps-stateless",
+        "parent",
+        "ConfigMap",
+        json!({}),
+    );
+    assert_eq!(child["metadata"]["name"], json!("parent-config"));
+    assert_eq!(child["data"]["parent"], json!("parent"));
+    let (context, failed) = client.call_tool("helm_apps", json!({
+        "op": "query_manifests", "kind": "Deployment",
+        "query": ".[] | select(.manifest.metadata.name == \"sibling\") | .manifest.metadata.annotations",
+    }));
+    assert!(!failed, "{context}");
+    let context: Value = serde_json::from_str(&context).expect("sibling context");
+    assert_eq!(context["context-group"], json!("apps-stateless"));
+    assert_eq!(context["context-type"], json!("apps-stateless"));
+    assert_eq!(context["context-parent"], json!("false"));
+    client.shutdown();
+}
+
+#[test]
+fn helm_apps_render_skips_blank_optional_files_but_rejects_invalid_documents() {
+    let chart = library_chart_fixture(&format!(
+        "_include_from_file: optional.yaml\n_include_files: [optional.yaml, missing.yaml, extra.yaml]\n{}",
+        include_str!("fixtures/helm-apps-1.10.1-values.yaml"),
+    ));
+    std::fs::write(chart.path().join("optional.yaml"), " \n").expect("empty optional include");
+    std::fs::write(
+        chart.path().join("extra.yaml"),
+        "apps-configmaps:\n  extra:\n    enabled: true\n    data: |\n      source: included\n",
+    )
+    .expect("extra include");
+    let mut client = Client::start(&["--chart", &chart.path().to_string_lossy()]);
+    let extra = render_resource(
+        &mut client,
+        "apps-configmaps",
+        "extra",
+        "ConfigMap",
+        json!({}),
+    );
+    assert_eq!(extra["data"]["source"], json!("included"));
+    let policy = render_resource(
+        &mut client,
+        "apps-network-policies",
+        "native",
+        "NetworkPolicy",
+        json!({}),
+    );
+    assert_eq!(
+        policy["spec"]["podSelector"]["matchLabels"]["prod"],
+        json!("yes")
+    );
+    for text in ["# comment\n", "null\n", "- item\n"] {
+        std::fs::write(chart.path().join("optional.yaml"), text).expect("invalid include");
+        let (message, failed) = client.call_tool(
+            "helm_apps",
+            json!({
+                "op": "render", "group": "apps-network-policies", "app": "native",
+            }),
+        );
+        assert!(
+            failed && message.contains("values document must be a YAML map"),
+            "{text:?}: {message}"
+        );
+    }
     client.shutdown();
 }
 
